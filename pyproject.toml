@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tradar-x402-ap2"
+name = "x402-secure"
 version = "0.1.0"
-description = "x402 Custom Facilitator with AP2 integration (HNP risk control)"
+description = "x402 Custom Facilitator Proxy"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }

@@ -1,6 +1,6 @@
 # x402-secure
 
-[![CI](https://github.com/t54-labs/tradar_x402_ap2/actions/workflows/test.yml/badge.svg)](https://github.com/t54-labs/tradar_x402_ap2/actions/workflows/test.yml)
+[![CI](https://github.com/t54-labs/x402-secure/actions/workflows/test.yml/badge.svg)](https://github.com/t54-labs/x402-secure/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 

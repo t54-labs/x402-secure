@@ -1,0 +1,40 @@
+# Copyright 2025 t54 labs
+# SPDX-License-Identifier: Apache-2.0
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python test dependencies
+RUN pip install \
+    pytest \
+    pytest-asyncio \
+    pytest-cov \
+    pytest-docker \
+    pytest-timeout \
+    pytest-mock \
+    httpx \
+    fastapi
+
+# Copy source code for imports
+COPY proxy/src/ proxy/src/
+COPY packages/x402-secure/src/ packages/x402-secure/src/
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# Add to Python path
+ENV PYTHONPATH=/app/proxy/src:/app/packages/x402-secure/src
+
+# Copy test files
+COPY tests/conftest.py tests/
+COPY tests/pytest-docker.ini pytest.ini
+
+# Default command
+CMD ["pytest", "-v"]

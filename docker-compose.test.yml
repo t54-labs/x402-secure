@@ -1,0 +1,75 @@
+# Copyright 2025 t54 labs
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  facilitator-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: x402-facilitator-proxy-test
+    ports:
+      - "8000:8000"
+    environment:
+      # Proxy configuration
+      - PROXY_LOCAL_RISK=1
+      - PROXY_UPSTREAM_VERIFY_URL=http://mock-facilitator:8001/verify
+      - PROXY_UPSTREAM_SETTLE_URL=http://mock-facilitator:8001/settle
+      - AGENT_GATEWAY_URL=http://facilitator-proxy:8000
+      - HOST=0.0.0.0
+      - PORT=8000
+      # Test configuration
+      - MANDATE_URL_ALLOWLIST=https://test.example.com,http://localhost:8010
+      - LOG_LEVEL=DEBUG
+    networks:
+      - test-network
+    depends_on:
+      - mock-facilitator
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  mock-facilitator:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.mock-facilitator
+    container_name: mock-facilitator
+    ports:
+      - "8001:8001"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8001
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.test-runner
+    container_name: test-runner
+    volumes:
+      - ./tests:/app/tests
+      - ./test-results:/app/test-results
+    environment:
+      - AGENT_GATEWAY_URL=http://facilitator-proxy:8000
+      - MOCK_FACILITATOR_URL=http://mock-facilitator:8001
+      - PYTHONPATH=/app
+    networks:
+      - test-network
+    depends_on:
+      facilitator-proxy:
+        condition: service_healthy
+      mock-facilitator:
+        condition: service_healthy
+    command: pytest tests/test_integration_docker.py -v --junit-xml=/app/test-results/junit.xml
+
+networks:
+  test-network:
+    driver: bridge

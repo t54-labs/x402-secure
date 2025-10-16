@@ -1,0 +1,73 @@
+# Copyright 2025 t54 labs
+# SPDX-License-Identifier: Apache-2.0
+
+# Build stage
+FROM python:3.11-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /build
+
+# Copy dependency files and READMEs
+COPY pyproject.toml uv.lock ./
+COPY README.md ./
+COPY proxy/pyproject.toml proxy/README.md proxy/
+COPY packages/x402-secure/pyproject.toml packages/x402-secure/README.md packages/x402-secure/
+
+# Create virtual environment and install dependencies
+RUN uv venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN uv pip install --no-cache -e .
+RUN uv pip install --no-cache -e ./proxy
+RUN uv pip install --no-cache -e ./packages/x402-secure
+
+# Copy source code
+COPY proxy/src/ proxy/src/
+COPY packages/x402-secure/src/ packages/x402-secure/src/
+COPY run_facilitator_proxy.py .
+
+# Runtime stage
+FROM python:3.11-slim
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash appuser
+
+WORKDIR /app
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy application from builder
+COPY --from=builder /build /app
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Production environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV HOST=0.0.0.0
+ENV PORT=8000
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run with production server
+CMD ["uvicorn", "run_facilitator_proxy:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--log-level", "info"]

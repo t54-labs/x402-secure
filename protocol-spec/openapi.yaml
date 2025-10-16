@@ -1,0 +1,347 @@
+# Copyright 2025 t54 labs
+# SPDX-License-Identifier: Apache-2.0
+
+openapi: 3.0.3
+info:
+  title: x402 Facilitator Proxy - Unified Gateway API
+  version: 1.0.0
+  description: |
+    Unified gateway providing buyer risk APIs and seller x402 proxy functionality.
+    This proxy integrates with Trustline risk engine for AI agent payment protection.
+    
+    Developed by t54 labs (https://t54.ai)
+  contact:
+    name: t54 labs
+    email: dev@t54.ai
+    url: https://t54.ai
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+servers:
+  - url: <TRUSTLINE_API_URL>
+    description: Production Trustline API
+  - url: http://localhost:8000
+    description: Local development server
+tags:
+  - name: Risk Management
+    description: AI agent risk session and trace management endpoints
+  - name: x402 Proxy
+    description: Payment verification and settlement proxy endpoints
+  - name: Internal
+    description: Internal endpoints used by the proxy (not for direct client use)
+paths:
+  /risk/session:
+    post:
+      summary: Create risk session
+      operationId: createRiskSession
+      description: |
+        Create a new risk session for an AI agent. This session will be used to track
+        agent behavior and make risk decisions through Trustline's logic-level assessment.
+      tags:
+        - Risk Management
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id: { type: string, description: Buyer agent wallet/address }
+                app_id: { type: string, nullable: true }
+                device: { type: object, additionalProperties: true, nullable: true }
+      responses:
+        '200':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sid, expires_at]
+                properties:
+                  sid: { type: string, format: uuid }
+                  expires_at: { type: string, format: date-time }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /risk/trace:
+    post:
+      summary: Store agent trace for a session
+      operationId: createRiskTrace
+      description: |
+        Store comprehensive agent execution trace including reasoning chains, tool calls,
+        and runtime behavior. This data is used by Trustline for logic-level risk assessment
+        and evidence-based validation.
+      tags:
+        - Risk Management
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sid]
+              properties:
+                sid: { type: string, format: uuid }
+                fingerprint: { type: object, additionalProperties: true, nullable: true }
+                telemetry: { type: object, additionalProperties: true, nullable: true }
+                agent_trace: { type: object, additionalProperties: true, nullable: true }
+      responses:
+        '200':
+          description: Trace stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tid]
+                properties:
+                  tid: { type: string, format: uuid }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /risk/trace/{tid}:
+    get:
+      summary: Query stored agent trace by trace ID
+      operationId: getRiskTrace
+      tags:
+        - Risk Management
+      parameters:
+        - in: path
+          name: tid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Agent trace data
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sid, agent_trace]
+                properties:
+                  sid: { type: string, format: uuid }
+                  fingerprint: { type: object, additionalProperties: true, nullable: true }
+                  telemetry: { type: object, additionalProperties: true, nullable: true }
+                  agent_trace: { type: object, additionalProperties: true }
+        '404':
+          description: Trace not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: object }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /risk/session/{sid}:
+    get:
+      summary: Query session by session ID
+      operationId: getRiskSession
+      tags:
+        - Risk Management
+      parameters:
+        - in: path
+          name: sid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Session data
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agent_id, expires_at]
+                properties:
+                  agent_id: { type: string }
+                  app_id: { type: string, nullable: true }
+                  device: { type: object, additionalProperties: true, nullable: true }
+                  expires_at: { type: string, format: date-time }
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: object }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /risk/evaluate:
+    post:
+      summary: Evaluate payment risk (internal use by proxy)
+      operationId: evaluateRisk
+      description: |
+        Internal endpoint called by proxy to evaluate risk based on session, trace, and payment context.
+        In production mode (PROXY_LOCAL_RISK=0), this forwards to Trustline risk engine for:
+        - Logic-level evidence evaluation
+        - Prompt injection detection
+        - Agent behavior analysis
+        - Multi-factor risk assessment including code auditing and TEE attestation
+      tags:
+        - Internal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sid]
+              properties:
+                sid: { type: string, format: uuid }
+                tid: { type: string, format: uuid, nullable: true }
+                trace_context:
+                  type: object
+                  properties:
+                    tp: { type: string, description: W3C traceparent }
+                    ts: { type: string, description: URL-encoded tracestate, nullable: true }
+                mandate: { type: object, additionalProperties: true, nullable: true }
+                payment: { type: object, additionalProperties: true, nullable: true }
+      responses:
+        '200':
+          description: Risk evaluation decision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [decision, decision_id]
+                properties:
+                  decision: { type: string, enum: [allow, deny, review] }
+                  decision_id: { type: string, format: uuid }
+                  ttl_seconds: { type: integer }
+                  reasons: { type: array, items: { type: string } }
+                  risk_level: { type: string, enum: [high, medium, low], default: low }
+                  extra: { type: object, additionalProperties: true }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /x402/verify:
+    post:
+      summary: Verify payment with risk gating then forward to upstream facilitator
+      operationId: proxyVerify
+      description: |
+        Verify x402 payment with Trustline risk assessment before forwarding to upstream facilitator.
+        Supports AP2 integration through X-AP2-EVIDENCE header for enhanced agent payment protection.
+        Risk decisions are made based on agent behavior, mandate compliance, and logic-level analysis.
+      tags:
+        - x402 Proxy
+      parameters:
+        - in: header
+          name: X-PAYMENT
+          required: true
+          schema: { type: string }
+        - in: header
+          name: X-PAYMENT-SECURE
+          required: true
+          schema: { type: string, description: w3c.v1;tp=<traceparent>[;ts=<url-encoded-tracestate>] }
+        - in: header
+          name: X-RISK-SESSION
+          required: true
+          schema: { type: string, format: uuid }
+        - in: header
+          name: X-AP2-EVIDENCE
+          required: false
+          schema: { type: string, description: evd.v1;mr=<ref>;ms=<sha256b64url>;mt=application/json;sz=<bytes> }
+        - in: header
+          name: Origin
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [x402Version, paymentPayload, paymentRequirements]
+              properties:
+                x402Version: { type: integer, enum: [1] }
+                paymentPayload: { type: object }
+                paymentRequirements: { type: object }
+      responses:
+        '200':
+          description: Upstream facilitator response (normalized)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [isValid, payer]
+                properties:
+                  isValid: { type: boolean }
+                  payer: { type: string }
+                  invalidReason: { type: string, nullable: true }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /x402/settle:
+    post:
+      summary: Settle payment (optional risk gating based on env)
+      operationId: proxySettle
+      tags:
+        - x402 Proxy
+      parameters:
+        - in: header
+          name: X-PAYMENT
+          required: true
+          schema: { type: string }
+        - in: header
+          name: X-PAYMENT-SECURE
+          required: true
+          schema: { type: string }
+        - in: header
+          name: X-RISK-SESSION
+          required: true
+          schema: { type: string, format: uuid }
+        - in: header
+          name: X-AP2-EVIDENCE
+          required: false
+          schema: { type: string }
+        - in: header
+          name: Origin
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [x402Version, paymentPayload, paymentRequirements]
+              properties:
+                x402Version: { type: integer, enum: [1] }
+                paymentPayload: { type: object }
+                paymentRequirements: { type: object }
+      responses:
+        '200':
+          description: Upstream facilitator response (normalized)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, payer]
+                properties:
+                  success: { type: boolean }
+                  payer: { type: string }
+                  transaction: { type: string, nullable: true }
+                  network: { type: string, nullable: true }
+                  errorReason: { type: string, nullable: true }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+components:
+  responses:
+    Error:
+      description: Error response with stable shape
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+              request_id: { type: string }

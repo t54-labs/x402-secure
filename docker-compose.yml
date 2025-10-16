@@ -1,0 +1,34 @@
+# Copyright 2025 t54 labs
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  facilitator-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: x402-facilitator-proxy
+    ports:
+      - "8000:8000"
+    environment:
+      # Local risk mode for development
+      - PROXY_LOCAL_RISK=1
+      - UPSTREAM_FACILITATOR_BASE_URL=https://x402.org/facilitator
+      - AGENT_GATEWAY_URL=http://0.0.0.0:8000
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=INFO
+      # Optional: Set these for testing with real facilitators
+      # - PROXY_LOCAL_RISK=0
+      # - RISK_ENGINE_URL=<TRUSTLINE_API_URL>
+      # - RISK_INTERNAL_TOKEN=your_api_key
+    volumes:
+      # Mount source code for hot reload in development
+      - ./src:/app/src
+      - ./proxy/src:/app/proxy/src
+      - ./packages/x402-secure/src:/app/packages/x402-secure/src
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 10s

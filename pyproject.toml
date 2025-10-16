@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradar-x402-ap2"
+version = "0.1.0"
+description = "x402 Custom Facilitator with AP2 integration (HNP risk control)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "t54 labs", email = "dev@t54.ai" }]
+
+dependencies = [
+  "x402==0.2.1",
+  "fastapi==0.117.1",
+  "uvicorn==0.24.0",
+  "requests==2.31.0",
+  "python-dotenv==1.1.1",
+  "httpx==0.28.1",
+  "web3==7.13.0",
+  "eth-account==0.13.7",
+  "pyjwt==2.8.0",
+  "jwcrypto==1.5.0",
+  "cryptography==41.0.7",
+  "cachetools==5.3.2",
+  "pydantic>=2.10.3,<3",
+  "x402-proxy",
+  "x402-secure",
+  "opentelemetry-api>=1.24.0",
+  "opentelemetry-sdk>=1.24.0",
+  "opentelemetry-exporter-otlp>=1.24.0",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[dependency-groups]
+dev = [
+  "ruff>=0.6.0",
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+]
+agent = [
+  "openai>=1.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+  "venv",
+  ".venv",
+  "build",
+  "dist",
+  "packages/*/dist",
+  "packages/*/build",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = []
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv.sources]
+# Install the local packages in editable mode during development
+x402-proxy = { path = "proxy", editable = true }
+x402-secure = { path = "packages/x402-secure", editable = true }

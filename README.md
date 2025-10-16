@@ -3,6 +3,7 @@
 [![CI](https://github.com/t54-labs/x402-secure/actions/workflows/test.yml/badge.svg)](https://github.com/t54-labs/x402-secure/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![Docs](https://img.shields.io/badge/docs-x402--secure-green)](https://x402-secure.t54.ai/)
 
 **Open-Source SDK & Proxy for Secure Agent Payments on x402 — Powered by Trustline from [t54](https://t54.ai)**
 

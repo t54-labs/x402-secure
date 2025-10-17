@@ -212,7 +212,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [sid]
+              required: [sid, payment]
               properties:
                 sid: { type: string, format: uuid }
                 tid: { type: string, format: uuid, nullable: true }
@@ -222,7 +222,8 @@ paths:
                     tp: { type: string, description: W3C traceparent }
                     ts: { type: string, description: URL-encoded tracestate, nullable: true }
                 mandate: { type: object, additionalProperties: true, nullable: true }
-                payment: { type: object, additionalProperties: true, nullable: true }
+                payment:
+                  $ref: '#/components/schemas/PaymentContext'
       responses:
         '200':
           description: Risk evaluation decision
@@ -355,6 +356,42 @@ paths:
 
 components:
   schemas:
+    PaymentContext:
+      type: object
+      description: Generic payment context supporting multiple protocols
+      required:
+        - protocol
+        - payload
+      properties:
+        protocol:
+          type: string
+          description: 'Payment protocol identifier (e.g., "eip3009", "x402:exact", "solana:transfer", "btc:psbt")'
+          example: "eip3009"
+        version:
+          type: [string, integer]
+          nullable: true
+          description: Protocol version
+        network:
+          type: string
+          nullable: true
+          description: 'Network identifier (e.g., "base-sepolia", "solana-mainnet")'
+          example: "base-sepolia"
+        payload:
+          type: object
+          additionalProperties: true
+          description: Protocol-specific payload (e.g., authorization, signature)
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          nullable: true
+          description: Transport/binding related headers (optional)
+        extra:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Additional metadata (optional)
+
     AgentTraceData:
       type: object
       description: Complete agent execution trace with all required fields

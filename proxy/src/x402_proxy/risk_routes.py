@@ -7,7 +7,7 @@ import os
 import uuid as _uuid
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 import json
 
 import httpx
@@ -70,12 +70,25 @@ class Decision(str, Enum):
     review = "review"
 
 
+class PaymentContext(BaseModel):
+    """
+    Generic payment context supporting multiple protocols.
+    protocol: Protocol identifier (e.g., "eip3009", "x402:exact", "solana:transfer", "btc:psbt")
+    """
+    protocol: str = Field(..., description="Payment protocol identifier")
+    version: Optional[Union[str, int]] = Field(None, description="Protocol version")
+    network: Optional[str] = Field(None, description="Network identifier (e.g., 'base-sepolia', 'solana-mainnet')")
+    payload: Dict[str, Any] = Field(default_factory=dict, description="Protocol-specific payload")
+    headers: Optional[Dict[str, str]] = Field(None, description="Transport/binding related headers")
+    extra: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+
 class EvaluateRequest(BaseModel):
     sid: str
-    tid: Optional[str] = None
     trace_context: TraceContext
+    payment: PaymentContext
+    tid: Optional[str] = None
     mandate: Optional[MandateMeta] = None
-    payment: Optional[Dict[str, Any]] = None
 
 
 class EvaluateResponse(BaseModel):
@@ -184,6 +197,11 @@ class _LocalStore:
                 logger.info(f"[LOCAL] Agent trace context: tid={req.tid}, task={task}, "
                            f"model={model_config.get('provider')}/{model_config.get('model')}, "
                            f"events={len(events)} ({event_summary})")
+        
+        # Log payment context (required field)
+        logger.info(f"[LOCAL] Payment context: {req.payment}")
+        logger.info(f"[LOCAL] Payment context: protocol={req.payment.protocol}, "
+                   f"network={req.payment.network}, version={req.payment.version}")
         
         # Simple allow decision for local testing
         return EvaluateResponse(

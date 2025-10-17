@@ -22,7 +22,7 @@ async def store_agent_trace(
     model_config: Optional[Dict[str, Any]] = None,
     session_context: Optional[Dict[str, Any]] = None,
 ) -> str:
-    import time
+    from datetime import datetime, timezone
     
     agent_trace: Dict[str, Any] = {
         "task": task,
@@ -39,8 +39,8 @@ async def store_agent_trace(
     if session_context:
         agent_trace["session_context"] = session_context
     
-    # Add timestamps
-    agent_trace["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Add timestamps with timezone
+    agent_trace["completed_at"] = datetime.now(timezone.utc).isoformat()
     
     tid = (await risk.create_trace(sid=sid, agent_trace=agent_trace))["tid"]
     return tid

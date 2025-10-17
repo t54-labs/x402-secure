@@ -25,6 +25,7 @@ from .headers import (
     parse_x_ap2_evidence,
     parse_risk_ids,
 )
+from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps
 try:  # pragma: no cover - optional dependency path
@@ -632,20 +633,26 @@ async def proxy_verify(
             r = await client.post(f"{rurl}/risk/evaluate", json=evaluate_json, headers=headers)
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
-        rjson = r.json()
-        decision = str(rjson.get("decision", "")).lower()
+        
+        # Validate and parse risk response
+        try:
+            risk_response = EvaluateResponse(**r.json())
+            logger.info(f"[{req_id}] [PROXY] Risk response: {risk_response.model_dump_json()}")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Invalid risk response: {str(e)}")
+        
+        decision = risk_response.decision
         if response is not None:
-            response.headers["X-Risk-Decision"] = decision
-        if rjson.get("decision_id"):
-            response.headers["X-Risk-Decision-ID"] = str(rjson.get("decision_id"))
-        if rjson.get("ttl_seconds") is not None:
-            response.headers["X-Risk-TTL-Seconds"] = str(rjson.get("ttl_seconds"))
-        logger.info(f"[{req_id}] [PROXY] ✅ Risk decision: {decision} (id={rjson.get('decision_id')})")
+            response.headers["X-Risk-Decision"] = decision.value
+        if risk_response.decision_id:
+            response.headers["X-Risk-Decision-ID"] = risk_response.decision_id
+        if risk_response.ttl_seconds:
+            response.headers["X-Risk-TTL-Seconds"] = str(risk_response.ttl_seconds)
+        logger.info(f"[{req_id}] [PROXY] ✅ Risk decision: {decision.value} (id={risk_response.decision_id})")
 
         # Gate forwarding on decision
-        if decision == "deny":
-            reasons = rjson.get("reasons") or []
-            msg = "Risk denied" + (f": {', '.join(reasons)}" if reasons else "")
+        if decision == Decision.deny:
+            msg = "Risk denied" + (f": {', '.join(risk_response.reasons)}" if risk_response.reasons else "")
             raise HTTPException(status_code=403, detail=msg)
     except HTTPException as e:
         return _error_response(e, req_id)
@@ -823,20 +830,25 @@ async def proxy_settle(
                 r = await client.post(f"{rurl}/risk/evaluate", json=evaluate_json, headers=headers)
             if r.status_code != 200:
                 raise HTTPException(status_code=r.status_code, detail=r.text)
-            rjson = r.json()
-            decision = str(rjson.get("decision", "")).lower()
+            
+            # Validate and parse risk response
+            try:
+                risk_response = EvaluateResponse(**r.json())
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Invalid risk response: {str(e)}")
+            
+            decision = risk_response.decision
             if response is not None:
-                response.headers["X-Risk-Decision"] = decision
-            if rjson.get("decision_id"):
-                response.headers["X-Risk-Decision-ID"] = str(rjson.get("decision_id"))
-            if rjson.get("ttl_seconds") is not None:
-                response.headers["X-Risk-TTL-Seconds"] = str(rjson.get("ttl_seconds"))
-            logger.info(f"[{req_id}] [PROXY] ✅ Risk decision: {decision} (id={rjson.get('decision_id')})")
+                response.headers["X-Risk-Decision"] = decision.value
+            if risk_response.decision_id:
+                response.headers["X-Risk-Decision-ID"] = risk_response.decision_id
+            if risk_response.ttl_seconds:
+                response.headers["X-Risk-TTL-Seconds"] = str(risk_response.ttl_seconds)
+            logger.info(f"[{req_id}] [PROXY] ✅ Risk decision: {decision.value} (id={risk_response.decision_id})")
 
             # Gate forwarding on decision
-            if decision == "deny":
-                reasons = rjson.get("reasons") or []
-                msg = "Risk denied" + (f": {', '.join(reasons)}" if reasons else "")
+            if decision == Decision.deny:
+                msg = "Risk denied" + (f": {', '.join(risk_response.reasons)}" if risk_response.reasons else "")
                 raise HTTPException(status_code=403, detail=msg)
         else:
             # Risk on settle disabled by configuration; do not call Risk Engine.

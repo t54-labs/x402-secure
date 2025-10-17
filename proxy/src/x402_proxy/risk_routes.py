@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import logging
 import os
 import uuid as _uuid
 from datetime import datetime, timedelta
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 
 router = APIRouter(prefix="/risk", tags=["risk-public"])
+logger = logging.getLogger(__name__)
 
 
 class RiskSessionRequest(BaseModel):
@@ -62,6 +64,12 @@ class RiskLevel(str, Enum):
     low = "low"
 
 
+class Decision(str, Enum):
+    allow = "allow"
+    deny = "deny"
+    review = "review"
+
+
 class EvaluateRequest(BaseModel):
     sid: str
     tid: Optional[str] = None
@@ -71,7 +79,7 @@ class EvaluateRequest(BaseModel):
 
 
 class EvaluateResponse(BaseModel):
-    decision: str
+    decision: Decision
     reasons: list[str] = Field(default_factory=list)
     decision_id: str
     ttl_seconds: int = 300
@@ -158,63 +166,28 @@ class _LocalStore:
             if self.traces[req.tid]["sid"] != req.sid:
                 raise HTTPException(status_code=400, detail="tid not linked to sid")
             
-            # Print agent trace context (like Risk Engine does)
+            # Log agent trace context
             trace_data = self.traces.get(req.tid, {})
             agent_trace = trace_data.get("agent_trace")
             if agent_trace:
-                print("\n" + "="*80)
-                print(f"📊 [PROXY LOCAL] Agent Trace Context for tid={req.tid}:")
-                print("="*80)
-                print(f"  Task: {agent_trace.get('task')}")
-                print(f"  Parameters: {agent_trace.get('parameters')}")
-                print(f"  Environment: {agent_trace.get('environment')}")
-                
-                # Print model config if present
-                model_config = agent_trace.get('model_config')
-                if model_config:
-                    print(f"  Model Config:")
-                    print(f"    Provider: {model_config.get('provider')}")
-                    print(f"    Model: {model_config.get('model')}")
-                    print(f"    Tools: {', '.join(model_config.get('tools_enabled', []))}")
-                
-                # Print session context if present
-                session_ctx = agent_trace.get('session_context')
-                if session_ctx:
-                    print(f"  Session Context:")
-                    print(f"    Session ID: {session_ctx.get('session_id')}")
-                    print(f"    Request ID: {session_ctx.get('request_id')}")
-                    print(f"    Agent DID: {session_ctx.get('agent_did')}")
-                    if 'client_ip_hash' in session_ctx:
-                        print(f"    Client IP (hashed): {session_ctx['client_ip_hash'][:16]}...")
-                
+                task = agent_trace.get('task', 'N/A')
                 events = agent_trace.get('events', [])
-                print(f"  Events: {len(events)} total")
                 
-                # Show user inputs
-                user_inputs = [e for e in events if e.get('type') == 'user_input']
-                if user_inputs:
-                    print(f"\n  👤 User Inputs ({len(user_inputs)} items):")
-                    for i, evt in enumerate(user_inputs, 1):
-                        content = evt.get('content', '')[:80]
-                        print(f"    {i}. {content}{'...' if len(evt.get('content', '')) > 80 else ''}")
+                # Count event types
+                event_summary = {}
+                for e in events:
+                    etype = e.get('type', 'unknown')
+                    event_summary[etype] = event_summary.get(etype, 0) + 1
                 
-                # Show agent outputs
-                agent_outputs = [e for e in events if e.get('type') == 'agent_output']
-                if agent_outputs:
-                    print(f"\n  🤖 Agent Outputs ({len(agent_outputs)} items):")
-                    for i, evt in enumerate(agent_outputs, 1):
-                        content = evt.get('content', '')[:80]
-                        print(f"    {i}. {content}{'...' if len(evt.get('content', '')) > 80 else ''}")
-                
-                if events:
-                    print("\n  Recent events:")
-                    for i, evt in enumerate(events[-5:], 1):
-                        print(f"    {i}. {evt.get('type')}: {evt.get('name', 'N/A')}")
-                print("="*80 + "\n")
+                # Log summary
+                model_config = agent_trace.get('model_config', {})
+                logger.info(f"[LOCAL] Agent trace context: tid={req.tid}, task={task}, "
+                           f"model={model_config.get('provider')}/{model_config.get('model')}, "
+                           f"events={len(events)} ({event_summary})")
         
         # Simple allow decision for local testing
         return EvaluateResponse(
-            decision="allow",
+            decision=Decision.allow,
             reasons=[],
             decision_id=str(_uuid.uuid4()),
             ttl_seconds=300,
@@ -243,18 +216,8 @@ async def create_session(req: RiskSessionRequest):
         if _STORE is None:
             _STORE = _LocalStore()
         
-        # Log input payload
-        print("\n" + "="*80)
-        print("📥 [RISK] POST /risk/session - RAW Input Payload (JSON):")
-        print("="*80)
-        print(json.dumps(req.model_dump(), indent=2, ensure_ascii=False))
-        print("="*80 + "\n")
-        
         result = _STORE.create_session(req)
-        
-        # Log output
-        print(f"✅ [RISK] Session created: sid={result.sid}")
-        print(f"   Expires at: {result.expires_at}\n")
+        logger.info(f"[LOCAL] Session created: sid={result.sid}, expires_at={result.expires_at}")
         
         return result
     
@@ -267,11 +230,7 @@ async def create_session(req: RiskSessionRequest):
     
     # Apply compatibility layer if enabled (e.g., Trustline API)
     if _external_compat_enabled():
-        before = payload.copy()
         payload = _adapt_payload_for_external_api(payload, path)
-        print(f"[RISK FORWARD] compat=on path={path}")
-        print(f"  before: {json.dumps(before, ensure_ascii=False)}")
-        print(f"  after : {json.dumps(payload, ensure_ascii=False)}")
     
     # Forward request to external risk engine
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -284,7 +243,17 @@ async def create_session(req: RiskSessionRequest):
     if ctype != "application/json":
         raise HTTPException(status_code=502, detail="invalid content-type from risk engine")
     
-    return JSONResponse(status_code=200, content=r.json())
+    # Validate response structure
+    try:
+        response_data = r.json()
+        validated = RiskSessionResponse(**response_data)
+        return validated
+    except Exception as e:
+        logger.error(f"Risk engine response validation failed: {e}, response: {response_data}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid response from risk engine: {str(e)}"
+        )
 
 
 @router.post("/trace", response_model=RiskTraceResponse)
@@ -299,62 +268,19 @@ async def create_trace(req: RiskTraceRequest):
         if _STORE is None:
             _STORE = _LocalStore()
         
-        # Log input payload
-        print("\n" + "="*80)
-        print("📥 [RISK] POST /risk/trace - RAW Input Payload (JSON):")
-        print("="*80)
-        print(json.dumps(req.model_dump(), indent=2, ensure_ascii=False))
-        print("="*80)
-        
-        # Log formatted summary for readability
-        print("\n" + "="*80)
-        print("📊 [RISK] /risk/trace - Formatted Summary:")
-        print("="*80)
-        print(f"  sid: {req.sid}")
-        print(f"  fingerprint: {req.fingerprint}")
-        print(f"  telemetry: {req.telemetry}")
-        
-        agent_trace = req.agent_trace
-        if agent_trace:
-            print(f"\n  📊 Agent Trace:")
-            print(f"    task: {agent_trace.get('task')}")
-            print(f"    parameters: {agent_trace.get('parameters')}")
-            print(f"    environment: {agent_trace.get('environment')}")
-            
-            # Model config
-            model_cfg = agent_trace.get('model_config')
-            if model_cfg:
-                print(f"    model_config:")
-                print(f"      provider: {model_cfg.get('provider')}")
-                print(f"      model: {model_cfg.get('model')}")
-                print(f"      tools_enabled: {model_cfg.get('tools_enabled')}")
-            
-            # Session context
-            session_ctx = agent_trace.get('session_context')
-            if session_ctx:
-                print(f"    session_context:")
-                print(f"      session_id: {session_ctx.get('session_id')}")
-                print(f"      request_id: {session_ctx.get('request_id')}")
-                print(f"      agent_did: {session_ctx.get('agent_did')}")
-            
-            # Events summary
-            events = agent_trace.get('events', [])
-            if events:
-                print(f"    events: {len(events)} total")
-                event_types = {}
-                for e in events:
-                    etype = e.get('type', 'unknown')
-                    event_types[etype] = event_types.get(etype, 0) + 1
-                for etype, count in event_types.items():
-                    print(f"      - {etype}: {count}")
-        
-        print("="*80 + "\n")
-        
         result = _STORE.create_trace(req)
         
-        # Log output
-        print(f"✅ [RISK] Trace created: tid={result.tid}")
-        print(f"   Linked to sid={req.sid}\n")
+        # Log trace creation with summary
+        agent_trace = req.agent_trace
+        if agent_trace:
+            events = agent_trace.get('events', [])
+            event_summary = {}
+            for e in events:
+                etype = e.get('type', 'unknown')
+                event_summary[etype] = event_summary.get(etype, 0) + 1
+            logger.info(f"[LOCAL] Trace created: tid={result.tid}, sid={req.sid}, events={len(events)} ({event_summary})")
+        else:
+            logger.info(f"[LOCAL] Trace created: tid={result.tid}, sid={req.sid}")
         
         return result
     
@@ -367,11 +293,7 @@ async def create_trace(req: RiskTraceRequest):
     
     # Apply compatibility layer if enabled (e.g., Trustline API)
     if _external_compat_enabled():
-        before = payload.copy()
         payload = _adapt_payload_for_external_api(payload, path)
-        print(f"[RISK FORWARD] compat=on path={path}")
-        print(f"  before: {json.dumps(before, ensure_ascii=False)}")
-        print(f"  after : {json.dumps(payload, ensure_ascii=False)}")
     
     # Forward request to external risk engine
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -384,12 +306,21 @@ async def create_trace(req: RiskTraceRequest):
     if ctype != "application/json":
         raise HTTPException(status_code=502, detail="invalid content-type from risk engine")
     
-    # Adapt response: Trustline uses "trace_id", we use "tid"
-    response_data = r.json()
-    if _external_compat_enabled() and "trace_id" in response_data and "tid" not in response_data:
-        response_data["tid"] = response_data["trace_id"]
-    
-    return JSONResponse(status_code=200, content=response_data)
+    # Validate response structure
+    try:
+        response_data = r.json()
+        # risk engine returns trace_id, we use tid
+        if "trace_id" in response_data and "tid" not in response_data:
+            response_data["tid"] = response_data["trace_id"]
+        
+        validated = RiskTraceResponse(**response_data)
+        return validated
+    except Exception as e:
+        logger.error(f"Risk engine response validation failed: {e}, response: {response_data}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid response from risk engine: {str(e)}"
+        )
 
 
 @router.post("/evaluate", response_model=EvaluateResponse)
@@ -404,37 +335,11 @@ async def evaluate_risk(req: EvaluateRequest):
         if _STORE is None:
             _STORE = _LocalStore()
         
-        # Log input payload
-        print("\n" + "="*80)
-        print("📥 [RISK] POST /risk/evaluate - RAW Input Payload (JSON):")
-        print("="*80)
-        print(json.dumps(req.model_dump(), indent=2, ensure_ascii=False))
-        print("="*80)
-        
-        # Log formatted summary
-        print("\n" + "="*80)
-        print("📊 [RISK] /risk/evaluate - Formatted Summary:")
-        print("="*80)
-        print(f"  sid: {req.sid}")
-        print(f"  tid: {req.tid}")
-        print(f"  trace_context:")
-        print(f"    tp (traceparent): {req.trace_context.tp}")
-        if req.trace_context.ts:
-            print(f"    ts (tracestate): {req.trace_context.ts[:80]}...")
-        if req.mandate:
-            print(f"  mandate:")
-            print(f"    ref: {req.mandate.ref}")
-            print(f"    sha256: {req.mandate.sha256_b64url}")
-            print(f"    size: {req.mandate.size} bytes")
-        if req.payment:
-            print(f"  payment: {req.payment}")
-        print("="*80 + "\n")
-        
         result = _STORE.evaluate(req)
         
-        # Log output
-        print(f"✅ [RISK] Evaluation complete: decision={result.decision}")
-        print(f"   decision_id={result.decision_id}\n")
+        # Log evaluation result
+        logger.info(f"[LOCAL] Evaluation: decision={result.decision}, sid={req.sid}, tid={req.tid}, "
+                   f"decision_id={result.decision_id}, mandate={bool(req.mandate)}")
         
         return result
     
@@ -447,11 +352,7 @@ async def evaluate_risk(req: EvaluateRequest):
     
     # Apply compatibility layer if enabled (e.g., Trustline API)
     if _external_compat_enabled():
-        before = payload.copy()
         payload = _adapt_payload_for_external_api(payload, path)
-        print(f"[RISK FORWARD] compat=on path={path}")
-        print(f"  before: {json.dumps(before, ensure_ascii=False)}")
-        print(f"  after : {json.dumps(payload, ensure_ascii=False)}")
     
     # Forward request to external risk engine
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -464,7 +365,17 @@ async def evaluate_risk(req: EvaluateRequest):
     if ctype != "application/json":
         raise HTTPException(status_code=502, detail="invalid content-type from risk engine")
     
-    return JSONResponse(status_code=200, content=r.json())
+    # Validate response structure
+    try:
+        response_data = r.json()
+        validated = EvaluateResponse(**response_data)
+        return validated
+    except Exception as e:
+        logger.error(f"Risk engine response validation failed: {e}, response: {response_data}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid response from risk engine: {str(e)}"
+        )
 
 
 @router.get("/trace/{tid}")

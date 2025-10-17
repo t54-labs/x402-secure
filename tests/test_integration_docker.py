@@ -306,6 +306,17 @@ class TestDockerIntegration:
                 "tid": tid,
                 "trace_context": {
                     "tp": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                },
+                "payment": {
+                    "protocol": "eip3009",
+                    "network": "base-sepolia",
+                    "payload": {
+                        "authorization": {
+                            "from": "0x" + "e" * 40,
+                            "to": "0x" + "f" * 40,
+                            "value": "1000000"
+                        }
+                    }
                 }
             }
         )

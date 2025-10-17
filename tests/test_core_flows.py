@@ -194,6 +194,17 @@ class TestRiskEvaluation:
                 "tid": tid,
                 "trace_context": {
                     "tp": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                },
+                "payment": {
+                    "protocol": "eip3009",
+                    "network": "base-sepolia",
+                    "payload": {
+                        "authorization": {
+                            "from": "0x" + "a" * 40,
+                            "to": "0x" + "b" * 40,
+                            "value": "1000000"
+                        }
+                    }
                 }
             }
         )
@@ -235,6 +246,17 @@ class TestRiskEvaluation:
                 "sid": "925ca6ee-aa4b-4508-955b-10b1c02c69bb",
                 "trace_context": {
                     "tp": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                },
+                "payment": {
+                    "protocol": "x402:exact",
+                    "network": "base-sepolia",
+                    "payload": {
+                        "authorization": {
+                            "from": "0x" + "c" * 40,
+                            "to": "0x" + "d" * 40,
+                            "value": "2000000"
+                        }
+                    }
                 }
             }
         )

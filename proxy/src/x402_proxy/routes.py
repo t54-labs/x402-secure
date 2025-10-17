@@ -596,10 +596,28 @@ async def proxy_verify(
             except Exception as e:
                 logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
 
+        # Construct payment context from paymentPayload
+        payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
+        xpay = request.headers.get("X-PAYMENT")
+        if xpay:
+            try:
+                # Decode X-PAYMENT to preserve all fields
+                payment_payload_dict = json.loads(safe_base64_decode(xpay))
+            except Exception:
+                pass  # Fall back to Pydantic serialization
+        
+        payment_context = {
+            "protocol": payment_payload_dict.get("protocol") or payment_payload_dict.get("scheme"),
+            "version": payment_payload_dict.get("version") or payment_payload_dict.get("x402Version"),
+            "network": payment_payload_dict.get("network"),
+            "payload": payment_payload_dict.get("payload", {}),
+        }
+
         evaluate_json: Dict[str, Any] = {
             "sid": sid,
             **({"tid": extracted_tid} if extracted_tid else {}),
             "trace_context": {"tp": tc["tp"], **({"ts": tc["ts"]} if "ts" in tc else {})},
+            "payment": payment_context,
         }
         if mandate:
             evaluate_json["mandate"] = {
@@ -794,10 +812,28 @@ async def proxy_settle(
                 except Exception as e:
                     logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
 
+            # Construct payment context from paymentPayload
+            payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
+            xpay = request.headers.get("X-PAYMENT")
+            if xpay:
+                try:
+                    # Decode X-PAYMENT to preserve all fields
+                    payment_payload_dict = json.loads(safe_base64_decode(xpay))
+                except Exception:
+                    pass  # Fall back to Pydantic serialization
+            
+            payment_context = {
+                "protocol": payment_payload_dict.get("protocol") or payment_payload_dict.get("scheme"),
+                "version": payment_payload_dict.get("version") or payment_payload_dict.get("x402Version"),
+                "network": payment_payload_dict.get("network"),
+                "payload": payment_payload_dict.get("payload", {}),
+            }
+
             evaluate_json: Dict[str, Any] = {
                 "sid": sid,
                 **({"tid": extracted_tid} if extracted_tid else {}),
                 "trace_context": {"tp": tc["tp"], **({"ts": tc["ts"]} if "ts" in tc else {})},
+                "payment": payment_context,
             }
             if mandate:
                 evaluate_json["mandate"] = {

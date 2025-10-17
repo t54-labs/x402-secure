@@ -72,6 +72,9 @@ paths:
         Store comprehensive agent execution trace including reasoning chains, tool calls,
         and runtime behavior. This data is used by Trustline for logic-level risk assessment
         and evidence-based validation.
+        
+        Note: agent_trace must include all required fields (task, parameters, environment,
+        events, model_config, session_context, completed_at). See AgentTraceData schema.
       tags:
         - Risk Management
       requestBody:
@@ -80,12 +83,24 @@ paths:
           application/json:
             schema:
               type: object
-              required: [sid]
+              required: [sid, agent_trace]
               properties:
-                sid: { type: string, format: uuid }
-                fingerprint: { type: object, additionalProperties: true, nullable: true }
-                telemetry: { type: object, additionalProperties: true, nullable: true }
-                agent_trace: { type: object, additionalProperties: true, nullable: true }
+                sid: 
+                  type: string
+                  format: uuid
+                  description: Session ID from /risk/session
+                fingerprint: 
+                  type: object
+                  additionalProperties: true
+                  nullable: true
+                  description: Browser/device fingerprint (optional)
+                telemetry: 
+                  type: object
+                  additionalProperties: true
+                  nullable: true
+                  description: Additional telemetry data (optional)
+                agent_trace:
+                  $ref: '#/components/schemas/AgentTraceData'
       responses:
         '200':
           description: Trace stored
@@ -119,10 +134,19 @@ paths:
                 type: object
                 required: [sid, agent_trace]
                 properties:
-                  sid: { type: string, format: uuid }
-                  fingerprint: { type: object, additionalProperties: true, nullable: true }
-                  telemetry: { type: object, additionalProperties: true, nullable: true }
-                  agent_trace: { type: object, additionalProperties: true }
+                  sid: 
+                    type: string
+                    format: uuid
+                  fingerprint: 
+                    type: object
+                    additionalProperties: true
+                    nullable: true
+                  telemetry: 
+                    type: object
+                    additionalProperties: true
+                    nullable: true
+                  agent_trace:
+                    $ref: '#/components/schemas/AgentTraceData'
         '404':
           description: Trace not found
           content:
@@ -235,7 +259,7 @@ paths:
         - in: header
           name: X-PAYMENT-SECURE
           required: true
-          schema: { type: string, description: w3c.v1;tp=<traceparent>[;ts=<url-encoded-tracestate>] }
+          schema: { type: string, description: "w3c.v1;tp=<traceparent>[;ts=<url-encoded-tracestate>]" }
         - in: header
           name: X-RISK-SESSION
           required: true
@@ -330,6 +354,73 @@ paths:
         '5XX': { $ref: '#/components/responses/Error' }
 
 components:
+  schemas:
+    AgentTraceData:
+      type: object
+      description: Complete agent execution trace with all required fields
+      required:
+        - task
+        - parameters
+        - environment
+        - events
+        - model_config
+        - session_context
+        - completed_at
+      properties:
+        task:
+          type: string
+          description: 'Task description (e.g., "Buy BTC price")'
+        parameters:
+          type: object
+          additionalProperties: true
+          description: 'Task parameters (e.g., {"symbol": "BTC/USD"})'
+        environment:
+          type: object
+          additionalProperties: true
+          description: Environment configuration (e.g., network, seller URL)
+        events:
+          type: array
+          description: List of agent events (user inputs, agent outputs, tool calls, etc.)
+          items:
+            type: object
+            additionalProperties: true
+        model_config:
+          type: object
+          description: LLM model configuration
+          additionalProperties: true
+          properties:
+            provider:
+              type: string
+              example: "openai"
+            model:
+              type: string
+              example: "gpt-5-mini"
+            tools_enabled:
+              type: array
+              items:
+                type: string
+        session_context:
+          type: object
+          description: Session context information
+          additionalProperties: true
+          properties:
+            session_id:
+              type: string
+              format: uuid
+            request_id:
+              type: string
+              format: uuid
+            agent_did:
+              type: string
+              description: Agent DID (wallet address or EIP-8004 DID)
+            client_ip_hash:
+              type: string
+              description: SHA256 hash of client IP
+        completed_at:
+          type: string
+          format: date-time
+          description: Completion timestamp (ISO 8601)
+
   responses:
     Error:
       description: Error response with stable shape

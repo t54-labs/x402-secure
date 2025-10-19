@@ -15,8 +15,8 @@ services:
       - PROXY_UPSTREAM_VERIFY_URL=http://mock-facilitator:8001/verify
       - PROXY_UPSTREAM_SETTLE_URL=http://mock-facilitator:8001/settle
       - AGENT_GATEWAY_URL=http://facilitator-proxy:8000
-      - HOST=0.0.0.0
-      - PORT=8000
+      - PROXY_HOST=0.0.0.0
+      - PROXY_PORT=8000
       # Test configuration
       - MANDATE_URL_ALLOWLIST=https://test.example.com,http://localhost:8010
       - LOG_LEVEL=DEBUG

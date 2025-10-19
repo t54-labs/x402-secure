@@ -27,6 +27,54 @@
 
 **❤️ Developed by [t54 labs](https://t54.ai)**
 
+## 🚀 Quickstart: Run the Proxy Locally
+
+Want to quickly test the proxy on your machine? Follow these steps:
+
+### Prerequisites
+- **Install uv** (macOS/Linux): `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Python 3.11 or 3.12**
+
+### Setup
+```bash
+# 1. Clone and navigate to the repo
+git clone https://github.com/t54labs/x402-secure
+cd x402-secure
+
+# 2. Create virtual environment and install dependencies
+uv venv
+uv sync
+
+# 3. Configure environment
+cp env.example .env
+```
+
+Edit `.env` and set:
+```bash
+PROXY_LOCAL_RISK=1
+PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
+PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
+```
+
+### Run the Proxy
+```bash
+# Start the proxy
+uv run python run_facilitator_proxy.py
+
+# Health check (in another terminal)
+curl http://localhost:8000/health
+```
+
+### Common Issues
+- **"risk endpoints 500"**: Ensure `PROXY_LOCAL_RISK=1` for local mode, or set `RISK_ENGINE_URL` for forward mode.
+- **Port in use**: Adjust `PROXY_PORT` in `.env` or free port 8000.
+
+### Next Steps
+- For full development flow (seller + buyer examples), see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+- For agent integration examples, see [packages/x402-secure/examples/](packages/x402-secure/examples/)
+
+---
+
 ## 🤔 Why you need x402-secure?
 
 ### The Problem
@@ -61,9 +109,11 @@ x402-secure provides **clear responsibility boundaries** through:
 
 ### Quick Integration (5 minutes)
 
+> **Note on Package Naming**: The PyPI package name is `x402-secure`, but the import module is `x402_secure_client`.
+
 ```python
 # 1. Install SDK
-pip install x402-secure-client
+pip install x402-secure
 
 # 2. Initialize clients
 from x402_secure_client import BuyerClient, BuyerConfig, RiskClient, OpenAITraceCollector
@@ -161,7 +211,7 @@ result = await run_agent_payment(
 
 ```python
 # 1. Install SDK
-pip install x402-secure-client
+pip install x402-secure
 
 # 2. Add to your FastAPI app
 from fastapi import FastAPI, Request

@@ -259,8 +259,8 @@ def evaluate_agent_trace(agent_trace: dict, payer: str) -> dict:
 ```bash
 # 1. Run agent
 export BUYER_PRIVATE_KEY=<your_private_key>
-AGENT_GATEWAY_URL=http://localhost:8060 SELLER_BASE_URL=http://localhost:8010 \
-uv run python packages/x402-secure-client/examples/buyer_agent_openai.py
+AGENT_GATEWAY_URL=http://localhost:8000 SELLER_BASE_URL=http://localhost:8010 \
+uv run python packages/x402-secure/examples/buyer_agent_openai.py
 
 # Output will display:
 # 👤 User Inputs (2 items)
@@ -270,10 +270,10 @@ uv run python packages/x402-secure-client/examples/buyer_agent_openai.py
 
 # 2. Query complete data
 TID="e6812ee1-d509-4f0b-b79d-72e86ec1141c"
-curl -sS "http://localhost:8060/risk/trace/$TID" | python3 -m json.tool
+curl -sS "http://localhost:8000/risk/trace/$TID" | python3 -m json.tool
 
 # 3. Verify hash
-curl -sS "http://localhost:8060/risk/trace/$TID" | \
+curl -sS "http://localhost:8000/risk/trace/$TID" | \
 python3 -c "
 import json, sys, hashlib
 events = json.load(sys.stdin)['agent_trace']['events']
@@ -419,13 +419,13 @@ print('✅ Hash Verification:', 'Passed' if expected == actual else 'Failed')
 ```bash
 # Run and view complete output
 export BUYER_PRIVATE_KEY=<your_private_key>
-AGENT_GATEWAY_URL=http://localhost:8060 SELLER_BASE_URL=http://localhost:8010 \
-uv run python packages/x402-secure-client/examples/buyer_agent_openai.py | \
+AGENT_GATEWAY_URL=http://localhost:8000 SELLER_BASE_URL=http://localhost:8010 \
+uv run python packages/x402-secure/examples/buyer_agent_openai.py | \
 grep -A 30 "AGENT TRACE CONTEXT"
 
 # Get tid from output, then query
 TID="<get from output>"
-curl -sS "http://localhost:8060/risk/trace/$TID" | python3 -m json.tool > full_trace.json
+curl -sS "http://localhost:8000/risk/trace/$TID" | python3 -m json.tool > full_trace.json
 cat full_trace.json
 ```
 

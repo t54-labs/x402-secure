@@ -17,7 +17,7 @@ import sys
 import httpx
 
 
-async def view_trace(tid: str, gateway_url: str = "http://localhost:8060"):
+async def view_trace(tid: str, gateway_url: str = "http://localhost:8000"):
     """View a single trace"""
     async with httpx.AsyncClient() as client:
         try:
@@ -66,7 +66,7 @@ async def view_trace(tid: str, gateway_url: str = "http://localhost:8060"):
             print(f"❌ Connection failed: {e}")
 
 
-async def list_info(gateway_url: str = "http://localhost:8060"):
+async def list_info(gateway_url: str = "http://localhost:8000"):
     """Display proxy information and health check"""
     async with httpx.AsyncClient() as client:
         try:
@@ -87,7 +87,7 @@ def main():
         print(__doc__)
         sys.exit(1)
     
-    gateway_url = "http://localhost:8060"
+    gateway_url = "http://localhost:8000"
     
     if sys.argv[1] == "--list":
         asyncio.run(list_info(gateway_url))

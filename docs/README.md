@@ -6,7 +6,7 @@ Welcome to the x402 + AP2 documentation! This directory contains all technical d
 
 ### 🚀 Getting Started
 - [Main README](../README.md) - Project overview and quick start
-- [Quick Start Guide](../QUICKSTART.md) - Fast setup instructions
+- [Quick Start Guide](QUICKSTART.md) - Fast setup instructions
 
 ### 📘 User Guides
 Comprehensive guides for using the system:
@@ -35,12 +35,6 @@ Monitoring and tracing setup:
 - [**OpenTelemetry Collector Guide**](observability/otel-collector-minimal.md) - OTEL setup instructions
 - [**Collector Config**](observability/otel-collector.yaml) - Ready-to-use OTEL config
 
-### 📈 Progress & Reports
-Implementation tracking and reports:
-
-- [**Implementation Progress**](progress/implementation-progress.md) - Development changelog
-- [**Docs Update Report**](progress/DOCS_UPDATE_REPORT.md) - Documentation audit report
-
 ---
 
 ## 📁 Directory Structure
@@ -60,12 +54,9 @@ docs/
 ├── design/                            # Design documents
 │   ├── AGENT_TRACE_ENHANCEMENT.md
 │   └── OPEN_SOURCE_AND_CO_DEPLOY_PLAN.md
-├── observability/                     # Monitoring and tracing
-│   ├── otel-collector-minimal.md
-│   └── otel-collector.yaml
-└── progress/                          # Progress tracking
-    ├── implementation-progress.md
-    └── DOCS_UPDATE_REPORT.md
+└── observability/                     # Monitoring and tracing
+    ├── otel-collector-minimal.md
+    └── otel-collector.yaml
 ```
 
 ---
@@ -82,7 +73,6 @@ docs/
 - **Learn about trace format** → [specs/TRACE_PAYLOAD_FORMAT.md](specs/TRACE_PAYLOAD_FORMAT.md)
 - **See the architecture** → [design/OPEN_SOURCE_AND_CO_DEPLOY_PLAN.md](design/OPEN_SOURCE_AND_CO_DEPLOY_PLAN.md)
 - **Setup observability** → [observability/otel-collector-minimal.md](observability/otel-collector-minimal.md)
-- **Track progress** → [progress/implementation-progress.md](progress/implementation-progress.md)
 
 ---
 
@@ -94,7 +84,6 @@ When adding new documentation:
 2. **Specs** - Technical specifications and formal definitions
 3. **Design** - Architecture decisions and enhancement proposals
 4. **Observability** - Monitoring, tracing, and debugging setup
-5. **Progress** - Implementation tracking and reports
 
 Update this index when adding new documents!
 

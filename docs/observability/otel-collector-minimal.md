@@ -21,8 +21,8 @@ Run (Docker)
    export OTEL_SERVICE_NAME=buyer-demo       # optional; defaults to buyer-demo
 
 3) Run the buyer demo:
-   AGENT_GATEWAY_URL=http://localhost:8060 SELLER_BASE_URL=http://localhost:8010 \
-   uv run python packages/x402-secure-client/examples/buyer_agent_openai.py
+   AGENT_GATEWAY_URL=http://localhost:8000 SELLER_BASE_URL=http://localhost:8010 \
+   uv run python packages/x402-secure/examples/buyer_agent_openai.py
 
 Expected
 - The Collector container logs a line per span (from the logging exporter).

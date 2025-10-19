@@ -52,7 +52,7 @@ Agent trace context is the complete execution record of an AI agent, including:
 ```bash
 # Query complete agent trace
 TID="59db88a1-fda6-4d9c-9945-6d083f4a12a8"
-curl -sS "http://localhost:8060/risk/trace/$TID" | python3 -m json.tool
+curl -sS "http://localhost:8000/risk/trace/$TID" | python3 -m json.tool
 ```
 
 **Returns**:
@@ -228,8 +228,8 @@ export BUYER_PRIVATE_KEY=<your_private_key>
 
 # 2. Run agent and save output
 export OPENAI_API_KEY=sk-...
-AGENT_GATEWAY_URL=http://localhost:8060 SELLER_BASE_URL=http://localhost:8010 \
-uv run python packages/x402-secure-client/examples/buyer_agent_openai.py > /tmp/agent_run.txt 2>&1
+AGENT_GATEWAY_URL=http://localhost:8000 SELLER_BASE_URL=http://localhost:8010 \
+uv run python packages/x402-secure/examples/buyer_agent_openai.py > /tmp/agent_run.txt 2>&1
 
 # 3. View agent trace summary
 grep -A 15 "AGENT TRACE CONTEXT" /tmp/agent_run.txt
@@ -239,7 +239,7 @@ TID=$(grep "Agent trace uploaded, tid:" /tmp/agent_run.txt | head -1 | sed 's/.*
 echo "TID: $TID"
 
 # 5. Query complete trace
-curl -sS "http://localhost:8060/risk/trace/$TID" | python3 -m json.tool > /tmp/full_trace.json
+curl -sS "http://localhost:8000/risk/trace/$TID" | python3 -m json.tool > /tmp/full_trace.json
 cat /tmp/full_trace.json
 
 # 6. View events only

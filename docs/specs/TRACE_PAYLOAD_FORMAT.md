@@ -204,15 +204,15 @@ pkill -f run_facilitator_proxy
 
 # 2. Restart proxy (will load new code)
 PROXY_LOCAL_RISK=1 \
-PROXY_PORT=8060 \
+PROXY_PORT=8000 \
 PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify \
 PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle \
 uv run python run_facilitator_proxy.py
 
 # 3. Run buyer in another terminal
-AGENT_GATEWAY_URL=http://localhost:8060 \
+AGENT_GATEWAY_URL=http://localhost:8000 \
 SELLER_BASE_URL=http://localhost:8010 \
-uv run python packages/x402-secure-client/examples/buyer_agent_openai.py
+uv run python packages/x402-secure/examples/buyer_agent_openai.py
 ```
 
 ---

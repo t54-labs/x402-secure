@@ -15,19 +15,21 @@ This guide helps AI agent developers integrate x402-secure for protected payment
 
 - Python 3.11+
 - An Ethereum wallet with private key
-- OpenAI API key (if using OpenAI)
+- OpenAI API key (if using OpenAI for agent traces)
 - Basic understanding of async Python
+- OpenTelemetry SDK (installed via the `otel` extra) for X-PAYMENT-SECURE trace headers
 
 ## Installation
 
 ```bash
-pip install x402-secure-client
+# Basic installation (includes OpenAI client dependency)
+pip install x402-secure
+
+# For full buyer functionality (EIP-3009 signing + OpenTelemetry tracing)
+pip install x402-secure[signing,otel]
 ```
 
-For OpenAI integration:
-```bash
-pip install x402-secure-client[openai]
-```
+**Note**: The package is imported as `x402_secure_client`.
 
 ## Basic Integration
 
@@ -35,18 +37,24 @@ pip install x402-secure-client[openai]
 
 ```python
 import os
-from x402_secure_client import BuyerClient, BuyerConfig, RiskClient, OpenAITraceCollector
+from x402_secure_client import (
+    BuyerClient, BuyerConfig, RiskClient, 
+    OpenAITraceCollector, setup_otel_from_env
+)
+
+# Initialize OpenTelemetry first (required for X-PAYMENT-SECURE headers)
+setup_otel_from_env()
 
 # Required environment variables
-PRIVATE_KEY = os.getenv("AGENT_PRIVATE_KEY")  # Your agent's wallet
+BUYER_PRIVATE_KEY = os.getenv("BUYER_PRIVATE_KEY")  # Your agent's wallet
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # If using OpenAI
 
 # Initialize buyer client
 buyer = BuyerClient(BuyerConfig(
     seller_base_url="https://api.example.com",
     agent_gateway_url="https://x402-proxy.t54.ai",
-    buyer_private_key=PRIVATE_KEY,
-    network="base"  # or "base-sepolia" for testing
+    buyer_private_key=BUYER_PRIVATE_KEY,
+    network="base-sepolia"  # or "base" for mainnet
 ))
 
 # Initialize risk client
@@ -67,8 +75,12 @@ tracer = OpenAITraceCollector()
 
 # Automatic trace collection with OpenAI streaming
 async def agent_task(user_request: str):
-    # Create risk session first
-    session = await risk_client.create_session(agent_did=buyer.address)
+    # Create risk session first (all parameters are keyword-only)
+    session = await risk_client.create_session(
+        agent_did=buyer.address,
+        app_id="my-agent-v1",
+        device={"ua": "my-agent"}
+    )
     sid = session['sid']
     
     # Define the purchase tool
@@ -115,13 +127,18 @@ async def agent_task(user_request: str):
     if "make_purchase" in result.get("tool_results", {}):
         purchase_data = result["tool_results"]["make_purchase"]
         
-        # Store trace and get trace ID
+        # Store trace and get trace ID (environment is required)
         tid = await store_agent_trace(
             risk=risk_client,
             sid=sid,
             task=f"Purchase {purchase_data['item']}",
             params=purchase_data,
-            events=tracer.events
+            environment={
+                "network": buyer.cfg.network,
+                "seller_base_url": buyer.cfg.seller_base_url
+            },
+            events=tracer.events,
+            model_config=tracer.model_config
         )
         
         # Execute payment with protection
@@ -140,10 +157,8 @@ async def agent_task(user_request: str):
 #### LangChain Integration (Coming Soon)
 
 ```python
-from x402_secure_client import LangChainTraceCollector
-
-# Future support
-tracer = LangChainTraceCollector()
+# Future support - custom trace collector for LangChain
+# tracer = LangChainTraceCollector()
 # ... integrate with your LangChain agent
 ```
 
@@ -152,10 +167,11 @@ tracer = LangChainTraceCollector()
 ```python
 # Complete payment flow example
 async def make_payment(task: str, endpoint: str, params: dict):
-    # 1. Create risk session
+    # 1. Create risk session (all parameters are keyword-only)
     session = await risk_client.create_session(
         agent_did=buyer.address,
-        app_id="my-agent-v1"
+        app_id="my-agent-v1",
+        device={"ua": "my-agent"}
     )
     sid = session['sid']
     
@@ -165,8 +181,11 @@ async def make_payment(task: str, endpoint: str, params: dict):
         sid=sid,
         task=task,
         params=params,
+        environment={
+            "network": buyer.cfg.network,
+            "seller_base_url": buyer.cfg.seller_base_url
+        },
         events=tracer.events,  # Your collected trace events
-        environment={"network": "base-sepolia"},
         model_config=tracer.model_config
     )
     
@@ -196,81 +215,119 @@ result = await make_payment(
 
 ### 1. Session Management
 
-For better risk assessment across multiple transactions:
+Reuse a single session ID across a conversation, but create a new trace ID per payment:
 
 ```python
 # Create a session for a user interaction
-session = await client.create_session(
-    user_id="user123",
-    app_id="shopping-agent-v1"
+session = await risk_client.create_session(
+    agent_did=buyer.address,
+    app_id="shopping-agent-v1",
+    device={"ua": "my-agent"}
+)
+sid = session['sid']
+
+# For each purchase in the conversation:
+# 1. Create new trace
+tid = await store_agent_trace(
+    risk=risk_client,
+    sid=sid,  # Reuse session
+    task="Purchase item",
+    params={"item": "Coffee Maker"},
+    environment={"network": buyer.cfg.network, "seller_base_url": buyer.cfg.seller_base_url},
+    events=tracer.events,
+    model_config=tracer.model_config
 )
 
-# Use session for all related payments
-result = await client.protected_payment(
-    merchant="store.com",
-    amount="50.00",
-    reason="User shopping cart",
-    trace=tracer.get_events(),
-    session_id=session.id
+# 2. Execute payment with trace ID
+result = await execute_payment_with_tid(
+    buyer=buyer,
+    endpoint="/api/purchase",
+    task="Purchase item",
+    params={"item": "Coffee Maker"},
+    sid=sid,
+    tid=tid
 )
 ```
 
-### 2. Risk Threshold Configuration
+### 2. Trace Enrichment
+
+Add context to improve risk assessment using tracer methods:
 
 ```python
-# Configure risk tolerance
-client = BuyerClient(
-    proxy_url="https://x402-proxy.t54.ai",
-    private_key=PRIVATE_KEY,
-    risk_config={
-        "max_amount_per_tx": "100.00",      # Max per transaction
-        "max_amount_per_day": "500.00",     # Daily limit
-        "require_explicit_amount": True,     # User must mention amount
-        "allowed_merchants": ["*.example.com", "trusted-api.com"]
-    }
+# Record user input
+tracer.record_user_input("I want to buy a coffee maker for under $100")
+
+# Record system prompt if applicable
+tracer.record_system_prompt("You are a helpful shopping assistant.", version="v1.0")
+
+# Set model configuration
+tracer.set_model_config(
+    provider="openai",
+    model="gpt-4",
+    tools_enabled=["make_purchase", "check_inventory"]
 )
-```
 
-### 3. Trace Enrichment
+# Record agent output
+tracer.record_agent_output("I found a coffee maker for $89.99. Shall I proceed?")
 
-Add context to improve risk assessment:
-
-```python
-# Enrich trace with user context
-tracer.add_context({
-    "user_history": {
-        "account_age_days": 365,
-        "previous_purchases": 42,
-        "dispute_rate": 0.02
-    },
-    "session_info": {
+# Store trace with model_config and optional session_context
+tid = await store_agent_trace(
+    risk=risk_client,
+    sid=sid,
+    task="Purchase coffee maker",
+    params={"item": "Coffee Maker", "max_price": 100},
+    environment={"network": buyer.cfg.network, "seller_base_url": buyer.cfg.seller_base_url},
+    events=tracer.events,
+    model_config=tracer.model_config,
+    session_context={
+        "user_id": "user123",
         "auth_method": "oauth",
         "device_trusted": True
     }
-})
-
-# The context is included with the trace
-result = await client.protected_payment(...)
+)
 ```
 
-### 4. Async Batch Payments
+### 3. Async Batch Payments
+
+Process multiple payments by reusing the session and creating a new trace per item:
 
 ```python
-# Process multiple payments efficiently
+# Create session once
+sid = (await risk_client.create_session(
+    agent_did=buyer.address,
+    app_id="batch-processor",
+    device={"ua": "my-agent"}
+))['sid']
+
+# Process multiple payments
 payments = [
-    {"merchant": "api1.com", "amount": "10.00", "reason": "API credits"},
-    {"merchant": "api2.com", "amount": "15.00", "reason": "Data access"},
-    {"merchant": "api3.com", "amount": "20.00", "reason": "Premium features"}
+    {"endpoint": "/api/credits", "item": "API credits", "amount": "10.00"},
+    {"endpoint": "/api/data", "item": "Data access", "amount": "15.00"},
+    {"endpoint": "/api/premium", "item": "Premium features", "amount": "20.00"}
 ]
 
-results = await client.batch_protected_payments(
-    payments=payments,
-    trace=tracer.get_events(),
-    stop_on_failure=True  # Stop if any payment fails
-)
-
-for payment, result in zip(payments, results):
-    print(f"{payment['merchant']}: {'✅' if result.approved else '❌'}")
+for payment in payments:
+    # Create new trace for each payment
+    tid = await store_agent_trace(
+        risk=risk_client,
+        sid=sid,  # Reuse session
+        task=f"Purchase {payment['item']}",
+        params={"item": payment['item'], "amount": payment['amount']},
+        environment={"network": buyer.cfg.network, "seller_base_url": buyer.cfg.seller_base_url},
+        events=tracer.events,
+        model_config=tracer.model_config
+    )
+    
+    # Execute payment
+    result = await execute_payment_with_tid(
+        buyer=buyer,
+        endpoint=payment['endpoint'],
+        task=f"Purchase {payment['item']}",
+        params={"amount": payment['amount']},
+        sid=sid,
+        tid=tid
+    )
+    print(f"{payment['item']}: ✅ {result}")
 ```
 
 ## Error Handling
@@ -278,108 +335,168 @@ for payment, result in zip(payments, results):
 ### Common Errors and Solutions
 
 ```python
-from x402_secure_client.errors import (
-    InsufficientFundsError,
-    RiskBlockedError,
-    NetworkError,
-    InvalidMerchantError
-)
+import httpx
+import asyncio
 
 try:
-    result = await client.protected_payment(...)
-except InsufficientFundsError:
-    # Handle insufficient balance
-    print("Please add funds to your agent wallet")
-except RiskBlockedError as e:
-    # Payment blocked by risk engine
-    print(f"Payment blocked: {e.reason}")
-    print(f"Risk factors: {e.risk_factors}")
-except InvalidMerchantError:
-    # Merchant not recognized or blocked
-    print("This merchant is not approved")
-except NetworkError:
-    # Network issues - safe to retry
+    result = await execute_payment_with_tid(
+        buyer=buyer,
+        endpoint="/api/purchase",
+        task="Purchase item",
+        params={"item": "Coffee"},
+        sid=sid,
+        tid=tid
+    )
+except httpx.HTTPStatusError as e:
+    # Non-2xx response from seller or proxy
+    print(f"Payment failed: {e.response.status_code}")
+    print(f"Response: {e.response.text}")
+    # Check specific status codes:
+    if e.response.status_code == 402:
+        print("Payment required - check wallet balance")
+    elif e.response.status_code == 403:
+        print("Payment blocked by risk engine or seller")
+    elif e.response.status_code == 404:
+        print("Endpoint not found")
+except httpx.RequestError as e:
+    # Network issues - retryable
+    print(f"Network error: {e}")
     await asyncio.sleep(5)
-    result = await client.protected_payment(...)  # Retry
+    # Retry logic here
+except RuntimeError as e:
+    # SDK precondition failures
+    print(f"SDK error: {e}")
+    # Examples: missing BUYER_PRIVATE_KEY, missing X-PAYMENT-SECURE
+except ValueError as e:
+    # Invalid parameters
+    print(f"Invalid input: {e}")
 ```
 
-### Checking Protection Status
+### Retry Pattern for Network Errors
 
 ```python
-# Later, check if a payment is still protected
-protection = await client.check_protection(protection_id)
-
-print(f"Status: {protection.status}")  # active, disputed, resolved
-print(f"Coverage: {protection.coverage_amount}")
-print(f"Expires: {protection.expires_at}")
-
-if protection.status == "disputed":
-    print(f"Dispute reason: {protection.dispute_reason}")
-    print(f"Your evidence: {protection.evidence_url}")
+async def execute_payment_with_retry(buyer, endpoint, task, params, sid, tid, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return await execute_payment_with_tid(
+                buyer=buyer,
+                endpoint=endpoint,
+                task=task,
+                params=params,
+                sid=sid,
+                tid=tid
+            )
+        except httpx.RequestError as e:
+            if attempt == max_retries - 1:
+                raise
+            print(f"Retry {attempt + 1}/{max_retries} after network error: {e}")
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
 ```
 
 ## Testing
 
-### 1. Test Environment Setup
+### 1. Local Test Environment Setup
 
-```python
-# Use test network
-test_client = BuyerClient(
-    proxy_url="https://test.x402-proxy.t54.ai",
-    private_key=TEST_PRIVATE_KEY,
-    network="base-sepolia"
-)
+Run the proxy locally for testing (see `docs/DEVELOPMENT.md` for details):
 
-# Test payments won't charge real money
-result = await test_client.protected_payment(
-    merchant="test.example.com",
-    amount="100.00",
-    reason="Test payment",
-    trace=tracer.get_events()
-)
+```bash
+# Set environment variables
+export AGENT_GATEWAY_URL=http://localhost:8000
+export SELLER_BASE_URL=http://localhost:8010
+export NETWORK=base-sepolia
+export BUYER_PRIVATE_KEY=0x...  # Your test wallet private key
 ```
 
-### 2. Simulating Risk Scenarios
-
 ```python
-# Test high-risk payment
-tracer.add_context({"test_scenario": "high_risk"})
+import os
+from x402_secure_client import (
+    BuyerClient, BuyerConfig, RiskClient,
+    setup_otel_from_env
+)
 
-# Test blocked payment
-tracer.add_context({"test_scenario": "block_payment"})
+# Initialize for local testing
+setup_otel_from_env()
 
-# Test dispute flow
-tracer.add_context({"test_scenario": "will_dispute"})
+buyer = BuyerClient(BuyerConfig(
+    seller_base_url=os.getenv("SELLER_BASE_URL", "http://localhost:8010"),
+    agent_gateway_url=os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000"),
+    network="base-sepolia",
+    buyer_private_key=os.getenv("BUYER_PRIVATE_KEY")
+))
+
+risk_client = RiskClient(os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000"))
 ```
+
+### 2. Running Example Scripts
+
+The SDK ships with working examples:
+
+```bash
+# Basic payment example
+cd packages/x402-secure/examples
+python buyer_basic.py
+
+# OpenAI agent example (requires OPENAI_API_KEY)
+python buyer_agent_openai.py
+```
+
+See `packages/x402-secure/examples/README.md` for details.
 
 ### 3. Integration Tests
 
 ```python
 import pytest
-from x402_secure_client.testing import MockBuyerClient, MockTracer
+from x402_secure_client import (
+    BuyerClient, BuyerConfig, RiskClient,
+    OpenAITraceCollector, store_agent_trace, execute_payment_with_tid,
+    setup_otel_from_env
+)
 
 @pytest.mark.asyncio
 async def test_payment_flow():
-    # Use mock client for testing
-    client = MockBuyerClient()
-    tracer = MockTracer()
+    setup_otel_from_env()
+    
+    buyer = BuyerClient(BuyerConfig(
+        seller_base_url="http://localhost:8010",
+        agent_gateway_url="http://localhost:8000",
+        network="base-sepolia",
+        buyer_private_key=os.getenv("BUYER_PRIVATE_KEY")
+    ))
+    
+    risk = RiskClient("http://localhost:8000")
+    tracer = OpenAITraceCollector()
     
     # Simulate agent interaction
-    tracer.add_event("tool_call", {
-        "name": "make_purchase",
-        "args": {"item": "Test Item", "price": "10.00"}
-    })
+    tracer.record_user_input("Buy test item")
+    tracer.record_agent_output("Purchasing test item")
     
-    # Test payment
-    result = await client.protected_payment(
-        merchant="test.com",
-        amount="10.00",
-        reason="Test purchase",
-        trace=tracer.get_events()
+    # Create session and trace
+    sid = (await risk.create_session(
+        agent_did=buyer.address,
+        app_id="test-agent",
+        device={"ua": "pytest"}
+    ))['sid']
+    
+    tid = await store_agent_trace(
+        risk=risk,
+        sid=sid,
+        task="Test purchase",
+        params={"item": "Test Item"},
+        environment={"network": "base-sepolia", "seller_base_url": "http://localhost:8010"},
+        events=tracer.events
     )
     
-    assert result.approved
-    assert result.protection_id is not None
+    # Execute payment
+    result = await execute_payment_with_tid(
+        buyer=buyer,
+        endpoint="/api/test",
+        task="Test purchase",
+        params={"item": "Test Item"},
+        sid=sid,
+        tid=tid
+    )
+    
+    assert result is not None
 ```
 
 ## Production Checklist
@@ -418,6 +535,7 @@ Before going live:
 
 ## Support
 
-- 📧 Email: support@x402-secure.com
-- 💬 Discord: [Join our community](https://discord.gg/x402secure)
-- 📖 API Docs: [docs.x402-secure.com](https://docs.x402-secure.com)
+- 📧 Email: support@t54.ai
+- 💬 Discord: [Join our community](https://discord.gg/t54labs)
+- 📖 Documentation: [docs.t54.ai](https://docs.t54.ai)
+- 🔗 GitHub: [github.com/t54labs/x402-secure](https://github.com/t54labs/x402-secure)

@@ -39,10 +39,10 @@ uv run python scripts/create_wallets.py
 
 ## 📋 Complete Manual Commands (For Debugging)
 
-### Terminal 1: Start Proxy (8060)
+### Terminal 1: Start Proxy (8000)
 ```bash
 PROXY_LOCAL_RISK=1 \
-PROXY_PORT=8060 \
+PROXY_PORT=8000 \
 PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify \
 PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle \
 uv run python run_facilitator_proxy.py
@@ -50,25 +50,25 @@ uv run python run_facilitator_proxy.py
 
 ### Terminal 2: Start Seller (8010)
 ```bash
-PROXY_BASE=http://localhost:8060/x402 \
-uv run uvicorn --app-dir packages/x402-secure-client/examples seller_integration:app --port 8010
+PROXY_BASE=http://localhost:8000/x402 \
+uv run uvicorn --app-dir packages/x402-secure/examples seller_integration:app --port 8010
 ```
 
 ### Terminal 3: Run Buyer
 
 **Option A: Basic Example**
 ```bash
-AGENT_GATEWAY_URL=http://localhost:8060 \
+AGENT_GATEWAY_URL=http://localhost:8000 \
 SELLER_BASE_URL=http://localhost:8010 \
-uv run python packages/x402-secure-client/examples/buyer_basic.py
+uv run python packages/x402-secure/examples/buyer_basic.py
 ```
 
 **Option B: OpenAI Agent Example**
 ```bash
 export OPENAI_API_KEY=sk-proj-...
-AGENT_GATEWAY_URL=http://localhost:8060 \
+AGENT_GATEWAY_URL=http://localhost:8000 \
 SELLER_BASE_URL=http://localhost:8010 \
-uv run python packages/x402-secure-client/examples/buyer_agent_openai.py
+uv run python packages/x402-secure/examples/buyer_agent_openai.py
 ```
 
 ---

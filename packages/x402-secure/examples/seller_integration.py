@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI(title="Seller Example (OSS)")
 
-PROXY_BASE = os.getenv("PROXY_BASE", "http://localhost:8000/x402")
-seller_sdk = SellerClient(PROXY_BASE)
+GATEWAY = os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000")
+seller_sdk = SellerClient(GATEWAY)
 
 
 @app.get("/api/market-data")

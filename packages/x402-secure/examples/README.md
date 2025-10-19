@@ -37,9 +37,9 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 - `OPENAI_API_KEY` - OpenAI API key (for agent examples)
 
 ### Optional (with defaults)
-- `AGENT_GATEWAY_URL` - Facilitator proxy URL (default: http://localhost:8000)
+- `AGENT_GATEWAY_URL` - Agent gateway base URL (default: http://localhost:8000)
+  - Used by buyers for `/risk/*` endpoints and sellers for `/x402/*` proxy endpoints
 - `SELLER_BASE_URL` - Seller API URL (default: http://localhost:8010)
-- `PROXY_BASE` - Proxy base for sellers (default: http://localhost:8000/x402) ⚠️ Must be port 8000!
 - `NETWORK` - Blockchain network (default: base-sepolia)
 - `OPENAI_MODEL` - AI model (default: gpt-5-mini)
 - `MERCHANT_PAYTO` - Merchant wallet address
@@ -135,10 +135,11 @@ kill <PID>
 ```
 
 ### Seller gets 404 on /x402/verify
-Check `PROXY_BASE` in `.env` points to port **8000** (facilitator proxy), not 8010:
+Ensure `AGENT_GATEWAY_URL` points to the facilitator proxy (port **8000**), not the seller port:
 ```bash
-PROXY_BASE=http://localhost:8000/x402
+AGENT_GATEWAY_URL=http://localhost:8000
 ```
+The `SellerClient` automatically appends `/x402` to the gateway URL.
 
 ### ModuleNotFoundError
 Install with examples support:

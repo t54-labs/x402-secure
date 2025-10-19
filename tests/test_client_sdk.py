@@ -118,7 +118,7 @@ class TestSellerClient:
     def seller_client(self, test_env):
         """Create seller client instance."""
         from x402_secure_client.seller import SellerClient
-        return SellerClient(proxy_base="http://localhost:8000")
+        return SellerClient(gateway_base_url="http://localhost:8000")
     
     async def test_verify_payment(self, seller_client):
         """Test payment verification."""

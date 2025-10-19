@@ -208,7 +208,7 @@ python scripts/view_trace.py dde4fbf8-1448-43c0-a556-e6e98353416b
 ### Or Use curl Directly
 
 ```bash
-curl http://localhost:8060/risk/trace/dde4fbf8-1448-43c0-a556-e6e98353416b | jq
+curl http://localhost:8000/risk/trace/dde4fbf8-1448-43c0-a556-e6e98353416b | jq
 ```
 
 Output example:

@@ -89,6 +89,8 @@ cd x402-secure
 
 ### 2. Install Dependencies
 
+> **Important**: Use `uv sync` to install all workspace dependencies. This command installs the local packages (`x402-proxy` and `x402-secure`) in editable mode as defined in `[tool.uv.sources]` in the root `pyproject.toml`.
+
 ```bash
 # Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -98,6 +100,11 @@ uv venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 uv sync
 ```
+
+The `uv sync` command:
+- Installs all dependencies from `pyproject.toml` and `uv.lock`
+- Automatically installs local packages (`x402-proxy` and `x402-secure`) in editable mode
+- Ensures consistent dependency versions across environments
 
 ### 3. Environment Configuration
 
@@ -139,8 +146,8 @@ uv run python packages/x402-secure/examples/buyer_agent_openai.py
 # Run all tests
 uv run pytest
 
-# Run specific test file
-uv run pytest tests/test_proxy.py
+# Run specific test file (without coverage check)
+uv run pytest tests/test_core_flows.py --no-cov
 
 # Run with coverage
 uv run pytest --cov=x402_secure --cov-report=html
@@ -151,85 +158,32 @@ uv run pytest --cov=x402_secure --cov-report=html
 ### Option 1: Docker Deployment
 
 ```yaml
-# docker-compose.yml
-version: '3.8'
-
+# docker-compose.yml (production example)
 services:
-  proxy:
-    image: ghcr.io/t54labs/x402-secure-proxy:latest
+  facilitator-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
     ports:
       - "8000:8000"
     environment:
       - PROXY_LOCAL_RISK=0
       - RISK_ENGINE_URL=<TRUSTLINE_API_URL>
-      - PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
-      - PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
+      - UPSTREAM_FACILITATOR_BASE_URL=https://x402.org/facilitator
+      - AGENT_GATEWAY_URL=http://your-domain.com:8000
       - RISK_INTERNAL_TOKEN=${RISK_INTERNAL_TOKEN}
     restart: unless-stopped
 ```
 
 ```bash
-# Start services
+# Build and start services
 docker-compose up -d
 
 # View logs
-docker-compose logs -f proxy
+docker-compose logs -f facilitator-proxy
 ```
 
-### Option 2: Kubernetes Deployment
-
-```yaml
-# k8s/deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: x402-secure-proxy
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: x402-secure-proxy
-  template:
-    metadata:
-      labels:
-        app: x402-secure-proxy
-    spec:
-      containers:
-      - name: proxy
-        image: ghcr.io/t54labs/x402-secure-proxy:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: PROXY_LOCAL_RISK
-          value: "0"
-        - name: RISK_ENGINE_URL
-          value: "<TRUSTLINE_API_URL>"
-        - name: RISK_INTERNAL_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: x402-secure-secrets
-              key: risk-token
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "250m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: x402-secure-proxy
-spec:
-  selector:
-    app: x402-secure-proxy
-  ports:
-  - port: 80
-    targetPort: 8000
-```
-
-### Option 3: Manual Deployment
+### Option 2: Manual Deployment
 
 ```bash
 # On your server
@@ -254,38 +208,6 @@ gunicorn -w 4 -k uvicorn.workers.UvicornWorker \
   run_facilitator_proxy:app
 ```
 
-### Monitoring & Observability
-
-```python
-# Add to your deployment
-from prometheus_client import Counter, Histogram, generate_latest
-import time
-
-# Metrics
-payment_requests = Counter('payment_requests_total', 'Total payment requests')
-payment_success = Counter('payment_success_total', 'Successful payments')
-payment_failed = Counter('payment_failed_total', 'Failed payments')
-risk_evaluation_time = Histogram('risk_evaluation_seconds', 'Risk evaluation time')
-
-# Instrument your code
-@app.post("/x402/verify")
-async def verify_payment(request: Request):
-    payment_requests.inc()
-    
-    with risk_evaluation_time.time():
-        # ... risk evaluation logic
-        pass
-    
-    if approved:
-        payment_success.inc()
-    else:
-        payment_failed.inc()
-
-# Metrics endpoint
-@app.get("/metrics")
-async def metrics():
-    return Response(generate_latest(), media_type="text/plain")
-```
 
 ## Contributing
 
@@ -367,42 +289,74 @@ class TestBuyerClient:
 ```python
 # How trace collection works internally
 class OpenAITraceCollector:
-    def __init__(self):
-        self.events = []
-        self.context = {}
+    def __init__(self, coalesce: bool = True):
+        self.events: List[Dict[str, Any]] = []
+        self.coalesce = coalesce
+        self.model_config: Dict[str, Any] = {}
+        self.started_at: Optional[float] = None
+        self.completed_at: Optional[float] = None
     
-    async def trace(self):
-        # Context manager for automatic collection
-        self.start_trace()
-        try:
-            yield self
-        finally:
-            self.end_trace()
+    def set_model_config(self, *, provider: str = "openai", model: str, 
+                         tools_enabled: Optional[List[str]] = None) -> None:
+        """Set model configuration for trace context."""
+        self.model_config = {
+            "provider": provider,
+            "model": model,
+            "tools_enabled": tools_enabled or []
+        }
     
-    def collect_event(self, event_type: str, data: dict):
-        self.events.append({
-            "type": event_type,
-            "timestamp": time.time(),
-            "data": data,
-            "context": self.context.copy()
-        })
+    async def process_stream(self, stream, tools: dict) -> dict:
+        """Process OpenAI stream and execute tools, collecting events."""
+        # Processes stream, collects events automatically
+        # Returns tool results
+        pass
+
+# Usage example
+tracer = OpenAITraceCollector()
+tracer.set_model_config(provider="openai", model="gpt-5-mini")
+
+with client.responses.stream(model="gpt-5-mini", input=messages, tools=tool_defs) as stream:
+    result = asyncio.get_event_loop().run_until_complete(
+        tracer.process_stream(stream, tools=wrapped_tools)
+    )
+
+# Recorded events are stored for risk upload
+events = tracer.events
 ```
 
 #### Risk Client
 
 ```python
-# Risk session management
+# Risk session and trace management
 class RiskClient:
-    async def create_session(self, **kwargs) -> Session:
-        response = await self.http.post("/risk/session", json=kwargs)
-        return Session(**response.json())
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.http = httpx.AsyncClient(timeout=15.0)
     
-    async def submit_trace(self, session_id: str, events: List[dict]) -> str:
-        response = await self.http.post(
-            f"/risk/trace/{session_id}",
-            json={"events": events}
+    async def create_session(self, *, agent_did: str, app_id: Optional[str], 
+                             device: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create a risk session with agent identification.
+        
+        Returns: Dict containing 'sid' (session ID) and other metadata
+        """
+        r = await self.http.post(
+            f"{self.base_url}/risk/session",
+            json={"agent_did": agent_did, "app_id": app_id, "device": device}
         )
-        return response.json()["trace_id"]
+        r.raise_for_status()
+        return r.json()  # {"sid": "...", "expires_at": "..."}
+    
+    async def create_trace(self, *, sid: str, agent_trace: Dict[str, Any]) -> Dict[str, Any]:
+        """Upload agent trace data linked to a session.
+        
+        Returns: Dict containing 'tid' (trace ID)
+        """
+        r = await self.http.post(
+            f"{self.base_url}/risk/trace",
+            json={"sid": sid, "agent_trace": agent_trace}
+        )
+        r.raise_for_status()
+        return r.json()  # {"tid": "..."}
 ```
 
 ### Proxy Implementation
@@ -410,53 +364,81 @@ class RiskClient:
 #### Header Processing
 
 ```python
-# How the proxy processes payment headers
-async def process_payment_headers(request: Request) -> PaymentInfo:
-    # Extract headers
-    receipt = request.headers.get("X-Payment-Receipt")
-    signature = request.headers.get("X-Payment-Signature") 
-    risk_session = request.headers.get("X-Risk-Session")
-    secure_context = request.headers.get("X-Payment-Secure")
+# How the proxy processes payment security headers
+from proxy.src.x402_proxy.headers import parse_x_payment_secure, parse_risk_ids
+
+async def process_payment_headers(request: Request) -> dict:
+    # Extract and validate required headers
+    x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
+    x_risk_session = request.headers.get("X-RISK-SESSION")
     
-    # Validate signature
-    if not verify_signature(receipt, signature):
-        raise InvalidSignatureError()
+    if not x_payment_secure:
+        raise HeaderError("X-PAYMENT-SECURE required")
     
-    # Parse trace context
-    trace_info = parse_trace_context(secure_context)
+    # Parse session ID (required) and optional trace ID
+    sid, tid = parse_risk_ids(x_risk_session, None)
     
-    return PaymentInfo(
-        receipt=receipt,
-        signature=signature,
-        risk_session=risk_session,
-        trace_id=trace_info.get("tid")
-    )
+    # Parse W3C trace context from X-PAYMENT-SECURE
+    # Format: 'w3c.v1;tp=<traceparent>;ts=<url-encoded-tracestate>'
+    tc = parse_x_payment_secure(x_payment_secure)
+    # Returns: {"tp": "00-...-...-00", "ts": "..."}
+    
+    # Extract tid from tracestate if present and not in header
+    extracted_tid = tid
+    if not extracted_tid and "ts" in tc:
+        try:
+            from urllib.parse import unquote
+            import base64, json
+            ts_decoded = unquote(tc["ts"])
+            ts_json = json.loads(base64.b64decode(ts_decoded))
+            extracted_tid = ts_json.get("tid")
+        except Exception:
+            pass
+    
+    return {
+        "sid": sid,
+        "tid": extracted_tid,
+        "trace_context": tc
+    }
 ```
 
 #### Risk Evaluation
 
 ```python
 # Risk evaluation logic
-async def evaluate_risk(payment_info: PaymentInfo) -> RiskDecision:
-    # Call Trustline API
-    response = await trustline_client.post(
-        "/risk/evaluate",
-        json={
-            "session_id": payment_info.risk_session,
-            "trace_id": payment_info.trace_id,
-            "amount": payment_info.amount,
-            "merchant": payment_info.merchant
-        }
-    )
+async def evaluate_risk(context: dict, payment_context: dict) -> dict:
+    # Build evaluation request
+    evaluate_json = {
+        "sid": context["sid"],  # Required: session ID
+        "trace_context": context["trace_context"],  # Required: {"tp": "...", "ts": "..."}
+        "payment": payment_context,  # Payment details
+    }
+    
+    # Include tid if available (links to uploaded agent trace)
+    if context.get("tid"):
+        evaluate_json["tid"] = context["tid"]
+    
+    # Call Risk Engine
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{risk_engine_url}/risk/evaluate",
+            json=evaluate_json
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
     
     risk_data = response.json()
     
-    return RiskDecision(
-        approved=risk_data["risk_score"] < 0.8,
-        score=risk_data["risk_score"],
-        factors=risk_data["factors"],
-        evidence_id=risk_data["evidence_id"]
-    )
+    # Response format:
+    # {
+    #   "decision": "allow" | "deny" | "challenge",
+    #   "decision_id": "uuid",
+    #   "ttl_seconds": 300,
+    #   "reasons": ["..."]
+    # }
+    
+    return risk_data
 ```
 
 ### Security Considerations

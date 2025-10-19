@@ -14,16 +14,9 @@ Env:
 
 import logging
 import os
-import sys
 from datetime import datetime, timezone
 
-# Add repo root to Python path
-repo_root = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, repo_root)
-sys.path.insert(0, os.path.join(repo_root, 'proxy', 'src'))
-sys.path.insert(0, os.path.join(repo_root, 'packages', 'x402-secure', 'src'))
-
-# Load .env BEFORE importing secure_x402 so env vars are available during module init
+# Load .env BEFORE importing packages so env vars are available during module init
 from dotenv import load_dotenv  # type: ignore
 load_dotenv()
 

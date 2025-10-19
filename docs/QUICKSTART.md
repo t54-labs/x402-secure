@@ -20,7 +20,11 @@ Get started with x402-secure in 5 minutes!
 ### 1. Install the SDK
 
 ```bash
-pip install x402-secure-client
+# Install with signing dependencies (required for payments)
+pip install x402-secure[signing]
+
+# Optional: Install OpenTelemetry for observability
+pip install x402-secure[signing,otel]
 ```
 
 ### 2. Get Test Wallet (Development)
@@ -30,7 +34,7 @@ pip install x402-secure-client
 python -c "from eth_account import Account; a = Account.create(); print(f'Address: {a.address}\nPrivate Key: {a.key.hex()}')"
 
 # Save the private key as environment variable
-export AGENT_PRIVATE_KEY=0x...  # Your private key from above
+export BUYER_PRIVATE_KEY=0x...  # Your private key from above
 ```
 
 ### 3. Create Your First Protected Payment
@@ -40,20 +44,28 @@ import asyncio
 import os
 from x402_secure_client import BuyerClient, BuyerConfig, RiskClient
 from x402_secure_client import execute_payment_with_tid, store_agent_trace
+from x402_secure_client.otel import setup_otel_from_env
 
 async def main():
+    # Optional: Initialize OpenTelemetry for observability
+    setup_otel_from_env()
+    
     # Initialize clients
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="https://test.example.com",
         agent_gateway_url="https://x402-proxy.t54.ai",
-        buyer_private_key=os.getenv("AGENT_PRIVATE_KEY"),
+        buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
         network="base-sepolia"  # Use testnet for development
     ))
     
     risk_client = RiskClient("https://x402-proxy.t54.ai")
     
-    # Create risk session
-    session = await risk_client.create_session(agent_did=buyer.address)
+    # Create risk session (requires app_id and device info)
+    session = await risk_client.create_session(
+        agent_did=buyer.address,
+        app_id=None,
+        device={"ua": "quickstart-demo"}
+    )
     sid = session['sid']
     
     # For testing: create a simple trace without AI
@@ -62,6 +74,10 @@ async def main():
         sid=sid,
         task="Test payment",
         params={"test": True},
+        environment={
+            "network": "base-sepolia",
+            "seller_base_url": "https://test.example.com"
+        },
         events=[]  # Empty events for testing
     )
     
@@ -92,21 +108,37 @@ from x402_secure_client import (
     BuyerClient, BuyerConfig, RiskClient, OpenAITraceCollector,
     store_agent_trace, execute_payment_with_tid
 )
+from x402_secure_client.otel import setup_otel_from_env
 
 async def shopping_agent():
+    # Initialize OpenTelemetry for observability
+    setup_otel_from_env()
+    
     # Initialize clients
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="https://shop.example.com",
         agent_gateway_url="https://x402-proxy.t54.ai",
-        buyer_private_key=os.getenv("AGENT_PRIVATE_KEY")
+        buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
+        network="base-sepolia"
     ))
     
     risk_client = RiskClient("https://x402-proxy.t54.ai")
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     tracer = OpenAITraceCollector()
     
-    # Create risk session
-    session = await risk_client.create_session(agent_did=buyer.address)
+    # Configure model info for trace context
+    tracer.set_model_config(
+        provider="openai",
+        model="gpt-4",
+        tools_enabled=["purchase_item"]
+    )
+    
+    # Create risk session (requires app_id and device info)
+    session = await risk_client.create_session(
+        agent_did=buyer.address,
+        app_id=None,
+        device={"ua": "shopping-agent"}
+    )
     sid = session['sid']
     
     # Define purchase tool
@@ -153,7 +185,13 @@ async def shopping_agent():
             sid=sid,
             task="Purchase coffee maker",
             params=purchase,
-            events=tracer.events
+            environment={
+                "network": "base-sepolia",
+                "seller_base_url": "https://shop.example.com"
+            },
+            events=tracer.events,
+            model_config=tracer.model_config,
+            session_context={"user_intent": "buy coffee maker"}
         )
         
         # Execute protected payment
@@ -185,11 +223,15 @@ asyncio.run(shopping_agent())
 ### 1. Install the SDK
 
 ```bash
-# For FastAPI
-pip install x402-secure-client[fastapi]
+# For FastAPI (recommended - includes all dependencies)
+pip install x402-secure[examples]
+
+# Or install framework separately
+pip install x402-secure fastapi uvicorn pydantic
 
 # For Flask
-pip install x402-secure-client[flask]
+pip install x402-secure flask
+# Note: Flask requires async support (Flask 3+ with async views or use Quart)
 ```
 
 ### 2. Add Payment Protection to Your API
@@ -207,7 +249,7 @@ app = FastAPI()
 # Initialize seller client
 seller = SellerClient("https://x402-proxy.t54.ai/x402")
 
-@app.post("/api/generate")
+@app.get("/api/generate")
 async def generate_content(request: Request, prompt: str):
     # Define payment requirements
     pr = {
@@ -261,8 +303,8 @@ import base64, json
 app = Flask(__name__)
 seller = SellerClient("https://x402-proxy.t54.ai/x402")
 
-@app.route("/api/analyze", methods=["POST"])
-def analyze_data():
+@app.route("/api/analyze", methods=["GET"])
+async def analyze_data():
     # Define payment requirements
     pr = {
         "scheme": "exact",
@@ -285,24 +327,25 @@ def analyze_data():
             "error": "Payment required"
         }), 402
     
-    # Note: Flask requires sync or asyncio wrapper
-    # This is simplified - see docs for async support
-    try:
-        payment_data = json.loads(base64.b64decode(x_payment))
-        # In production, use async wrapper for seller.verify_then_settle
-        # For now, assume sync version exists
-        
-        # Process request
-        data = request.json
-        result = f"Analysis complete for {len(data)} items"
-        
-        response = make_response(jsonify({"result": result}))
-        # Add payment response header
-        # response.headers["X-PAYMENT-RESPONSE"] = ...
-        return response
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 402
+    # Verify and settle payment
+    payment_data = json.loads(base64.b64decode(x_payment))
+    result = await seller.verify_then_settle(
+        payment_data, pr,
+        x_payment_b64=x_payment,
+        origin=request.headers.get("Origin"),
+        x_payment_secure=x_payment_secure,
+        risk_sid=risk_session
+    )
+    
+    # Process request
+    data = request.args.get("data", "test data")
+    analysis_result = f"Analysis complete for: {data}"
+    
+    response = make_response(jsonify({"result": analysis_result}))
+    response.headers["X-PAYMENT-RESPONSE"] = base64.b64encode(
+        json.dumps(result).encode()
+    ).decode()
+    return response
 
 # Run with: flask run
 ```
@@ -311,16 +354,15 @@ def analyze_data():
 
 ```bash
 # Test without payment (should return 402)
-curl -X POST http://localhost:8000/api/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello world"}'
+curl "http://localhost:8000/api/generate?prompt=Hello+world"
 
 # Test with payment headers (contact us for test headers)
-curl -X POST http://localhost:8000/api/generate \
-  -H "Content-Type: application/json" \
-  -H "X-Payment-Receipt: ..." \
-  -H "X-Payment-Signature: ..." \
-  -d '{"prompt": "Hello world"}'
+# Note: The buyer SDK handles these headers automatically
+curl "http://localhost:8000/api/generate?prompt=Hello+world" \
+  -H "X-PAYMENT: <base64-encoded-payment>" \
+  -H "X-PAYMENT-SECURE: <w3c-trace-context>" \
+  -H "X-RISK-SESSION: <session-id>" \
+  -H "Origin: http://localhost:8000"
 ```
 
 ### Next Steps

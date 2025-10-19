@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI(title="Seller Example (OSS)")
 
-PROXY_BASE = os.getenv("PROXY_BASE", "http://localhost:8010/x402")
+PROXY_BASE = os.getenv("PROXY_BASE", "http://localhost:8000/x402")
 seller_sdk = SellerClient(PROXY_BASE)
 
 

@@ -20,19 +20,22 @@ This guide helps API and service providers accept secure payments from AI agents
 ## Installation
 
 ```bash
-pip install x402-secure-client
+pip install x402-secure
 ```
 
-For specific frameworks:
+Optional extras:
 ```bash
-# FastAPI
-pip install x402-secure-client[fastapi]
+# For EIP-3009 payment signing
+pip install x402-secure[signing]
 
-# Flask  
-pip install x402-secure-client[flask]
+# For OpenTelemetry integration
+pip install x402-secure[otel]
 
-# Django
-pip install x402-secure-client[django]
+# For running examples
+pip install x402-secure[examples]
+
+# For OpenAI agent integration
+pip install x402-secure[agent]
 ```
 
 ## Basic Integration
@@ -41,7 +44,10 @@ pip install x402-secure-client[django]
 
 ```python
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from x402_secure_client import SellerClient
+import base64
+import json
 
 app = FastAPI()
 
@@ -65,28 +71,28 @@ async def generate_text(request: Request, prompt: str):
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
+    origin = request.headers.get("Origin")
     
-    if not all([x_payment, x_payment_secure, risk_session]):
+    if not all([x_payment, x_payment_secure, risk_session, origin]):
         # Return 402 Payment Required
-        raise HTTPException(
-            status_code=402,
-            detail={
+        return JSONResponse(
+            {
                 "x402Version": 1,
                 "accepts": [payment_requirements],
                 "error": "Payment required"
-            }
+            },
+            status_code=402
         )
     
     # Verify and settle payment
     try:
-        import base64, json
         payment_data = json.loads(base64.b64decode(x_payment))
         
         result = await seller.verify_then_settle(
             payment_data,
             payment_requirements,
             x_payment_b64=x_payment,
-            origin=request.headers.get("Origin"),
+            origin=origin,
             x_payment_secure=x_payment_secure,
             risk_sid=risk_session
         )
@@ -102,7 +108,9 @@ async def generate_text(request: Request, prompt: str):
         )
         
     except Exception as e:
-        raise HTTPException(status_code=402, detail=str(e))
+        # Handle errors - 403 indicates risk denial, other errors are payment failures
+        status_code = 403 if "Risk denied" in str(e) else 402
+        return JSONResponse({"error": str(e)}, status_code=status_code)
 ```
 
 ### 2. Flask Integration
@@ -112,6 +120,7 @@ from flask import Flask, request, jsonify
 from x402_secure_client import SellerClient
 import base64
 import json
+import anyio
 
 app = Flask(__name__)
 
@@ -133,8 +142,9 @@ def analyze_data():
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
+    origin = request.headers.get("Origin")
     
-    if not all([x_payment, x_payment_secure, risk_session]):
+    if not all([x_payment, x_payment_secure, risk_session, origin]):
         return jsonify({
             "x402Version": 1,
             "accepts": [payment_requirements],
@@ -145,16 +155,18 @@ def analyze_data():
     try:
         payment_data = json.loads(base64.b64decode(x_payment))
         
-        # Note: Flask integration requires sync version or run_async wrapper
-        # This is a simplified example - see full docs for async support
-        result = seller.verify_then_settle_sync(
-            payment_data,
-            payment_requirements,
-            x_payment_b64=x_payment,
-            origin=request.headers.get("Origin"),
-            x_payment_secure=x_payment_secure,
-            risk_sid=risk_session
-        )
+        # Note: SellerClient is async-only. For Flask, wrap with an async runner:
+        async def _verify_and_settle():
+            return await seller.verify_then_settle(
+                payment_data,
+                payment_requirements,
+                x_payment_b64=x_payment,
+                origin=origin,
+                x_payment_secure=x_payment_secure,
+                risk_sid=risk_session
+            )
+        
+        result = anyio.from_thread.run(_verify_and_settle)
         
         # Process request
         data = request.json
@@ -165,94 +177,246 @@ def analyze_data():
         }), 200, {"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
         
     except Exception as e:
-        return jsonify({"error": str(e)}), 402
+        status_code = 403 if "Risk denied" in str(e) else 402
+        return jsonify({"error": str(e)}), status_code
 ```
+
+> **Note**: The SellerClient is async-only. For Flask, you must use an async runner like `anyio.from_thread.run()` or consider using an async-capable framework like FastAPI for endpoints that handle payments.
 
 ### 3. Payment Headers
 
-x402-secure uses standard HTTP headers:
+x402-secure uses the following HTTP headers:
 
 ```http
 POST /api/endpoint HTTP/1.1
 Host: api.yourservice.com
-X-Payment-Receipt: <base64_encoded_receipt>
-X-Payment-Signature: <signature>
-X-Risk-Session: <session_id>
-X-Payment-Secure: <trace_context>
+Origin: https://buyer-origin.com
+X-PAYMENT: <base64_encoded_payment_payload>
+X-PAYMENT-SECURE: w3c.v1;tp=<traceparent>;ts=<url_encoded_tracestate>
+X-RISK-SESSION: <session_uuid>
+X-AP2-EVIDENCE: evd.v1;mr=<ref>;ms=<sha256_b64url>;mt=application/json;sz=<bytes>
 ```
 
-Your validator automatically handles these headers.
+**Required Headers:**
+- `X-PAYMENT`: Base64-encoded JSON payment payload
+- `X-PAYMENT-SECURE`: W3C trace context (format: `w3c.v1;tp=...;ts=...`)
+- `X-RISK-SESSION`: UUID of the risk session
+- `Origin`: Buyer's origin (for AP2 origin binding)
+
+**Optional Headers:**
+- `X-AP2-EVIDENCE`: AP2 mandate reference (format: `evd.v1;mr=...;ms=...;mt=application/json;sz=...`)
+
+Your service forwards these headers to the proxy via `SellerClient`; the proxy validates them and calls the risk engine before forwarding to the upstream facilitator.
 
 ## Risk Management
 
-### Understanding Risk Scores
+### How Risk Gating Works
+
+Risk evaluation happens **inside the proxy** before payment verification reaches the upstream facilitator:
+
+1. Your service calls `seller.verify_then_settle(...)` with payment headers
+2. The proxy calls `/risk/evaluate` with session ID, trace context, and payment data
+3. The risk engine returns a decision: `allow`, `deny`, or `review`
+4. If `deny`, the proxy returns 403 with an error message
+5. If `allow`, the proxy forwards the request to the upstream facilitator
+
+### Handling Risk Decisions
 
 ```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from x402_secure_client import SellerClient
+import base64
+import json
+
+app = FastAPI()
+seller = SellerClient("https://x402-proxy.t54.ai/x402")
+
 @app.post("/api/premium-feature")
 async def premium_feature(request: Request):
-    payment = await validator.verify_payment(request)
+    payment_requirements = {
+        "scheme": "exact",
+        "network": "base-sepolia",
+        "maxAmountRequired": "500000",  # 0.50 USDC
+        "resource": str(request.url),
+        "payTo": "0xYourWalletAddress",
+        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+    }
     
-    if not payment.valid:
-        return {"error": "Payment required"}, 402
+    x_payment = request.headers.get("X-PAYMENT")
+    x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
+    risk_session = request.headers.get("X-RISK-SESSION")
+    origin = request.headers.get("Origin")
     
-    # Risk-based pricing/access
-    if payment.risk_score < 0.3:
-        # Low risk - full access
-        return await full_premium_response()
+    if not all([x_payment, x_payment_secure, risk_session, origin]):
+        return JSONResponse(
+            {"x402Version": 1, "accepts": [payment_requirements], "error": "Payment required"},
+            status_code=402
+        )
     
-    elif payment.risk_score < 0.7:
-        # Medium risk - limited access
-        return await limited_premium_response()
-    
-    else:
-        # High risk - require additional verification
-        return {
-            "error": "Additional verification required",
-            "verification_url": f"https://verify.x402-secure.com/{payment.id}"
-        }
+    try:
+        payment_data = json.loads(base64.b64decode(x_payment))
+        
+        # Proxy handles risk evaluation internally
+        result = await seller.verify_then_settle(
+            payment_data,
+            payment_requirements,
+            x_payment_b64=x_payment,
+            origin=origin,
+            x_payment_secure=x_payment_secure,
+            risk_sid=risk_session
+        )
+        
+        # Risk passed - deliver service
+        return {"data": "Premium content delivered"}
+        
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Handle risk denial (403 from proxy)
+        if "Risk denied" in error_msg or "403" in error_msg:
+            return JSONResponse(
+                {"error": "Payment denied by risk assessment", "details": error_msg},
+                status_code=403
+            )
+        
+        # Handle other payment failures
+        return JSONResponse(
+            {"error": "Payment verification failed", "details": error_msg},
+            status_code=402
+        )
 ```
 
-### Risk Factors Explained
+### Risk Response Headers
 
-The risk score (0.0 to 1.0) considers:
+The proxy adds these headers to responses (for observability):
 
-- **Agent Behavior** (40%)
-  - Reasoning consistency
-  - Tool usage patterns
-  - Response to prompts
+- `X-Risk-Decision`: The decision value (`allow`, `deny`, `review`)
+- `X-Risk-Decision-ID`: Unique ID for this risk evaluation
+- `X-Risk-TTL-Seconds`: How long this decision is valid
 
-- **Transaction Pattern** (30%)
-  - Amount vs. history
-  - Frequency
-  - Time patterns
+**Note**: The current `SellerClient` returns only the JSON body. To access these headers in your service, you would need to call the proxy endpoints directly with `httpx` instead of using the SDK wrapper.
 
-- **User History** (20%)
-  - Account age
-  - Dispute rate
-  - Previous transactions
-
-- **Technical Factors** (10%)
-  - Network anomalies
-  - Header consistency
-  - Signature validity
-
-### Configuring Risk Tolerance
+### Error Handling Best Practices
 
 ```python
-seller = SellerClient(
-    "https://x402-proxy.t54.ai/x402",
-    config={
-        "risk_tolerance": {
-            "max_score": 0.8,           # Reject above this
-            "require_trace": True,      # Require reasoning trace
-            "min_confirmations": 1,     # Blockchain confirmations
-            "challenge_threshold": 0.6  # Require challenge above this
-        }
-    }
-)
+try:
+    result = await seller.verify_then_settle(...)
+except httpx.HTTPStatusError as e:
+    if e.response.status_code == 403:
+        # Risk engine denied the payment
+        log_risk_denial(e.response.json())
+        return JSONResponse({"error": "Payment denied"}, status_code=403)
+    elif e.response.status_code == 422:
+        # Validation error (bad headers, AP2 mismatch, etc.)
+        return JSONResponse({"error": "Invalid payment data"}, status_code=422)
+    else:
+        # Other payment failures
+        return JSONResponse({"error": "Payment failed"}, status_code=402)
+except Exception as e:
+    # Network or unexpected errors
+    log_error(e)
+    return JSONResponse({"error": "Service unavailable"}, status_code=503)
 ```
 
 ## Advanced Features
+
+### AP2 Policy Enforcement
+
+You can enforce agent payment protection (AP2) requirements by adding policy flags to your payment requirements:
+
+```python
+payment_requirements = {
+    "scheme": "exact",
+    "network": "base-sepolia",
+    "maxAmountRequired": "100000",
+    "resource": str(request.url),
+    "payTo": "0xYourWalletAddress",
+    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    "extra": {
+        "name": "USDC",
+        "version": "2",
+        "ap2": {
+            "requireTrace": True,              # Require agent trace evidence
+            "requireIntentMandate": False,     # Require intent mandate
+            "requireCartMandate": False,       # Require cart mandate
+            "requirePaymentMandate": False,    # Require payment mandate
+            "acceptedMerchantIds": [           # Whitelist merchant DIDs (optional)
+                "did:web:api.yourservice.com"
+            ]
+        }
+    }
+}
+```
+
+**Supported AP2 Policy Flags:**
+
+- `requireTrace` (bool): Require agent trace context in payment
+- `requireIntentMandate` (bool): Require intent_uid in AP2 evidence
+- `requireCartMandate` (bool): Require cart_uid in AP2 evidence
+- `requirePaymentMandate` (bool): Require payment_uid in AP2 evidence
+- `acceptedMerchantIds` (list): Whitelist of accepted merchant DIDs
+
+When a buyer provides the optional `X-AP2-EVIDENCE` header, the proxy validates:
+- Origin binding (originHash matches Origin header)
+- Payment hash binding (paymentHash matches X-PAYMENT)
+- TTL (notBefore/notAfter/exp timestamps)
+- Resource congruence (resource, network, asset, payTo match)
+- Optional EIP-712 signature (if sig field present)
+
+### Multi-Currency Support
+
+To offer multiple payment options, return multiple entries in the `accepts` array of your 402 response:
+
+```python
+@app.get("/api/multi-currency-endpoint")
+async def multi_currency_endpoint(request: Request):
+    # Check for payment headers
+    if not request.headers.get("X-PAYMENT"):
+        # Offer multiple currency options
+        base_requirements = {
+            "scheme": "exact",
+            "network": "base-sepolia",
+            "resource": str(request.url),
+            "payTo": "0xYourWalletAddress",
+            "maxTimeoutSeconds": 30
+        }
+        
+        usdc_option = {
+            **base_requirements,
+            "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "maxAmountRequired": "1000000",  # 1.00 USDC
+            "extra": {"name": "USDC", "version": "2"}
+        }
+        
+        usdt_option = {
+            **base_requirements,
+            "asset": "0x...",  # USDT address
+            "maxAmountRequired": "1000000",  # 1.00 USDT
+            "extra": {"name": "USDT", "version": "2"}
+        }
+        
+        dai_option = {
+            **base_requirements,
+            "asset": "0x...",  # DAI address
+            "maxAmountRequired": "1050000",  # 1.05 DAI (slight premium)
+            "extra": {"name": "DAI", "version": "2"}
+        }
+        
+        return JSONResponse(
+            {
+                "x402Version": 1,
+                "accepts": [usdc_option, usdt_option, dai_option],
+                "error": "Payment required"
+            },
+            status_code=402
+        )
+    
+    # Process payment normally
+    # ... (verify_then_settle code)
+```
+
+**Note**: The proxy automatically strips non-standard fields from `extra` before forwarding to the upstream facilitator, keeping only `name` and `version` for EIP-3009 signing.
 
 > **Note**: The following examples demonstrate conceptual patterns for advanced payment scenarios. Some features like subscriptions, usage-based billing, and automated dispute handling are planned enhancements. For current implementation, focus on the basic integration pattern shown above.
 
@@ -291,160 +455,16 @@ async def stream_response(request: Request):
     return StreamingResponse(generate())
 ```
 
-### 2. Subscription Management
+### Planned Features
 
-```python
-@app.post("/api/subscribe")
-async def create_subscription(request: Request, plan: str):
-    payment = await validator.verify_payment(request)
-    
-    if not payment.valid:
-        raise HTTPException(402, "Payment required")
-    
-    # Create subscription
-    subscription = await validator.create_subscription(
-        payment=payment,
-        plan_id=plan,
-        interval="monthly",
-        amount="29.99"
-    )
-    
-    return {
-        "subscription_id": subscription.id,
-        "next_payment": subscription.next_payment_date,
-        "status": "active"
-    }
-```
+The following features are under development and not yet available:
 
-### 3. Usage-Based Billing
+- **Subscription Management**: Recurring payment handling
+- **Usage-Based Billing**: Metered API usage tracking and charging
+- **Automated Dispute Handling**: Dispute resolution workflows with evidence
+- **Challenge Flows**: Pre-transaction user confirmation for high-risk payments
 
-```python
-# Track usage
-@app.middleware("http")
-async def track_usage(request: Request, call_next):
-    response = await call_next(request)
-    
-    if hasattr(request.state, "payment"):
-        # Record usage for billing
-        await validator.record_usage(
-            payment_id=request.state.payment.id,
-            usage_type="api_calls",
-            quantity=1,
-            metadata={"endpoint": request.url.path}
-        )
-    
-    return response
-
-# Bill at end of period
-async def bill_usage_period():
-    bills = await validator.calculate_usage_bills(
-        period_start=datetime.now() - timedelta(days=30),
-        period_end=datetime.now()
-    )
-    
-    for bill in bills:
-        await validator.charge_usage(bill)
-```
-
-### 4. Multi-Currency Support
-
-```python
-validator = PaymentValidator(
-    config=SellerConfig(
-        proxy_url="https://x402-proxy.t54.ai",
-        merchant_id="api.yourservice.com",
-        accepted_currencies=["USDC", "USDT", "DAI"],
-        pricing={
-            "USDC": "10.00",
-            "USDT": "10.00",
-            "DAI": "10.50"  # Slight premium for DAI
-        }
-    )
-)
-```
-
-## Dispute Handling
-
-### 1. Automatic Evidence Collection
-
-```python
-# Evidence is automatically collected, but you can add context
-@app.post("/api/sensitive-action")
-async def sensitive_action(request: Request, action: dict):
-    payment = await validator.verify_payment(request)
-    
-    # Add your own evidence
-    await validator.add_evidence(
-        payment_id=payment.id,
-        evidence={
-            "request_body": action,
-            "user_confirmation": action.get("confirmed", False),
-            "risk_warnings_shown": True,
-            "timestamp": datetime.now().isoformat()
-        }
-    )
-    
-    # Process action
-    result = await execute_sensitive_action(action)
-    
-    # Settle with result evidence
-    await validator.settle_payment(
-        payment,
-        evidence={"action_result": result}
-    )
-    
-    return result
-```
-
-### 2. Handling Disputes
-
-```python
-# Webhook for dispute notifications
-@app.post("/webhooks/disputes")
-async def handle_dispute(dispute: dict):
-    # Get dispute details
-    dispute_info = await validator.get_dispute(dispute["id"])
-    
-    # Check the evidence
-    if dispute_info.auto_resolvable:
-        # Strong evidence - auto resolve
-        await validator.resolve_dispute(
-            dispute_id=dispute["id"],
-            accept=False,  # Reject the dispute
-            evidence_url=dispute_info.evidence_url
-        )
-    else:
-        # Manual review needed
-        await notify_support_team(dispute_info)
-    
-    return {"status": "processed"}
-```
-
-### 3. Dispute Prevention
-
-```python
-# Pre-transaction challenges for high-risk payments
-@app.post("/api/high-value-action")
-async def high_value_action(request: Request):
-    payment = await validator.verify_payment(request)
-    
-    if payment.risk_score > 0.5 or payment.amount > 50:
-        # Require additional confirmation
-        challenge = await validator.create_challenge(
-            payment_id=payment.id,
-            challenge_type="user_confirmation",
-            question="Please confirm this high-value transaction"
-        )
-        
-        return {
-            "status": "challenge_required",
-            "challenge_id": challenge.id,
-            "challenge_url": challenge.url
-        }
-    
-    # Process normally for low-risk
-    return await process_action()
-```
+For updates on these features, see our [GitHub roadmap](https://github.com/t54-labs/x402-secure/issues).
 
 ## Production Checklist
 
@@ -468,19 +488,20 @@ async def high_value_action(request: Request):
 ### Reliability
 
 - [ ] **Payment Validation**
-  - [ ] Always validate before processing
+  - [ ] Always verify before processing
   - [ ] Handle validation failures gracefully
-  - [ ] Cache validation results (5 min TTL)
+  - [ ] Honor 4xx/5xx from proxy and surface X-Request-ID for support
 
 - [ ] **Settlement**
   - [ ] Always settle after delivery
   - [ ] Handle settlement failures
-  - [ ] Implement retry logic
+  - [ ] Implement retry logic for safe failures
 
 - [ ] **Monitoring**
-  - [ ] Log all payment attempts
-  - [ ] Monitor validation failures
-  - [ ] Track dispute rates
+  - [ ] Log all payment attempts with X-Request-ID
+  - [ ] Log X-Risk-* headers from proxy responses (if accessing directly)
+  - [ ] Monitor validation and settlement failures
+  - [ ] Track 403 (risk denial) vs 422 (validation) vs other errors
 
 ### Compliance
 
@@ -519,12 +540,13 @@ async def high_value_action(request: Request):
 ## Example: Complete API Implementation
 
 ```python
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from x402_secure_client import SellerClient
 import base64
 import json
 import logging
+import httpx
 
 app = FastAPI(title="AI Service API")
 logger = logging.getLogger(__name__)
@@ -552,7 +574,7 @@ async def generate_content(request: Request, prompt: str):
     origin = request.headers.get("Origin")
     
     # Check if payment provided
-    if not all([x_payment, x_payment_secure, risk_session]):
+    if not all([x_payment, x_payment_secure, risk_session, origin]):
         logger.info("Payment required for request")
         return JSONResponse(
             {
@@ -598,11 +620,34 @@ async def generate_content(request: Request, prompt: str):
             }
         )
         
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error processing payment: {e.response.status_code}")
+        
+        # Handle different error types
+        if e.response.status_code == 403:
+            # Risk engine denied the payment
+            return JSONResponse(
+                {"error": "Payment denied by risk assessment"},
+                status_code=403
+            )
+        elif e.response.status_code == 422:
+            # Validation error (bad headers, AP2 mismatch, etc.)
+            return JSONResponse(
+                {"error": "Invalid payment data", "details": str(e)},
+                status_code=422
+            )
+        else:
+            # Other payment failures
+            return JSONResponse(
+                {"error": "Payment verification failed", "details": str(e)},
+                status_code=402
+            )
+    
     except Exception as e:
-        logger.error(f"Error processing request: {e}")
+        logger.error(f"Unexpected error processing request: {e}")
         return JSONResponse(
-            {"error": "Payment processing failed", "details": str(e)},
-            status_code=402
+            {"error": "Service unavailable", "details": str(e)},
+            status_code=503
         )
 
 # Health check (no payment required)

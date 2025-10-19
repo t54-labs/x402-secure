@@ -27,7 +27,7 @@ def setup_otel_from_env(use_console: bool = True) -> None:
         )
     except Exception as e:  # pragma: no cover - import error path
         raise RuntimeError(
-            "OpenTelemetry SDK/exporter not installed. Install extras: pip install x402-secure-client[otel]"
+            "OpenTelemetry SDK/exporter not installed. Install extras: pip install x402-secure[otel]"
         ) from e
 
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")  # Only enable if explicitly set

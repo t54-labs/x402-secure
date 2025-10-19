@@ -6,14 +6,18 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 
 1. **Create virtual environment:**
    ```bash
-   cd examples
+   cd packages/x402-secure/examples
    python3 -m venv .venv
    source .venv/bin/activate
    ```
 
 2. **Install from PyPI:**
    ```bash
-   pip install x402-secure[examples]
+   pip install "x402-secure[examples]"
+   
+   # For agent examples (buyer_agent_openai.py), also install:
+   pip install "x402-secure[agent]"
+   # Or alternatively: pip install openai
    ```
 
 3. **Configure environment:**
@@ -22,6 +26,8 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
    # Edit .env and add:
    # - BUYER_PRIVATE_KEY (required)
    # - OPENAI_API_KEY (required for agent example)
+   # 
+   # ⚠️ IMPORTANT: Never commit .env to version control - it contains secrets!
    ```
 
 ## Environment Variables
@@ -35,9 +41,13 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 - `SELLER_BASE_URL` - Seller API URL (default: http://localhost:8010)
 - `PROXY_BASE` - Proxy base for sellers (default: http://localhost:8000/x402) ⚠️ Must be port 8000!
 - `NETWORK` - Blockchain network (default: base-sepolia)
-- `OPENAI_MODEL` - AI model (default: gpt-4o-mini)
+- `OPENAI_MODEL` - AI model (default: gpt-5-mini)
 - `MERCHANT_PAYTO` - Merchant wallet address
 - `USDC_ADDRESS` - USDC contract address
+- `OTEL_EXPORTER_OTLP_ENDPOINT` - OpenTelemetry endpoint (optional, for trace export)
+- `OTEL_SERVICE_NAME` - Service name for traces (default: x402-buyer)
+- `AGENT_ORIGIN` - Agent origin for session context (optional)
+- `CLIENT_IP` - Client IP for session context hashing (optional)
 
 ## Complete Flow Demo
 
@@ -52,14 +62,14 @@ uv run run_facilitator_proxy.py
 
 ### 2. Start Seller (Terminal 2)
 ```bash
-cd examples
+cd packages/x402-secure/examples
 source .venv/bin/activate
 python -m uvicorn seller_integration:app --host 0.0.0.0 --port 8010
 ```
 
 ### 3. Run Buyer (Terminal 3)
 ```bash
-cd examples
+cd packages/x402-secure/examples
 source .venv/bin/activate
 
 # Basic buyer
@@ -77,6 +87,13 @@ Mock upstream facilitator for testing.
 **Run:**
 ```bash
 python -m uvicorn upstream_stub:app --port 9000
+```
+
+**To use with the proxy:**
+Before starting the facilitator proxy, set these environment variables to point to the stub:
+```bash
+export PROXY_UPSTREAM_VERIFY_URL=http://localhost:9000/verify
+export PROXY_UPSTREAM_SETTLE_URL=http://localhost:9000/settle
 ```
 
 ### 2. Seller Integration
@@ -126,7 +143,7 @@ PROXY_BASE=http://localhost:8000/x402
 ### ModuleNotFoundError
 Install with examples support:
 ```bash
-pip install x402-secure[examples]
+pip install "x402-secure[examples]"
 ```
 
 ### Missing environment variables

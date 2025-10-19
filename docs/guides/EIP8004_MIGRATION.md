@@ -18,9 +18,9 @@ All `agent_id` parameters and fields have been renamed to `agent_did` to prepare
 - `sdk/secure_x402/src/secure_x402/risk_public.py` - public risk API (local proxy mode)
 
 **Examples & Tests:**
-- `packages/x402-secure-client/examples/buyer_agent_openai.py`
-- `packages/x402-secure-client/examples/buyer_basic.py`
-- `packages/x402-secure-client/README.md`
+- `packages/x402-secure/examples/buyer_agent_openai.py`
+- `packages/x402-secure/examples/buyer_basic.py`
+- `packages/x402-secure/examples/README.md`
 - `scripts/test_ap2_flow.py`
 - `tests/test_proxy_risk_public.py`
 

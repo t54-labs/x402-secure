@@ -22,6 +22,11 @@ COPY proxy/README.md proxy/README.md
 COPY packages/x402-secure/pyproject.toml packages/x402-secure/pyproject.toml
 COPY packages/x402-secure/README.md packages/x402-secure/README.md
 
+# Copy source code first (needed for editable install)
+COPY proxy/src/ proxy/src/
+COPY packages/x402-secure/src/ packages/x402-secure/src/
+COPY run_facilitator_proxy.py .
+
 # Install dependencies directly (skip the root package)
 RUN uv pip install --system \
     x402==0.2.1 \
@@ -45,17 +50,12 @@ RUN uv pip install --system \
 RUN uv pip install --system -e ./proxy
 RUN uv pip install --system -e ./packages/x402-secure
 
-# Copy source code
-COPY proxy/src/ proxy/src/
-COPY packages/x402-secure/src/ packages/x402-secure/src/
-COPY run_facilitator_proxy.py .
-
 # Default environment variables for local risk mode
 ENV PROXY_LOCAL_RISK=1
 ENV UPSTREAM_FACILITATOR_BASE_URL=https://facilitator.example.com
 ENV AGENT_GATEWAY_URL=http://0.0.0.0:8000
-ENV HOST=0.0.0.0
-ENV PORT=8000
+ENV PROXY_HOST=0.0.0.0
+ENV PROXY_PORT=8000
 
 # Expose port
 EXPOSE 8000

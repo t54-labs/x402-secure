@@ -115,9 +115,8 @@ x402-secure provides **clear responsibility boundaries** through:
 # 1. Install SDK
 pip install x402-secure
 
-# 2. Initialize clients
-from x402_secure_client import BuyerClient, BuyerConfig, RiskClient, OpenAITraceCollector
-from x402_secure_client import store_agent_trace, execute_payment_with_tid
+# 2. Initialize buyer client
+from x402_secure_client import BuyerClient, BuyerConfig, OpenAITraceCollector
 
 # Configure buyer client
 buyer = BuyerClient(BuyerConfig(
@@ -126,12 +125,8 @@ buyer = BuyerClient(BuyerConfig(
     buyer_private_key=YOUR_PRIVATE_KEY
 ))
 
-# Initialize risk client
-risk_client = RiskClient("https://x402-proxy.t54.ai")
-
 # 3. Create risk session
-session = await risk_client.create_session(
-    agent_did=buyer.address,
+session = await buyer.create_risk_session(
     app_id="my-agent-v1"
 )
 sid = session['sid']
@@ -147,8 +142,7 @@ with openai.responses.stream(...) as stream:
     )
 
 # 5. Store trace and get trace ID
-tid = await store_agent_trace(
-    risk=risk_client,
+tid = await buyer.store_agent_trace(
     sid=sid,
     task="Purchase item",
     params={"item": "coffee maker"},
@@ -156,8 +150,7 @@ tid = await store_agent_trace(
 )
 
 # 6. Execute payment with protection
-payment_result = await execute_payment_with_tid(
-    buyer=buyer,
+payment_result = await buyer.execute_with_tid(
     endpoint="/api/purchase",
     task="Purchase item",
     params={"item": "coffee maker"},

@@ -23,25 +23,25 @@ async def store_agent_trace(
     session_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     from datetime import datetime, timezone
-    
+
     agent_trace: Dict[str, Any] = {
         "task": task,
         "parameters": params,
         "environment": environment,
         "events": events,
     }
-    
+
     # Add model configuration if provided
     if model_config:
         agent_trace["model_config"] = model_config
-    
+
     # Add session context if provided
     if session_context:
         agent_trace["session_context"] = session_context
-    
+
     # Add timestamps with timezone
     agent_trace["completed_at"] = datetime.now(timezone.utc).isoformat()
-    
+
     tid = (await risk.create_trace(sid=sid, agent_trace=agent_trace))["tid"]
     return tid
 
@@ -64,6 +64,7 @@ async def execute_payment_with_tid(
             risk_sid=sid,
             extra_headers=xps,
         )
+
 
 def _resolve_handlers_from_defs(tool_defs: list, tracer, explicit: dict | None) -> dict:
     if explicit:
@@ -93,7 +94,10 @@ def _resolve_handlers_from_defs(tool_defs: list, tracer, explicit: dict | None) 
         if fn is not None:
             resolved[name] = tracer.tool(fn)
     if not resolved:
-        raise RuntimeError("No tool handlers resolvable; pass tools mapping, set X402_AGENT_TOOL_NS, or add x-python to tool_defs")
+        raise RuntimeError(
+            "No tool handlers resolvable; pass tools mapping, set X402_AGENT_TOOL_NS, "
+            "or add x-python to tool_defs"
+        )
     return resolved
 
 
@@ -137,9 +141,9 @@ async def run_agent_payment(
     # Create session + store trace
     rc = RiskClient(gateway_url)
     # TODO: When integrating with EIP-8004, pass did:eip8004:{chain_id}:{contract}:{token_id}
-    sid = (await rc.create_session(agent_did=buyer.address, app_id=None, device={"ua": "x402-agent"}))[
-        "sid"
-    ]
+    sid = (
+        await rc.create_session(agent_did=buyer.address, app_id=None, device={"ua": "x402-agent"})
+    )["sid"]
     tid = await store_agent_trace(
         risk=rc,
         sid=sid,

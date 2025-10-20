@@ -36,7 +36,7 @@ EIP-8004 is an Ethereum standard (finalized October 2025) that enables decentral
 2. **Decentralized Identifiers (DIDs)**: Uses standard DID format instead of simple addresses
 3. **Three On-chain Registries**:
    - Identity Registry
-   - Reputation Registry  
+   - Reputation Registry
    - Verification Registry
 
 ## EIP-8004 DID Format
@@ -69,12 +69,12 @@ class SessionRequest(BaseModel):
     trace_context: Dict[str, Any]
     agent_did: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    
+
     @validator('agent_did')
     def validate_agent_did(cls, v):
         if not v:
             return v
-        
+
         # Support EIP-8004 DID format
         if v.startswith('did:eip8004:'):
             parts = v.split(':')
@@ -87,11 +87,11 @@ class SessionRequest(BaseModel):
             if not contract.startswith('0x') or len(contract) != 42:
                 raise ValueError(f"Invalid contract address in DID: {contract}")
             return v
-        
+
         # Support legacy wallet address
         elif v.startswith('0x') and len(v) == 42:
             return v
-        
+
         else:
             raise ValueError(f"Invalid agent_did: must be EIP-8004 DID or Ethereum address")
 ```
@@ -106,46 +106,46 @@ from typing import Optional, Dict, Any
 
 class EIP8004Resolver:
     """Resolve EIP-8004 DIDs to on-chain agent identity."""
-    
+
     def __init__(self, web3_provider: str):
         self.w3 = Web3(Web3.HTTPProvider(web3_provider))
-    
+
     def resolve_did(self, did: str) -> Optional[Dict[str, Any]]:
         """
         Resolve EIP-8004 DID to agent identity metadata.
-        
+
         Args:
             did: EIP-8004 DID (did:eip8004:chain:contract:tokenId)
-            
+
         Returns:
             Dict with owner, metadata, reputation score, etc.
         """
         if not did.startswith('did:eip8004:'):
             return None
-        
+
         parts = did.split(':')
         chain_id = parts[2]
         contract = parts[3]
         token_id = int(parts[4])
-        
+
         # Load ERC-721 contract
         # TODO: Use actual EIP-8004 identity registry ABI
         contract_abi = [...] # ERC-721 + EIP-8004 extensions
-        
+
         agent_nft = self.w3.eth.contract(
             address=Web3.to_checksum_address(contract),
             abi=contract_abi
         )
-        
+
         # Get owner
         owner = agent_nft.functions.ownerOf(token_id).call()
-        
+
         # Get metadata URI
         metadata_uri = agent_nft.functions.tokenURI(token_id).call()
-        
+
         # Fetch metadata (IPFS or HTTP)
         # metadata = fetch_metadata(metadata_uri)
-        
+
         return {
             'did': did,
             'owner': owner,
@@ -173,16 +173,16 @@ eip8004_resolver = EIP8004Resolver(
 async def risk_create_session(req: RiskSessionRequest):
     if not req.agent_did:
         raise HTTPException(status_code=400, detail="agent_did required")
-    
+
     # Resolve EIP-8004 DID if provided
     agent_identity = None
     if req.agent_did.startswith('did:eip8004:'):
         agent_identity = eip8004_resolver.resolve_did(req.agent_did)
         if not agent_identity:
             raise HTTPException(status_code=400, detail="Invalid EIP-8004 DID")
-        
+
         logger.info(f"Resolved EIP-8004 identity: {agent_identity['owner']}")
-    
+
     # ... rest of session creation
 ```
 
@@ -250,4 +250,3 @@ sid = await rc.create_session(
 ## TODO Comments in Code
 
 Search for `TODO.*EIP-8004` or `TODO.*eip8004` in the codebase to find all locations marked for future enhancement.
-

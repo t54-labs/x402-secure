@@ -11,7 +11,7 @@ class SellerClient:
     def __init__(self, gateway_base_url: str):
         """
         Initialize SellerClient with the agent gateway base URL.
-        
+
         Args:
             gateway_base_url: Base URL of the agent gateway.
         """
@@ -44,11 +44,17 @@ class SellerClient:
             headers["X-AP2-EVIDENCE"] = x_ap2_evd
         r = await self.http.post(
             self.verify_url,
-            json={"x402Version": 1, "paymentPayload": payment_payload, "paymentRequirements": payment_requirements},
+            json={
+                "x402Version": 1,
+                "paymentPayload": payment_payload,
+                "paymentRequirements": payment_requirements,
+            },
             headers=headers,
         )
         r.raise_for_status()
-        if (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower() != "application/json":
+        if (r.headers.get("content-type") or "").split(";", 1)[
+            0
+        ].strip().lower() != "application/json":
             raise httpx.HTTPError("invalid content-type from /x402/verify")
         return r.json()
 
@@ -73,11 +79,17 @@ class SellerClient:
             headers["X-AP2-EVIDENCE"] = x_ap2_evd
         r = await self.http.post(
             self.settle_url,
-            json={"x402Version": 1, "paymentPayload": payment_payload, "paymentRequirements": payment_requirements},
+            json={
+                "x402Version": 1,
+                "paymentPayload": payment_payload,
+                "paymentRequirements": payment_requirements,
+            },
             headers=headers,
         )
         r.raise_for_status()
-        if (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower() != "application/json":
+        if (r.headers.get("content-type") or "").split(";", 1)[
+            0
+        ].strip().lower() != "application/json":
             raise httpx.HTTPError("invalid content-type from /x402/settle")
         return r.json()
 
@@ -112,4 +124,3 @@ class SellerClient:
             risk_sid=risk_sid,
             x_ap2_evd=x_ap2_evd,
         )
-

@@ -6,7 +6,6 @@ import re
 import uuid
 from typing import Dict, Optional, Tuple
 
-
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 _HEX2 = re.compile(r"^[0-9a-f]{2}$")
@@ -76,13 +75,19 @@ def parse_x_ap2_evidence(value: str) -> Dict[str, str]:
     ms = kv.get("ms")
     mt = kv.get("mt")
     sz = kv.get("sz")
-    _require(mr is not None and ms is not None and mt is not None and sz is not None, "Missing required evidence keys")
+    _require(
+        mr is not None and ms is not None and mt is not None and sz is not None,
+        "Missing required evidence keys",
+    )
     _require(mt == "application/json", "mt must be application/json")
     _require(sz.isdigit(), "sz must be decimal size")
     return {"mr": mr, "ms": ms, "mt": mt, "sz": sz}
 
 
-def parse_risk_ids(x_risk_session: Optional[str], x_risk_trace: Optional[str]) -> Tuple[str, Optional[str]]:
+def parse_risk_ids(
+    x_risk_session: Optional[str],
+    x_risk_trace: Optional[str],
+) -> Tuple[str, Optional[str]]:
     sid = _require_uuid(x_risk_session, name="X-RISK-SESSION")
     tid = _require_uuid_optional(x_risk_trace, name="X-RISK-TRACE")
     return sid, tid
@@ -104,4 +109,3 @@ def _require_uuid_optional(value: Optional[str], *, name: str) -> Optional[str]:
         return None
     _ = _require_uuid(value, name=name)
     return value
-

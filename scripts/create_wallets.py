@@ -41,14 +41,14 @@ def create_wallets():
             try:
                 buyer_account = Account.from_key(existing_buyer_key)
                 print(f"  Buyer address: {buyer_account.address}")
-            except:
+            except Exception:
                 print("  Invalid buyer private key")
 
         if existing_seller_key:
             try:
                 seller_account = Account.from_key(existing_seller_key)
                 print(f"  Seller address: {seller_account.address}")
-            except:
+            except Exception:
                 print("  Invalid seller private key")
 
         response = input("\nCreate new wallets? (y/n): ").lower()
@@ -61,13 +61,13 @@ def create_wallets():
 
     # Create buyer wallet
     buyer_account = Account.create()
-    print(f"\nBuyer wallet:")
+    print("\nBuyer wallet:")
     print(f"  Address: {buyer_account.address}")
     print(f"  Private key: {buyer_account.key.hex()}")
 
     # Create seller wallet
     seller_account = Account.create()
-    print(f"\nSeller wallet:")
+    print("\nSeller wallet:")
     print(f"  Address: {seller_account.address}")
     print(f"  Private key: {seller_account.key.hex()}")
 
@@ -81,7 +81,7 @@ def create_wallets():
                 example_content = f.read()
             with open(env_file, "w") as f:
                 f.write(example_content)
-            print(f"\n✅ Created .env file")
+            print("\n✅ Created .env file")
 
     # Update environment variables
     set_key(env_file, "BUYER_PRIVATE_KEY", buyer_account.key.hex())
@@ -102,7 +102,7 @@ def create_wallets():
     with open("wallets.json", "w") as f:
         json.dump(wallets_info, f, indent=2)
 
-    print(f"✅ Wallet backup saved to wallets.json")
+    print("✅ Wallet backup saved to wallets.json")
 
     # Show next steps
     print("\n" + "=" * 60)
@@ -110,8 +110,8 @@ def create_wallets():
     print("=" * 60)
 
     print("\n1. Get Base Sepolia ETH (for gas):")
-    print(f"   Buyer: https://www.coinbase.com/faucets/base-sepolia-faucet")
-    print(f"   Seller: https://www.coinbase.com/faucets/base-sepolia-faucet")
+    print("   Buyer: https://www.coinbase.com/faucets/base-sepolia-faucet")
+    print("   Seller: https://www.coinbase.com/faucets/base-sepolia-faucet")
 
     print("\n2. Get Base Sepolia USDC:")
     print("   Visit: https://faucet.circle.com/")
@@ -147,10 +147,10 @@ def show_existing_wallets():
     if buyer_key:
         try:
             buyer_account = Account.from_key(buyer_key)
-            print(f"\nBuyer wallet:")
+            print("\nBuyer wallet:")
             print(f"  Address: {buyer_account.address}")
             print(f"  Private key: {buyer_key}")
-        except:
+        except Exception:
             print("\nBuyer wallet: Invalid private key")
     else:
         print("\nBuyer wallet: Not configured")
@@ -158,18 +158,18 @@ def show_existing_wallets():
     if seller_key:
         try:
             seller_account = Account.from_key(seller_key)
-            print(f"\nSeller wallet:")
+            print("\nSeller wallet:")
             print(f"  Address: {seller_account.address}")
             print(f"  Private key: {seller_key}")
-        except:
+        except Exception:
             print("\nSeller wallet: Invalid private key")
     else:
         # If no seller private key, try to read from address
         seller_address = os.getenv("SELLER_ADDRESS")
         if seller_address:
-            print(f"\nSeller wallet:")
+            print("\nSeller wallet:")
             print(f"  Address: {seller_address}")
-            print(f"  Private key: Not configured (receive only)")
+            print("  Private key: Not configured (receive only)")
         else:
             print("\nSeller wallet: Not configured")
 

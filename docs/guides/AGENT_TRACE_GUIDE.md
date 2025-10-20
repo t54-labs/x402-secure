@@ -143,7 +143,7 @@ Auto-printed during /x402/verify → /risk/evaluate
   Parameters: {'symbol': 'BTC/USD'}
   Environment: {'network': 'base-sepolia', ...}
   Events: 14 total
-  
+
   Recent events:
     1. tool_call: prepare_payment
     2. tool_call: list_available_merchants
@@ -278,12 +278,12 @@ python3 -c "import json; data=json.load(open('/tmp/full_trace.json')); print(jso
 
 ## 🎯 Verification Points
 
-✅ task/parameters/environment fully recorded  
-✅ All tool calls are captured  
-✅ Tool results fully saved  
-✅ AI reasoning process recorded (gpt-5 series)  
-✅ tid associated with agent trace  
-✅ Queryable via API  
-✅ Auto-printed during verification  
+✅ task/parameters/environment fully recorded
+✅ All tool calls are captured
+✅ Tool results fully saved
+✅ AI reasoning process recorded (gpt-5 series)
+✅ tid associated with agent trace
+✅ Queryable via API
+✅ Auto-printed during verification
 
 **Agent trace context is fully visible, queryable, and auditable!** 🎉

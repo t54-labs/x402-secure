@@ -38,7 +38,7 @@ pip install x402-secure[signing,otel]
 ```python
 import os
 from x402_secure_client import (
-    BuyerClient, BuyerConfig, RiskClient, 
+    BuyerClient, BuyerConfig, RiskClient,
     OpenAITraceCollector, setup_otel_from_env
 )
 
@@ -82,7 +82,7 @@ async def agent_task(user_request: str):
         device={"ua": "my-agent"}
     )
     sid = session['sid']
-    
+
     # Define the purchase tool
     @tracer.tool
     def make_purchase(item: str, price: str, merchant: str):
@@ -92,13 +92,13 @@ async def agent_task(user_request: str):
             "merchant": merchant,
             "status": "ready_to_purchase"
         }
-    
+
     # Stream OpenAI response with tool execution
     messages = [
         {"role": "system", "content": "You are a helpful shopping assistant."},
         {"role": "user", "content": user_request}
     ]
-    
+
     with openai_client.responses.stream(
         model="gpt-4",
         input=messages,
@@ -122,11 +122,11 @@ async def agent_task(user_request: str):
             stream=stream,
             tools={"make_purchase": make_purchase}
         )
-    
+
     # Check if purchase was requested
     if "make_purchase" in result.get("tool_results", {}):
         purchase_data = result["tool_results"]["make_purchase"]
-        
+
         # Store trace and get trace ID (environment is required)
         tid = await store_agent_trace(
             risk=risk_client,
@@ -140,7 +140,7 @@ async def agent_task(user_request: str):
             events=tracer.events,
             model_config=tracer.model_config
         )
-        
+
         # Execute payment with protection
         payment_result = await execute_payment_with_tid(
             buyer=buyer,
@@ -150,7 +150,7 @@ async def agent_task(user_request: str):
             sid=sid,
             tid=tid
         )
-        
+
         return f"Successfully completed: {payment_result}"
 ```
 
@@ -174,7 +174,7 @@ async def make_payment(task: str, endpoint: str, params: dict):
         device={"ua": "my-agent"}
     )
     sid = session['sid']
-    
+
     # 2. Store agent trace (from your AI interactions)
     tid = await store_agent_trace(
         risk=risk_client,
@@ -188,7 +188,7 @@ async def make_payment(task: str, endpoint: str, params: dict):
         events=tracer.events,  # Your collected trace events
         model_config=tracer.model_config
     )
-    
+
     # 3. Execute payment with trace ID
     result = await execute_payment_with_tid(
         buyer=buyer,
@@ -198,7 +198,7 @@ async def make_payment(task: str, endpoint: str, params: dict):
         sid=sid,
         tid=tid
     )
-    
+
     print(f"✅ Payment completed")
     print(f"Result: {result}")
     return result
@@ -317,7 +317,7 @@ for payment in payments:
         events=tracer.events,
         model_config=tracer.model_config
     )
-    
+
     # Execute payment
     result = await execute_payment_with_tid(
         buyer=buyer,
@@ -455,28 +455,28 @@ from x402_secure_client import (
 @pytest.mark.asyncio
 async def test_payment_flow():
     setup_otel_from_env()
-    
+
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="http://localhost:8010",
         agent_gateway_url="http://localhost:8000",
         network="base-sepolia",
         buyer_private_key=os.getenv("BUYER_PRIVATE_KEY")
     ))
-    
+
     risk = RiskClient("http://localhost:8000")
     tracer = OpenAITraceCollector()
-    
+
     # Simulate agent interaction
     tracer.record_user_input("Buy test item")
     tracer.record_agent_output("Purchasing test item")
-    
+
     # Create session and trace
     sid = (await risk.create_session(
         agent_did=buyer.address,
         app_id="test-agent",
         device={"ua": "pytest"}
     ))['sid']
-    
+
     tid = await store_agent_trace(
         risk=risk,
         sid=sid,
@@ -485,7 +485,7 @@ async def test_payment_flow():
         environment={"network": "base-sepolia", "seller_base_url": "http://localhost:8010"},
         events=tracer.events
     )
-    
+
     # Execute payment
     result = await execute_payment_with_tid(
         buyer=buyer,
@@ -495,7 +495,7 @@ async def test_payment_flow():
         sid=sid,
         tid=tid
     )
-    
+
     assert result is not None
 ```
 

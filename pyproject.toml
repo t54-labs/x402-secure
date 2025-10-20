@@ -41,6 +41,7 @@ dev = [
   "pytest>=8.2",
   "pytest-asyncio>=0.23",
   "pytest-cov>=7.0.0",
+  "pre-commit>=3.5.0",
 ]
 agent = [
   "openai>=1.0.0",

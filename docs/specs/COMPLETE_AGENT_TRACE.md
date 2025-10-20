@@ -135,10 +135,10 @@
 def validate_user_input(events: list) -> tuple[bool, list[str]]:
     """Detect prompt injection and malicious input"""
     user_inputs = [e for e in events if e.get('type') == 'user_input']
-    
+
     for evt in user_inputs:
         content = evt.get('content', '').lower()
-        
+
         # Prompt injection detection
         injection_patterns = [
             "ignore previous instructions",
@@ -152,17 +152,17 @@ def validate_user_input(events: list) -> tuple[bool, list[str]]:
         for pattern in injection_patterns:
             if pattern in content:
                 return (False, [f"prompt_injection: {pattern}"])
-        
+
         # Length check
         if len(content) > 5000:
             return (False, ["input_too_long"])
-        
+
         # Content hash verification (anti-tampering)
         import hashlib
         expected_hash = hashlib.sha256(content.encode()).hexdigest()
         if evt.get('content_hash') != expected_hash:
             return (False, ["content_tampered"])
-    
+
     return (True, [])
 ```
 
@@ -172,30 +172,30 @@ def validate_user_input(events: list) -> tuple[bool, list[str]]:
 def validate_agent_output(events: list, task: str) -> tuple[bool, list[str]]:
     """Detect hallucinations, sensitive data leaks, and out-of-scope"""
     agent_outputs = [e for e in events if e.get('type') == 'agent_output']
-    
+
     for evt in agent_outputs:
         content = evt.get('content', '')
-        
+
         # Sensitive information detection
         sensitive_patterns = [
-            "private_key", "secret", "password", 
+            "private_key", "secret", "password",
             "0x[0-9a-f]{64}",  # Private key format
             "sk-[A-Za-z0-9]"  # API key format
         ]
         for pattern in sensitive_patterns:
             if pattern.lower() in content.lower():
                 return (False, [f"sensitive_data_leak: {pattern}"])
-        
+
         # Task relevance detection (anti-hallucination)
         if "BTC" in task and "BTC" not in content and "price" not in content:
             return (False, ["hallucination: off_topic"])
-        
+
         # Output hash verification
         import hashlib
         expected_hash = hashlib.sha256(content.encode()).hexdigest()
         if evt.get('output_hash') != expected_hash:
             return (False, ["output_tampered"])
-    
+
     return (True, [])
 ```
 
@@ -204,45 +204,45 @@ def validate_agent_output(events: list, task: str) -> tuple[bool, list[str]]:
 ```python
 def evaluate_agent_trace(agent_trace: dict, payer: str) -> dict:
     """Complete agent trace verification"""
-    
+
     # 1. Verify model_config
     model_config = agent_trace.get('model_config', {})
     allowed_models = ["gpt-5-mini", "gpt-4o-mini", "o1-mini"]
     if model_config.get('model') not in allowed_models:
         return {"decision": "deny", "reasons": ["unauthorized_model"]}
-    
+
     if not model_config.get('reasoning_enabled'):
         return {"decision": "review", "reasons": ["no_reasoning"]}
-    
+
     # 2. Verify session_context
     session_ctx = agent_trace.get('session_context', {})
-    
+
     # Agent ID and payer consistency
     if session_ctx.get('agent_id', '').lower() != payer.lower():
         return {"decision": "deny", "reasons": ["agent_payer_mismatch"]}
-    
+
     # Request duplication detection
     request_id = session_ctx.get('request_id')
     if is_duplicate_request(request_id):
         return {"decision": "deny", "reasons": ["duplicate_request"]}
-    
+
     # IP reputation check
     ip_hash = session_ctx.get('client_ip_hash')
     if ip_hash and is_blacklisted(ip_hash):
         return {"decision": "deny", "reasons": ["blacklisted_ip"]}
-    
+
     # 3. Verify user input
     events = agent_trace.get('events', [])
     valid, reasons = validate_user_input(events)
     if not valid:
         return {"decision": "deny", "reasons": reasons}
-    
+
     # 4. Verify agent output
     task = agent_trace.get('task', '')
     valid, reasons = validate_agent_output(events, task)
     if not valid:
         return {"decision": "deny", "reasons": reasons}
-    
+
     # 5. All checks passed
     return {
         "decision": "allow",

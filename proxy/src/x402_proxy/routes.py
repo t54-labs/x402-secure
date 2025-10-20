@@ -4,32 +4,34 @@ from __future__ import annotations
 
 import base64
 import json
+import json as _json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Dict, List, NamedTuple, Optional, Union
-import uuid
+from typing import Any, Dict, List, NamedTuple, Optional
 from urllib.parse import urlparse
-import json as _json
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport
 from pydantic import BaseModel, Field, ValidationError
+
 from .headers import (
     HeaderError,
-    parse_x_payment_secure,
-    parse_x_ap2_evidence,
     parse_risk_ids,
+    parse_x_ap2_evidence,
+    parse_x_payment_secure,
 )
 from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps
 try:  # pragma: no cover - optional dependency path
     from eth_utils import keccak  # type: ignore
+
     HAVE_KECCAK = True
 except Exception:  # pragma: no cover - optional dependency path
     HAVE_KECCAK = False
@@ -37,6 +39,7 @@ except Exception:  # pragma: no cover - optional dependency path
 try:  # pragma: no cover - optional dependency path
     from eth_account import Account  # type: ignore
     from eth_account.messages import encode_structured_data  # type: ignore
+
     HAVE_EIP712 = True
 except Exception:  # pragma: no cover - optional dependency path
     HAVE_EIP712 = False
@@ -55,6 +58,7 @@ LAST_SETTLE: Optional[Dict[str, Any]] = None
 # -------------------------------
 # Helpers
 # -------------------------------
+
 
 def _now_s() -> int:
     return int(time.time())
@@ -284,7 +288,9 @@ def compute_expected_payment_hash(request: Request, payload_obj: Dict[str, Any])
         raise HTTPException(status_code=422, detail=f"Cannot canonicalize paymentPayload: {e}")
 
 
-def verify_payment_hash_binding(ev: AP2Evidence, req: Request, payment_payload: PaymentPayload) -> None:
+def verify_payment_hash_binding(
+    ev: AP2Evidence, req: Request, payment_payload: PaymentPayload
+) -> None:
     payload_obj = payment_payload.model_dump(by_alias=True)
     expected = compute_expected_payment_hash(req, payload_obj)
     if _b32(ev.paymentHash) != expected:
@@ -296,8 +302,7 @@ def verify_merchant_identity(policy: AP2Policy, pr: PaymentRequirements) -> None
         return
     host = urlparse(pr.resource).netloc.lower()
     ok = any(
-        mid.startswith("did:web:")
-        and mid.split(":", 2)[2].lower() in (host, host.split(":")[0])
+        mid.startswith("did:web:") and mid.split(":", 2)[2].lower() in (host, host.split(":")[0])
         for mid in policy.acceptedMerchantIds
     )
     if not ok:
@@ -310,7 +315,9 @@ def verify_eip712_signature_if_present(
     if not ev.sig:
         return
     if not HAVE_EIP712:
-        raise HTTPException(status_code=422, detail="EIP-712 verification unavailable; install eth-account")
+        raise HTTPException(
+            status_code=422, detail="EIP-712 verification unavailable; install eth-account"
+        )
     chain_id = _network_to_chain_id(pr.network)
     if not chain_id:
         raise HTTPException(
@@ -381,7 +388,9 @@ def verify_eip712_signature_if_present(
         raise HTTPException(status_code=422, detail=f"AP2: EIP-712 signature invalid: {e}")
 
 
-def enforce_amount_and_asset(payment_payload: PaymentPayload, payment_requirements: PaymentRequirements) -> None:
+def enforce_amount_and_asset(
+    payment_payload: PaymentPayload, payment_requirements: PaymentRequirements
+) -> None:
     # Enforce amount <= maxAmountRequired when provided
     pr = payment_requirements
     pp = payment_payload.model_dump(by_alias=True)
@@ -401,25 +410,29 @@ def enforce_amount_and_asset(payment_payload: PaymentPayload, payment_requiremen
     # Asset address congruence is enforced against AP2 evidence; payload may not include it.
 
 
-async def fetch_and_validate_ap2_context(ev: AP2Evidence, risk_engine_url: Optional[str] = None) -> Dict[str, Any]:
+async def fetch_and_validate_ap2_context(
+    ev: AP2Evidence, risk_engine_url: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Fetch trace context and PaymentMandate VC from Risk Engine using UIDs in X-AP2-EVIDENCE.
-    
+
     This enables deep risk assessment without embedding data in payment payload.
     """
     if not risk_engine_url:
         risk_engine_url = os.getenv("RISK_ENGINE_URL", "http://localhost:8001")
-    
+
     result = {"trace_context": None, "payment_mandate": None}
-    
+
     # Fetch trace context using trace_uid
     if ev.trace_uid:
-        logger.info(f"[PROXY] Fetching trace context for trace_uid={ev.trace_uid} from {risk_engine_url}")
+        logger.info(
+            f"[PROXY] Fetching trace context for trace_uid={ev.trace_uid} from {risk_engine_url}"
+        )
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     f"{risk_engine_url}/ap2/trace/{ev.trace_uid}",
-                    headers={"Authorization": "Bearer proxy-internal"}  # TODO: proper auth
+                    headers={"Authorization": "Bearer proxy-internal"},  # TODO: proper auth
                 )
                 logger.info(f"[PROXY] Risk Engine responded with status {resp.status_code}")
                 if resp.status_code == 200:
@@ -427,38 +440,56 @@ async def fetch_and_validate_ap2_context(ev: AP2Evidence, risk_engine_url: Optio
                     logger.info(f"[PROXY] Trace context: {result['trace_context']}")
                     logger.info(f"[PROXY] ✅ Fetched trace context for trace_uid={ev.trace_uid}")
                 else:
-                    logger.warning(f"[PROXY] Failed to fetch trace context: status {resp.status_code}, body: {resp.text}")
+                    logger.warning(
+                        "[PROXY] Failed to fetch trace context: status %s, body: %s",
+                        resp.status_code,
+                        resp.text,
+                    )
         except Exception as e:
             logger.warning(f"[PROXY] Exception fetching trace context: {e}")
     else:
-        logger.warning(f"[PROXY] No trace_uid in AP2Evidence, skipping trace context fetch")
-    
+        logger.warning("[PROXY] No trace_uid in AP2Evidence, skipping trace context fetch")
+
     # Fetch PaymentMandate VC using payment_uid
     if ev.payment_uid:
-        logger.info(f"[PROXY] Fetching PaymentMandate for payment_uid={ev.payment_uid} from {risk_engine_url}")
+        logger.info(
+            "[PROXY] Fetching PaymentMandate for payment_uid=%s from %s",
+            ev.payment_uid,
+            risk_engine_url,
+        )
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     f"{risk_engine_url}/ap2/mandate/payment/{ev.payment_uid}",
-                    headers={"Authorization": "Bearer proxy-internal"}  # TODO: proper auth
+                    headers={"Authorization": "Bearer proxy-internal"},  # TODO: proper auth
                 )
                 logger.info(f"[PROXY] Risk Engine responded with status {resp.status_code}")
                 if resp.status_code == 200:
                     mandate_data = resp.json()
                     result["payment_mandate"] = mandate_data
-                    logger.info(f"[PROXY] ✅ Fetched PaymentMandate (risk approval) for payment_uid={ev.payment_uid}")
+                    logger.info(
+                        "[PROXY] ✅ Fetched PaymentMandate (risk approval) for payment_uid=%s",
+                        ev.payment_uid,
+                    )
                 else:
-                    logger.warning(f"[PROXY] Failed to fetch PaymentMandate: status {resp.status_code}, body: {resp.text}")
+                    logger.warning(
+                        "[PROXY] Failed to fetch PaymentMandate: status %s, body: %s",
+                        resp.status_code,
+                        resp.text,
+                    )
         except Exception as e:
             logger.warning(f"[PROXY] Exception fetching PaymentMandate: {e}")
     else:
-        logger.info(f"[PROXY] No payment_uid in AP2Evidence, skipping PaymentMandate fetch")
-    
+        logger.info("[PROXY] No payment_uid in AP2Evidence, skipping PaymentMandate fetch")
+
     return result
 
 
 def verify_ap2(
-    request: Request, body: ProxyVerifyRequest, origin_header: Optional[str], ap2_header: Optional[str]
+    request: Request,
+    body: ProxyVerifyRequest,
+    origin_header: Optional[str],
+    ap2_header: Optional[str],
 ) -> None:
     policy = extract_ap2_policy(body.paymentRequirements)
     ev = parse_ap2_evidence_b64(ap2_header, body.ap2EvidenceHeader)
@@ -480,19 +511,27 @@ def verify_ap2(
 
 class ProxyRuntimeConfig(BaseModel):
     upstream_verify_url: str = Field(
-        default_factory=lambda: os.getenv("PROXY_UPSTREAM_VERIFY_URL", "http://localhost:8001/verify")
+        default_factory=lambda: os.getenv(
+            "PROXY_UPSTREAM_VERIFY_URL", "http://localhost:8001/verify"
+        )
     )
     upstream_settle_url: str = Field(
-        default_factory=lambda: os.getenv("PROXY_UPSTREAM_SETTLE_URL", "http://localhost:8001/settle")
+        default_factory=lambda: os.getenv(
+            "PROXY_UPSTREAM_SETTLE_URL", "http://localhost:8001/settle"
+        )
     )
     timeout_s: float = Field(default_factory=lambda: float(os.getenv("PROXY_TIMEOUT_S", "15")))
     debug_enabled: bool = Field(
-        default_factory=lambda: (os.getenv("PROXY_DEBUG_ENABLED", "1").lower() in {"1", "true", "yes"})
+        default_factory=lambda: (
+            os.getenv("PROXY_DEBUG_ENABLED", "1").lower() in {"1", "true", "yes"}
+        )
     )
     # Feature flag: optionally enforce risk evaluate at settle (default OFF)
     # TODO(later): Consider enabling by default once prod readiness is confirmed.
     settle_risk_enabled: bool = Field(
-        default_factory=lambda: (os.getenv("PROXY_SETTLE_RISK_ENABLED", "0").lower() in {"1", "true", "yes"})
+        default_factory=lambda: (
+            os.getenv("PROXY_SETTLE_RISK_ENABLED", "0").lower() in {"1", "true", "yes"}
+        )
     )
 
 
@@ -588,11 +627,14 @@ async def proxy_verify(
             try:
                 # Decode tracestate to extract tid
                 from urllib.parse import unquote
+
                 ts_decoded = unquote(tc["ts"])
                 ts_json = json.loads(base64.b64decode(ts_decoded))
                 extracted_tid = ts_json.get("tid")
                 if extracted_tid:
-                    logger.info(f"[{req_id}] [PROXY] Extracted tid from tracestate: {extracted_tid}")
+                    logger.info(
+                        f"[{req_id}] [PROXY] Extracted tid from tracestate: {extracted_tid}"
+                    )
             except Exception as e:
                 logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
 
@@ -605,10 +647,11 @@ async def proxy_verify(
                 payment_payload_dict = json.loads(safe_base64_decode(xpay))
             except Exception:
                 pass  # Fall back to Pydantic serialization
-        
+
         payment_context = {
             "protocol": payment_payload_dict.get("protocol") or payment_payload_dict.get("scheme"),
-            "version": payment_payload_dict.get("version") or payment_payload_dict.get("x402Version"),
+            "version": payment_payload_dict.get("version")
+            or payment_payload_dict.get("x402Version"),
             "network": payment_payload_dict.get("network"),
             "payload": payment_payload_dict.get("payload", {}),
         }
@@ -651,14 +694,14 @@ async def proxy_verify(
             r = await client.post(f"{rurl}/risk/evaluate", json=evaluate_json, headers=headers)
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
-        
+
         # Validate and parse risk response
         try:
             risk_response = EvaluateResponse(**r.json())
             logger.info(f"[{req_id}] [PROXY] Risk response: {risk_response.model_dump_json()}")
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Invalid risk response: {str(e)}")
-        
+
         decision = risk_response.decision
         if response is not None:
             response.headers["X-Risk-Decision"] = decision.value
@@ -666,11 +709,18 @@ async def proxy_verify(
             response.headers["X-Risk-Decision-ID"] = risk_response.decision_id
         if risk_response.ttl_seconds:
             response.headers["X-Risk-TTL-Seconds"] = str(risk_response.ttl_seconds)
-        logger.info(f"[{req_id}] [PROXY] ✅ Risk decision: {decision.value} (id={risk_response.decision_id})")
+        logger.info(
+            "[%s] [PROXY] ✅ Risk decision: %s (id=%s)",
+            req_id,
+            decision.value,
+            risk_response.decision_id,
+        )
 
         # Gate forwarding on decision
         if decision == Decision.deny:
-            msg = "Risk denied" + (f": {', '.join(risk_response.reasons)}" if risk_response.reasons else "")
+            msg = "Risk denied" + (
+                f": {', '.join(risk_response.reasons)}" if risk_response.reasons else ""
+            )
             raise HTTPException(status_code=403, detail=msg)
     except HTTPException as e:
         return _error_response(e, req_id)
@@ -687,7 +737,7 @@ async def proxy_verify(
         transport = None
     # Build request compatible with both facilitator shapes (paymentPayload or paymentHeader)
     xpay = request.headers.get("X-PAYMENT")
-    
+
     # Preserve original payment payload fields (including ap2Ref) by decoding X-PAYMENT directly
     # instead of using Pydantic model_dump which may strip extra fields
     payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
@@ -697,10 +747,12 @@ async def proxy_verify(
             payment_payload_dict = json.loads(safe_base64_decode(xpay))
         except Exception:
             pass  # Fall back to Pydantic serialization
-    
+
     # Strip custom AP2 fields from PaymentRequirements before forwarding to upstream
     # The proxy has already validated AP2, so upstream (e.g., CDP) only needs standard x402 fields
-    payment_requirements_dict = body.paymentRequirements.model_dump(by_alias=True, exclude_none=True)
+    payment_requirements_dict = body.paymentRequirements.model_dump(
+        by_alias=True, exclude_none=True
+    )
     if "extra" in payment_requirements_dict:
         extra = payment_requirements_dict["extra"]
         # Remove ALL custom fields - keep only standard x402 token metadata
@@ -711,16 +763,18 @@ async def proxy_verify(
         if "version" in extra:
             standard_fields["version"] = extra["version"]
         payment_requirements_dict["extra"] = standard_fields if standard_fields else {}
-    
+
     # Remove null fields that CDP doesn't like
-    payment_requirements_dict = {k: v for k, v in payment_requirements_dict.items() if v is not None}
-    
+    payment_requirements_dict = {
+        k: v for k, v in payment_requirements_dict.items() if v is not None
+    }
+
     req_json = {
         "x402Version": body.x402Version,
         "paymentPayload": payment_payload_dict,
         "paymentRequirements": payment_requirements_dict,
     }
-    
+
     try:
         if xpay:
             # Pass through exact header form for facilitators expecting paymentHeader
@@ -732,12 +786,15 @@ async def proxy_verify(
             )
     except Exception:
         pass
-    
+
     # Debug: log what we're sending to upstream
     logger.info(f"[{req_id}] 📤 Forwarding to upstream: {cfg.upstream_verify_url}")
-    logger.info(f"[{req_id}] PaymentRequirements (cleaned): {json.dumps(payment_requirements_dict, indent=2)}")
+    pr_json = json.dumps(payment_requirements_dict, indent=2)
+    logger.info("[%s] PaymentRequirements (cleaned): %s", req_id, pr_json)
 
-    async with httpx.AsyncClient(timeout=cfg.timeout_s, transport=transport, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=cfg.timeout_s, transport=transport, follow_redirects=True
+    ) as client:
         resp = await client.post(
             cfg.upstream_verify_url,
             json=req_json,
@@ -764,7 +821,9 @@ async def proxy_verify(
     LAST_VERIFY = snapshot
 
     if resp.status_code != 200:
-        return _error_response(HTTPException(status_code=resp.status_code, detail=resp.text), req_id)
+        return _error_response(
+            HTTPException(status_code=resp.status_code, detail=resp.text), req_id
+        )
     data = resp_json or {}
     return VerifyResponse(
         isValid=bool(data.get("isValid")),
@@ -804,11 +863,14 @@ async def proxy_settle(
                 try:
                     # Decode tracestate to extract tid
                     from urllib.parse import unquote
+
                     ts_decoded = unquote(tc["ts"])
                     ts_json = json.loads(base64.b64decode(ts_decoded))
                     extracted_tid = ts_json.get("tid")
                     if extracted_tid:
-                        logger.info(f"[{req_id}] [PROXY] Extracted tid from tracestate: {extracted_tid}")
+                        logger.info(
+                            f"[{req_id}] [PROXY] Extracted tid from tracestate: {extracted_tid}"
+                        )
                 except Exception as e:
                     logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
 
@@ -821,10 +883,12 @@ async def proxy_settle(
                     payment_payload_dict = json.loads(safe_base64_decode(xpay))
                 except Exception:
                     pass  # Fall back to Pydantic serialization
-            
+
             payment_context = {
-                "protocol": payment_payload_dict.get("protocol") or payment_payload_dict.get("scheme"),
-                "version": payment_payload_dict.get("version") or payment_payload_dict.get("x402Version"),
+                "protocol": payment_payload_dict.get("protocol")
+                or payment_payload_dict.get("scheme"),
+                "version": payment_payload_dict.get("version")
+                or payment_payload_dict.get("x402Version"),
                 "network": payment_payload_dict.get("network"),
                 "payload": payment_payload_dict.get("payload", {}),
             }
@@ -866,13 +930,13 @@ async def proxy_settle(
                 r = await client.post(f"{rurl}/risk/evaluate", json=evaluate_json, headers=headers)
             if r.status_code != 200:
                 raise HTTPException(status_code=r.status_code, detail=r.text)
-            
+
             # Validate and parse risk response
             try:
                 risk_response = EvaluateResponse(**r.json())
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"Invalid risk response: {str(e)}")
-            
+
             decision = risk_response.decision
             if response is not None:
                 response.headers["X-Risk-Decision"] = decision.value
@@ -880,15 +944,26 @@ async def proxy_settle(
                 response.headers["X-Risk-Decision-ID"] = risk_response.decision_id
             if risk_response.ttl_seconds:
                 response.headers["X-Risk-TTL-Seconds"] = str(risk_response.ttl_seconds)
-            logger.info(f"[{req_id}] [PROXY] ✅ Risk decision: {decision.value} (id={risk_response.decision_id})")
+            logger.info(
+                "[%s] [PROXY] ✅ Risk decision: %s (id=%s)",
+                req_id,
+                decision.value,
+                risk_response.decision_id,
+            )
 
             # Gate forwarding on decision
             if decision == Decision.deny:
-                msg = "Risk denied" + (f": {', '.join(risk_response.reasons)}" if risk_response.reasons else "")
+                msg = "Risk denied" + (
+                    f": {', '.join(risk_response.reasons)}" if risk_response.reasons else ""
+                )
                 raise HTTPException(status_code=403, detail=msg)
         else:
             # Risk on settle disabled by configuration; do not call Risk Engine.
-            logger.info(f"[{req_id}] [PROXY] ⏭️  Skipping /risk/evaluate at /x402/settle (PROXY_SETTLE_RISK_ENABLED=0)")
+            logger.info(
+                "[%s] [PROXY] ⏭️  Skipping /risk/evaluate at /x402/settle "
+                "(PROXY_SETTLE_RISK_ENABLED=0)",
+                req_id,
+            )
             if response is not None:
                 response.headers["X-Risk-Decision"] = "skipped"
     except HTTPException as e:
@@ -903,9 +978,11 @@ async def proxy_settle(
             transport = ASGITransport(app=request.app)
     except Exception:
         transport = None
-    
+
     # Strip custom AP2 fields from PaymentRequirements before forwarding to upstream
-    payment_requirements_dict = body.paymentRequirements.model_dump(by_alias=True, exclude_none=True)
+    payment_requirements_dict = body.paymentRequirements.model_dump(
+        by_alias=True, exclude_none=True
+    )
     if "extra" in payment_requirements_dict:
         extra = payment_requirements_dict["extra"]
         # Keep only standard x402 token metadata
@@ -915,10 +992,12 @@ async def proxy_settle(
         if "version" in extra:
             standard_fields["version"] = extra["version"]
         payment_requirements_dict["extra"] = standard_fields if standard_fields else {}
-    
+
     # Remove null fields that CDP doesn't like
-    payment_requirements_dict = {k: v for k, v in payment_requirements_dict.items() if v is not None}
-    
+    payment_requirements_dict = {
+        k: v for k, v in payment_requirements_dict.items() if v is not None
+    }
+
     req_json = {
         "x402Version": body.x402Version,
         "paymentPayload": body.paymentPayload.model_dump(by_alias=True),
@@ -934,7 +1013,9 @@ async def proxy_settle(
             )
     except Exception:
         pass
-    async with httpx.AsyncClient(timeout=cfg.timeout_s, transport=transport, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=cfg.timeout_s, transport=transport, follow_redirects=True
+    ) as client:
         resp = await client.post(
             cfg.upstream_settle_url,
             json=req_json,
@@ -960,7 +1041,9 @@ async def proxy_settle(
     LAST_SETTLE = snapshot
 
     if resp.status_code != 200:
-        return _error_response(HTTPException(status_code=resp.status_code, detail=resp.text), req_id)
+        return _error_response(
+            HTTPException(status_code=resp.status_code, detail=resp.text), req_id
+        )
     data = resp_json or {}
     return SettleResponse(
         success=bool(data.get("success")),
@@ -969,6 +1052,7 @@ async def proxy_settle(
         network=data.get("network"),
         errorReason=data.get("errorReason") or data.get("error") or None,
     )
+
 
 @router.get("/debug")
 async def proxy_debug(cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg)) -> Dict[str, Any]:

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # Copyright 2025 t54 labs
 # SPDX-License-Identifier: Apache-2.0
-"""
-Standalone runner for the x402 Facilitator Proxy.
+"""Standalone runner for the x402 Facilitator Proxy.
 
-Env:
+Environment Variables:
   - PROXY_PORT (default: 8000)
   - PROXY_HOST (default: 0.0.0.0)
   - PROXY_UPSTREAM_VERIFY_URL (default: http://localhost:8001/verify)
@@ -16,14 +15,9 @@ import logging
 import os
 from datetime import datetime, timezone
 
-# Load .env BEFORE importing packages so env vars are available during module init
 from dotenv import load_dotenv  # type: ignore
-load_dotenv()
-
 from fastapi import Depends, FastAPI
-
-from x402_proxy import ProxyRuntimeConfig, get_proxy_cfg, router, risk_router
-
+from x402_proxy import ProxyRuntimeConfig, get_proxy_cfg, risk_router, router
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -33,6 +27,10 @@ logger = logging.getLogger("facilitator_proxy")
 
 
 def build_app() -> FastAPI:
+    """Build and configure the FastAPI application."""
+    # Load .env file to make environment variables available
+    load_dotenv()
+
     app = FastAPI(
         title="x402 Facilitator Proxy",
         description="AP2-enforcing proxy for x402 verify/settle",

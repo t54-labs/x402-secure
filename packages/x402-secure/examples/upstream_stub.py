@@ -13,4 +13,3 @@ async def verify():
 @app.post("/settle")
 async def settle():
     return {"success": True, "payer": "0xabc", "transaction": "0xtx"}
-

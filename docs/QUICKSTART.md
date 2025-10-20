@@ -42,15 +42,13 @@ export BUYER_PRIVATE_KEY=0x...  # Your private key from above
 ```python
 import asyncio
 import os
-from x402_secure_client import BuyerClient, BuyerConfig, RiskClient
-from x402_secure_client import execute_payment_with_tid, store_agent_trace
-from x402_secure_client.otel import setup_otel_from_env
+from x402_secure_client import BuyerClient, BuyerConfig, setup_otel_from_env
 
 async def main():
     # Optional: Initialize OpenTelemetry for observability
     setup_otel_from_env()
     
-    # Initialize clients
+    # Initialize buyer client
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="https://test.example.com",
         agent_gateway_url="https://x402-proxy.t54.ai",
@@ -58,19 +56,15 @@ async def main():
         network="base-sepolia"  # Use testnet for development
     ))
     
-    risk_client = RiskClient("https://x402-proxy.t54.ai")
-    
     # Create risk session (requires app_id and device info)
-    session = await risk_client.create_session(
-        agent_did=buyer.address,
+    session = await buyer.create_risk_session(
         app_id=None,
         device={"ua": "quickstart-demo"}
     )
     sid = session['sid']
     
     # For testing: create a simple trace without AI
-    tid = await store_agent_trace(
-        risk=risk_client,
+    tid = await buyer.store_agent_trace(
         sid=sid,
         task="Test payment",
         params={"test": True},
@@ -82,8 +76,7 @@ async def main():
     )
     
     # Execute payment
-    result = await execute_payment_with_tid(
-        buyer=buyer,
+    result = await buyer.execute_with_tid(
         endpoint="/api/test",
         task="Test payment",
         params={"amount": "1.00"},
@@ -105,16 +98,14 @@ import asyncio
 import json
 from openai import OpenAI
 from x402_secure_client import (
-    BuyerClient, BuyerConfig, RiskClient, OpenAITraceCollector,
-    store_agent_trace, execute_payment_with_tid
+    BuyerClient, BuyerConfig, OpenAITraceCollector, setup_otel_from_env
 )
-from x402_secure_client.otel import setup_otel_from_env
 
 async def shopping_agent():
     # Initialize OpenTelemetry for observability
     setup_otel_from_env()
     
-    # Initialize clients
+    # Initialize buyer client
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="https://shop.example.com",
         agent_gateway_url="https://x402-proxy.t54.ai",
@@ -122,7 +113,6 @@ async def shopping_agent():
         network="base-sepolia"
     ))
     
-    risk_client = RiskClient("https://x402-proxy.t54.ai")
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     tracer = OpenAITraceCollector()
     
@@ -134,8 +124,7 @@ async def shopping_agent():
     )
     
     # Create risk session (requires app_id and device info)
-    session = await risk_client.create_session(
-        agent_did=buyer.address,
+    session = await buyer.create_risk_session(
         app_id=None,
         device={"ua": "shopping-agent"}
     )
@@ -180,8 +169,7 @@ async def shopping_agent():
         purchase = result["tool_results"]["purchase_item"]
         
         # Store trace and get trace ID
-        tid = await store_agent_trace(
-            risk=risk_client,
+        tid = await buyer.store_agent_trace(
             sid=sid,
             task="Purchase coffee maker",
             params=purchase,
@@ -195,8 +183,7 @@ async def shopping_agent():
         )
         
         # Execute protected payment
-        payment_result = await execute_payment_with_tid(
-            buyer=buyer,
+        payment_result = await buyer.execute_with_tid(
             endpoint="/api/purchase",
             task="Purchase coffee maker",
             params=purchase,

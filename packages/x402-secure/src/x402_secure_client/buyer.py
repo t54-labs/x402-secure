@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import httpx
+from .risk import RiskClient
 
 
 def _now() -> int:
@@ -48,6 +49,8 @@ class BuyerClient:
         else:
             self.address = os.getenv("BUYER_ADDRESS") or ("0x" + os.urandom(20).hex())
 
+        self.risk = RiskClient(cfg.agent_gateway_url)
+        
     async def _first_request_402(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         r = await self.http.get(url, params=params)
         if r.status_code != 402:
@@ -106,4 +109,69 @@ class BuyerClient:
         final = await self.http.get(url, params=params, headers=headers)
         final.raise_for_status()
         return final.json()
+
+    async def create_risk_session(
+        self,
+        *,
+        agent_did: Optional[str] = None,
+        app_id: Optional[str] = None,
+        device: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create a risk session. Uses buyer's address as agent_did if not provided."""
+        return await self.risk.create_session(
+            agent_did=agent_did or self.address,
+            app_id=app_id,
+            device=device,
+        )
+
+    async def store_agent_trace(
+        self,
+        *,
+        sid: str,
+        task: str,
+        params: Dict[str, Any],
+        environment: Optional[Dict[str, Any]] = None,
+        events: Optional[list[Dict[str, Any]]] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        session_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Store agent trace and return trace ID (tid)."""
+        from datetime import datetime, timezone
+
+        agent_trace: Dict[str, Any] = {
+            "task": task,
+            "parameters": params,
+        }
+        if environment is not None:
+            agent_trace["environment"] = environment
+        if events is not None:
+            agent_trace["events"] = events
+        if model_config is not None:
+            agent_trace["model_config"] = model_config
+        if session_context is not None:
+            agent_trace["session_context"] = session_context
+
+        agent_trace["completed_at"] = datetime.now(timezone.utc).isoformat()
+        res = await self.risk.create_trace(sid=sid, agent_trace=agent_trace)
+        return res["tid"]
+
+    async def execute_with_tid(
+        self,
+        *,
+        endpoint: str,
+        task: str,
+        params: Dict[str, Any],
+        sid: str,
+        tid: str,
+    ) -> Any:
+        """Execute paid request with trace ID."""
+        from .headers import build_payment_secure_header
+        xps = build_payment_secure_header(agent_trace_context={"tid": tid})
+        return await self.execute_paid_request(
+            endpoint,
+            task=task,
+            params=params,
+            risk_sid=sid,
+            extra_headers=xps,
+        )
 

@@ -27,10 +27,7 @@ from typing import Any, Dict
 from x402_secure_client import (
     BuyerClient,
     BuyerConfig,
-    RiskClient,
     OpenAITraceCollector,
-    store_agent_trace,
-    execute_payment_with_tid,
     setup_otel_from_env,
 )
 from dotenv import load_dotenv
@@ -63,10 +60,8 @@ async def main() -> None:
     buyer = BuyerClient(cfg)
 
     # Create session early
-    rc = RiskClient(gateway)
-    # create_session input payload: agent_did (currently wallet address, future: EIP-8004 DID)
-    # TODO: When integrating with EIP-8004, pass did:eip8004:{chain_id}:{contract}:{token_id}
-    sid = (await rc.create_session(agent_did=buyer.address, app_id=None, device={"ua": "oss-agent"}))['sid']
+    #     # TODO: When integrating with EIP-8004, pass did:eip8004:{chain_id}:{contract}:{token_id}
+    sid = (await buyer.create_risk_session(app_id=None, device={"ua": "oss-agent"}))['sid']
 
     # Tracer + tools
     tracer = OpenAITraceCollector()
@@ -236,8 +231,7 @@ async def main() -> None:
     tracer.record_agent_output(final_output)
 
     # Store agent trace, execute payment
-    tid = await store_agent_trace(
-        risk=rc,
+    tid = await buyer.store_agent_trace(
         sid=sid,
         task="Buy BTC price",
         params=plan.get("params") or {"symbol": "BTC/USD"},
@@ -246,8 +240,7 @@ async def main() -> None:
         model_config=tracer.model_config,
         session_context=session_context,
     )
-    result = await execute_payment_with_tid(
-        buyer=buyer,
+    result = await buyer.execute_with_tid(
         endpoint=plan["endpoint"],
         task="Buy BTC price",
         params=plan.get("params") or {"symbol": "BTC/USD"},

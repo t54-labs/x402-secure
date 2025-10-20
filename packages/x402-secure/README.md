@@ -20,8 +20,7 @@ pip install x402-secure
 
 ```python
 import os, asyncio
-from x402_secure_client import BuyerConfig, BuyerClient, RiskClient
-from x402_secure_client import build_payment_secure_header, start_client_span
+from x402_secure_client import BuyerConfig, BuyerClient
 
 async def main():
     buyer = BuyerClient(BuyerConfig(
@@ -31,22 +30,24 @@ async def main():
         buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
     ))
 
-    # Create risk session + trace
-    rc = RiskClient(os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000"))
+    # Create risk session + trace (single client!)
     # agent_did: currently wallet address, future: EIP-8004 DID (did:eip8004:chain:contract:tokenId)
-    sid = (await rc.create_session(agent_did=buyer.address, app_id=None, device={"ua": "oss-example"}))['sid']
-    tid = (await rc.create_trace(sid=sid, agent_trace={"task": "buy", "parameters": {"symbol": "BTC/USD"}}))['tid']
+    sid = (await buyer.create_risk_session(app_id=None, device={"ua": "oss-example"}))['sid']
+    tid = await buyer.store_agent_trace(
+        sid=sid,
+        task="Buy BTC price",
+        params={"symbol": "BTC/USD"},
+        environment={"network": os.getenv("NETWORK", "base-sepolia")},
+    )
 
-    # Build secure header from OTEL context
-    with start_client_span("buyer.payment"):
-        xps = build_payment_secure_header(agent_trace_context={"tid": tid})
-        res = await buyer.execute_paid_request(
-            endpoint="/api/market-data",
-            task="Buy BTC price",
-            params={"symbol": "BTC/USD"},
-            risk_sid=sid,
-            extra_headers=xps,
-        )
+    # Execute payment with trace ID
+    res = await buyer.execute_with_tid(
+        endpoint="/api/market-data",
+        task="Buy BTC price",
+        params={"symbol": "BTC/USD"},
+        sid=sid,
+        tid=tid,
+    )
     print(res)
 
 asyncio.run(main())

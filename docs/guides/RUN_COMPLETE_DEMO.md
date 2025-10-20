@@ -50,7 +50,6 @@ uv run python run_facilitator_proxy.py
 
 ### Terminal 2: Start Seller (8010)
 ```bash
-PROXY_BASE=http://localhost:8000/x402 \
 uv run uvicorn --app-dir packages/x402-secure/examples seller_integration:app --port 8010
 ```
 

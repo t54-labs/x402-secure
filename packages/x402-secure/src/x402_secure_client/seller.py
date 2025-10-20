@@ -8,12 +8,19 @@ import httpx
 
 
 class SellerClient:
-    def __init__(self, proxy_base: str):
-        if not proxy_base:
-            raise ValueError("proxy_base required")
-        base = proxy_base.rstrip("/")
-        self.verify_url = f"{base}/verify"
-        self.settle_url = f"{base}/settle"
+    def __init__(self, gateway_base_url: str):
+        """
+        Initialize SellerClient with the agent gateway base URL.
+        
+        Args:
+            gateway_base_url: Base URL of the agent gateway.
+        """
+        if not gateway_base_url:
+            raise ValueError("gateway_base_url required")
+        base = gateway_base_url.rstrip("/")
+        proxy_base = f"{base}/x402"
+        self.verify_url = f"{proxy_base}/verify"
+        self.settle_url = f"{proxy_base}/settle"
         self.http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
     async def verify(

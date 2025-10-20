@@ -1,6 +1,11 @@
 # Copyright 2025 t54 labs
 # SPDX-License-Identifier: Apache-2.0
+"""Seller integration example demonstrating payment verification and settlement."""
+
+import base64
+import json
 import os
+import urllib.parse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -16,6 +21,7 @@ seller_sdk = SellerClient(GATEWAY)
 
 @app.get("/api/market-data")
 async def market_data(req: Request, symbol: str = "BTC/USD"):
+    """Handle market data requests with X-PAYMENT verification."""
     pr = {
         "scheme": "exact",
         "network": os.getenv("NETWORK", "base-sepolia"),
@@ -47,16 +53,12 @@ async def market_data(req: Request, symbol: str = "BTC/USD"):
         print("\n📊 Trace Context:")
         print(f"   traceparent: {parts.get('tp', 'N/A')}")
         if "ts" in parts:
-            import base64 as b64
-            import json as js
-            import urllib.parse as up
-
-        try:
-            ts_decoded = b64.b64decode(up.unquote(parts["ts"]))
-            ts_data = js.loads(ts_decoded)
-            print(f"   tracestate: {js.dumps(ts_data, indent=6)}")
-        except Exception:
-            print(f"   tracestate: {parts['ts'][:60]}...")
+            try:
+                ts_decoded = base64.b64decode(urllib.parse.unquote(parts["ts"]))
+                ts_data = json.loads(ts_decoded)
+                print(f"   tracestate: {json.dumps(ts_data, indent=6)}")
+            except Exception:
+                print(f"   tracestate: {parts['ts'][:60]}...")
     print("=" * 80 + "\n")
 
     if not x_payment or not xps or not sid or not origin:
@@ -64,11 +66,8 @@ async def market_data(req: Request, symbol: str = "BTC/USD"):
             {"x402Version": 1, "accepts": [pr], "error": "Payment required"}, status_code=402
         )
 
-    import base64
-    import json as _json
-
     try:
-        payment_payload = _json.loads(base64.b64decode(x_payment))
+        payment_payload = json.loads(base64.b64decode(x_payment))
     except Exception:
         return JSONResponse(
             {"x402Version": 1, "accepts": [pr], "error": "Invalid X-PAYMENT"}, status_code=402
@@ -83,8 +82,19 @@ async def market_data(req: Request, symbol: str = "BTC/USD"):
         risk_sid=sid,
     )
 
-    import json
-
     payload_resp_b64 = base64.b64encode(json.dumps(v).encode()).decode()
-    data = {"symbol": symbol, "price": 63500.12, "source": "oss-demo"}
+
+    print(
+        f"✅ Settlement success={v.get('success')} "
+        f"network={v.get('network')} "
+        f"tx={v.get('transaction')} "
+        f"payer={v.get('payer')}"
+    )
+
+    data = {
+        "symbol": symbol,
+        "price": 113500.12,
+        "source": "oss-demo",
+        "settlement": v,
+    }
     return JSONResponse(data, headers={"X-PAYMENT-RESPONSE": payload_resp_b64})

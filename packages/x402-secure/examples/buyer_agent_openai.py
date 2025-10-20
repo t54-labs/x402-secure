@@ -1,14 +1,15 @@
 # Copyright 2025 t54 labs
 # SPDX-License-Identifier: Apache-2.0
-"""
-Buyer agent example demonstrating the complete OSS SDK flow:
+"""Buyer agent example demonstrating the complete OSS SDK flow.
+
+Complete flow includes:
 - Create risk session first
 - Register Python tools via tracer.tool decorator
 - Let tracer.process_stream capture events and execute tools
 - Store agent trace at /risk/trace to get tid
 - Execute payment with tid in X-PAYMENT-SECURE
 
-Env:
+Environment variables:
 - AGENT_GATEWAY_URL (default http://localhost:8000)
 - SELLER_BASE_URL (default http://localhost:8010)
 - NETWORK (default base-sepolia)
@@ -35,6 +36,7 @@ from x402_secure_client import (
     OpenAITraceCollector,
     setup_otel_from_env,
 )
+from x402_secure_client.headers import start_client_span
 
 
 def _usdc_for_network(network: str) -> str:
@@ -46,6 +48,7 @@ def _usdc_for_network(network: str) -> str:
 
 
 async def main() -> None:
+    """Execute the complete buyer agent flow with OpenAI integration."""
     # Load environment variables from .env (repo root)
     load_dotenv()
     if not os.getenv("BUYER_PRIVATE_KEY"):
@@ -256,13 +259,15 @@ async def main() -> None:
         model_config=tracer.model_config,
         session_context=session_context,
     )
-    result = await buyer.execute_with_tid(
-        endpoint=plan["endpoint"],
-        task="Buy BTC price",
-        params=plan.get("params") or {"symbol": "BTC/USD"},
-        sid=sid,
-        tid=tid,
-    )
+
+    with start_client_span("buyer.execute_payment"):
+        result = await buyer.execute_with_tid(
+            endpoint=plan["endpoint"],
+            task="Buy BTC price",
+            params=plan.get("params") or {"symbol": "BTC/USD"},
+            sid=sid,
+            tid=tid,
+        )
 
     print(json.dumps(result, indent=2))
 

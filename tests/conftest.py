@@ -1,12 +1,13 @@
 # Copyright 2025 t54 labs
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import os
 import sys
-import asyncio
-import pytest
-from typing import AsyncGenerator, Generator
-from unittest.mock import AsyncMock, Mock
+from typing import Generator
+from unittest.mock import AsyncMock
+
 import httpx
+import pytest
 
 
 def _add_project_root_to_syspath() -> None:
@@ -19,8 +20,6 @@ _add_project_root_to_syspath()
 
 
 # Import after adding to syspath
-from fastapi.testclient import TestClient
-from fastapi import FastAPI
 
 
 @pytest.fixture(scope="session")
@@ -44,14 +43,14 @@ def test_env(monkeypatch) -> None:
     # Basic proxy config
     monkeypatch.setenv("AGENT_GATEWAY_URL", "http://localhost:8000")
     monkeypatch.setenv("UPSTREAM_FACILITATOR_BASE_URL", "https://facilitator.example.com")
-    
+
     # Local risk mode for testing
     monkeypatch.setenv("PROXY_LOCAL_RISK", "1")
-    
+
     # Test buyer config
     monkeypatch.setenv("BUYER_SIGNING_KEY", "0x" + "a" * 64)
     monkeypatch.setenv("BUYER_ADDRESS", "0x" + "b" * 40)
-    
+
     # Test seller config
     monkeypatch.setenv("SELLER_MERCHANT_NAME", "Test Merchant")
     monkeypatch.setenv("SELLER_MERCHANT_DOMAIN", "https://test.example.com")
@@ -69,7 +68,7 @@ def sample_payment_data() -> dict:
             "validAfter": "0",
             "validBefore": str(2**256 - 1),
             "nonce": "0x" + "0" * 64,
-            "signature": "0x" + "d" * 130
+            "signature": "0x" + "d" * 130,
         },
         "paymentRequirements": {
             "merchantName": "Test Merchant",
@@ -79,10 +78,10 @@ def sample_payment_data() -> dict:
                     "chain": "base-sepolia",
                     "currency": "USDC",
                     "receiver": "0x" + "c" * 40,
-                    "requiredAmount": "1000000"
+                    "requiredAmount": "1000000",
                 }
-            ]
-        }
+            ],
+        },
     }
 
 
@@ -92,7 +91,7 @@ def sample_risk_session() -> dict:
     return {
         "sid": "925ca6ee-aa4b-4508-955b-10b1c02c69bb",
         "agent_id": "0x" + "b" * 40,
-        "expires_at": "2025-12-31T23:59:59Z"
+        "expires_at": "2025-12-31T23:59:59Z",
     }
 
 
@@ -109,13 +108,9 @@ def sample_agent_trace() -> dict:
                     "type": "tool_call",
                     "tool": "get_price",
                     "arguments": {"symbol": "BTC/USD"},
-                    "result": {"price": 63500.12}
+                    "result": {"price": 63500.12},
                 }
             ],
-            "model_config": {
-                "model": "gpt-4",
-                "temperature": 0.7
-            }
-        }
+            "model_config": {"model": "gpt-4", "temperature": 0.7},
+        },
     }
-

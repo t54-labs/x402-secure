@@ -14,23 +14,31 @@ class RiskClient:
         self.base_url = base_url.rstrip("/")
         self.http = httpx.AsyncClient(timeout=15.0)
 
-    async def create_session(self, *, agent_did: str, app_id: Optional[str], device: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    async def create_session(
+        self, *, agent_did: str, app_id: Optional[str], device: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """
         Create a risk session with agent identification.
-        
+
         Args:
             agent_did: Agent decentralized identifier. Currently accepts wallet address (0x...).
-                      TODO: Support EIP-8004 DID format (did:eip8004:{chain_id}:{contract}:{token_id})
-                      when integrating with on-chain agent identity registry (ERC-721 based).
+                      TODO: Support EIP-8004 DID format
+                      (did:eip8004:{chain_id}:{contract}:{token_id})
+                      when integrating with on-chain agent identity (ERC-721 based).
             app_id: Optional application identifier
             device: Device information dict
-        
+
         Returns:
             Dict containing 'sid' (session ID) and other session metadata
         """
-        r = await self.http.post(f"{self.base_url}/risk/session", json={"agent_did": agent_did, "app_id": app_id, "device": device})
+        r = await self.http.post(
+            f"{self.base_url}/risk/session",
+            json={"agent_did": agent_did, "app_id": app_id, "device": device},
+        )
         r.raise_for_status()
-        if (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower() != "application/json":
+        if (r.headers.get("content-type") or "").split(";", 1)[
+            0
+        ].strip().lower() != "application/json":
             raise httpx.HTTPError("invalid content-type from /risk/session")
         return r.json()
 
@@ -44,10 +52,16 @@ class RiskClient:
     ) -> Dict[str, Any]:
         r = await self.http.post(
             f"{self.base_url}/risk/trace",
-            json={"sid": sid, "fingerprint": fingerprint, "telemetry": telemetry, "agent_trace": agent_trace},
+            json={
+                "sid": sid,
+                "fingerprint": fingerprint,
+                "telemetry": telemetry,
+                "agent_trace": agent_trace,
+            },
         )
         r.raise_for_status()
-        if (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower() != "application/json":
+        if (r.headers.get("content-type") or "").split(";", 1)[
+            0
+        ].strip().lower() != "application/json":
             raise httpx.HTTPError("invalid content-type from /risk/trace")
         return r.json()
-

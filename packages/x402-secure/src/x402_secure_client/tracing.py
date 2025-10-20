@@ -34,71 +34,112 @@ class OpenAITraceCollector:
         provider: str = "openai",
         model: str,
         tools_enabled: Optional[List[str]] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         """Set model configuration for trace context."""
         self.model_config = {
             "provider": provider,
             "model": model,
             "tools_enabled": tools_enabled or [],
-            **kwargs
+            **kwargs,
         }
 
     def record_user_input(self, content: str, role: str = "user") -> None:
         """Record user input for risk evaluation."""
         import hashlib
-        self.events.insert(0, {
-            "ts": time.time(),
-            "type": "user_input",
-            "role": role,
-            "content": content,
-            "content_hash": hashlib.sha256(content.encode()).hexdigest(),
-            "length": len(content)
-        })
+
+        self.events.insert(
+            0,
+            {
+                "ts": time.time(),
+                "type": "user_input",
+                "role": role,
+                "content": content,
+                "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+                "length": len(content),
+            },
+        )
         if self.started_at is None:
             self.started_at = time.time()
 
     def record_system_prompt(self, content: str, version: str = "v1.0") -> None:
         """Record system prompt for verification."""
         import hashlib
-        self.events.insert(0, {
-            "ts": time.time(),
-            "type": "system_prompt",
-            "role": "system",
-            "content": content,
-            "content_hash": hashlib.sha256(content.encode()).hexdigest(),
-            "version": version,
-            "length": len(content)
-        })
+
+        self.events.insert(
+            0,
+            {
+                "ts": time.time(),
+                "type": "system_prompt",
+                "role": "system",
+                "content": content,
+                "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+                "version": version,
+                "length": len(content),
+            },
+        )
 
     def record_agent_output(self, content: str, role: str = "assistant") -> None:
         """Record agent final output for compliance checking."""
         import hashlib
-        self.events.append({
-            "ts": time.time(),
-            "type": "agent_output",
-            "role": role,
-            "content": content,
-            "output_hash": hashlib.sha256(content.encode()).hexdigest(),
-            "length": len(content)
-        })
+
+        self.events.append(
+            {
+                "ts": time.time(),
+                "type": "agent_output",
+                "role": role,
+                "content": content,
+                "output_hash": hashlib.sha256(content.encode()).hexdigest(),
+                "length": len(content),
+            }
+        )
         if self.completed_at is None:
             self.completed_at = time.time()
 
     def tool(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         if asyncio.iscoroutinefunction(fn):
+
             async def _aw(*a, **k):
-                self.events.append({"ts": time.time(), "type": "tool_call", "name": fn.__name__, "args": {"a": a, "k": k}})
+                self.events.append(
+                    {
+                        "ts": time.time(),
+                        "type": "tool_call",
+                        "name": fn.__name__,
+                        "args": {"a": a, "k": k},
+                    }
+                )
                 out = await fn(*a, **k)
-                self.events.append({"ts": time.time(), "type": "tool_result", "name": fn.__name__, "result": out})
+                self.events.append(
+                    {
+                        "ts": time.time(),
+                        "type": "tool_result",
+                        "name": fn.__name__,
+                        "result": out,
+                    }
+                )
                 return out
 
             return _aw
         else:
+
             def _sw(*a, **k):
-                self.events.append({"ts": time.time(), "type": "tool_call", "name": fn.__name__, "args": {"a": a, "k": k}})
+                self.events.append(
+                    {
+                        "ts": time.time(),
+                        "type": "tool_call",
+                        "name": fn.__name__,
+                        "args": {"a": a, "k": k},
+                    }
+                )
                 out = fn(*a, **k)
-                self.events.append({"ts": time.time(), "type": "tool_result", "name": fn.__name__, "result": out})
+                self.events.append(
+                    {
+                        "ts": time.time(),
+                        "type": "tool_result",
+                        "name": fn.__name__,
+                        "result": out,
+                    }
+                )
                 return out
 
             return _sw
@@ -138,7 +179,15 @@ class OpenAITraceCollector:
                         args = json.loads(args_str or "{}")
                     except Exception:
                         args = {"_raw": args_str}
-                    self.events.append({"ts": now, "type": "function_call", "name": name, "call_id": cid, "arguments": args})
+                    self.events.append(
+                        {
+                            "ts": now,
+                            "type": "function_call",
+                            "name": name,
+                            "call_id": cid,
+                            "arguments": args,
+                        }
+                    )
                 if cid:
                     self._args_buf.pop(cid, None)
                     self._call_meta.pop(cid, None)
@@ -158,7 +207,12 @@ class OpenAITraceCollector:
             self.events.append({"ts": now, "type": t})
             return
 
-    async def process_stream(self, stream: Any, *, tools: Dict[str, Callable[..., Any]]) -> Dict[str, Any]:
+    async def process_stream(
+        self,
+        stream: Any,
+        *,
+        tools: Dict[str, Callable[..., Any]],
+    ) -> Dict[str, Any]:
         tool_results: Dict[str, Any] = {}
         arg_buffer: Dict[str, str] = {}
         call_metadata: Dict[str, Dict[str, Any]] = {}
@@ -201,4 +255,3 @@ class OpenAITraceCollector:
                     call_metadata.pop(cid, None)
         _ = stream.get_final_response()
         return {"tool_results": tool_results}
-

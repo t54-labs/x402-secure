@@ -8,7 +8,7 @@ info:
   description: |
     Unified gateway providing buyer risk APIs and seller x402 proxy functionality.
     This proxy integrates with Trustline risk engine for AI agent payment protection.
-    
+
     Developed by t54 labs (https://t54.ai)
   contact:
     name: t54 labs
@@ -72,7 +72,7 @@ paths:
         Store comprehensive agent execution trace including reasoning chains, tool calls,
         and runtime behavior. This data is used by Trustline for logic-level risk assessment
         and evidence-based validation.
-        
+
         Note: agent_trace must include all required fields (task, parameters, environment,
         events, model_config, session_context, completed_at). See AgentTraceData schema.
       tags:
@@ -85,16 +85,16 @@ paths:
               type: object
               required: [sid, agent_trace]
               properties:
-                sid: 
+                sid:
                   type: string
                   format: uuid
                   description: Session ID from /risk/session
-                fingerprint: 
+                fingerprint:
                   type: object
                   additionalProperties: true
                   nullable: true
                   description: Browser/device fingerprint (optional)
-                telemetry: 
+                telemetry:
                   type: object
                   additionalProperties: true
                   nullable: true
@@ -134,14 +134,14 @@ paths:
                 type: object
                 required: [sid, agent_trace]
                 properties:
-                  sid: 
+                  sid:
                     type: string
                     format: uuid
-                  fingerprint: 
+                  fingerprint:
                     type: object
                     additionalProperties: true
                     nullable: true
-                  telemetry: 
+                  telemetry:
                     type: object
                     additionalProperties: true
                     nullable: true

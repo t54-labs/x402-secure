@@ -3,10 +3,12 @@
 """
 Mock upstream facilitator for testing.
 """
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+
 import logging
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Header
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,16 +50,16 @@ async def verify_payment(
 ):
     """Mock payment verification."""
     logger.info(f"Verify request: {request.dict()}")
-    
+
     # Check for paymentHeader in request body (sent by proxy)
-    payment_header = getattr(request, 'paymentHeader', None) or x_payment
-    if not payment_header and hasattr(request, '__dict__') and 'paymentHeader' in request.__dict__:
-        payment_header = request.__dict__['paymentHeader']
-    
+    payment_header = getattr(request, "paymentHeader", None) or x_payment
+    if not payment_header and hasattr(request, "__dict__") and "paymentHeader" in request.__dict__:
+        payment_header = request.__dict__["paymentHeader"]
+
     # Simple validation logic
     payload = request.paymentPayload
-    requirements = request.paymentRequirements
-    
+    _ = request.paymentRequirements  # Required field but not used in mock
+
     # Extract payer from nested payload structure
     payer = None
     if isinstance(payload, dict):
@@ -70,15 +72,12 @@ async def verify_payment(
         # Fallback to direct from field
         if not payer:
             payer = payload.get("from")
-    
+
     if not payer:
         payer = "0x" + "b" * 40
-    
+
     # Mock validation - always valid for testing
-    return VerifyResponse(
-        isValid=True,
-        payer=payer
-    )
+    return VerifyResponse(isValid=True, payer=payer)
 
 
 @app.post("/settle", response_model=SettleResponse)
@@ -88,23 +87,23 @@ async def settle_payment(
 ):
     """Mock payment settlement."""
     logger.info(f"Settle request: {request.dict()}")
-    
+
     # Check for paymentHeader in request body (sent by proxy)
-    payment_header = getattr(request, 'paymentHeader', None) or x_payment
-    if not payment_header and hasattr(request, '__dict__') and 'paymentHeader' in request.__dict__:
-        payment_header = request.__dict__['paymentHeader']
-    
+    payment_header = getattr(request, "paymentHeader", None) or x_payment
+    if not payment_header and hasattr(request, "__dict__") and "paymentHeader" in request.__dict__:
+        payment_header = request.__dict__["paymentHeader"]
+
     payload = request.paymentPayload
     requirements = request.paymentRequirements
-    
+
     # Mock settlement - always successful for testing
     accept = requirements.get("accepts", [{}])[0]
-    
+
     return SettleResponse(
         success=True,
         payer=payload.get("from", "0x" + "b" * 40),
         transaction="0x" + "f" * 64,  # Mock transaction hash
-        network=accept.get("chain", "base-sepolia")
+        network=accept.get("chain", "base-sepolia"),
     )
 
 
@@ -114,7 +113,7 @@ async def verify_payment_fail(request: PaymentRequest):
     return VerifyResponse(
         isValid=False,
         payer=request.paymentPayload.get("from", ""),
-        invalidReason="Mock failure for testing"
+        invalidReason="Mock failure for testing",
     )
 
 
@@ -124,5 +123,5 @@ async def settle_payment_fail(request: PaymentRequest):
     return SettleResponse(
         success=False,
         payer=request.paymentPayload.get("from", ""),
-        errorReason="Mock settlement failure for testing"
+        errorReason="Mock settlement failure for testing",
     )

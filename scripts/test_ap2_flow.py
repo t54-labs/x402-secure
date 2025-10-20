@@ -6,8 +6,6 @@ Test complete AP2 flow: Buyer Agent -> Proxy -> Seller
 """
 
 import asyncio
-import base64
-import hashlib
 import json
 from datetime import datetime
 
@@ -32,7 +30,10 @@ async def test_buyer_agent_flow():
         trace_context = {
             "agent_did": "test-buyer-agent-001",
             "timestamp": datetime.utcnow().isoformat(),
-            "task": {"type": "purchase", "description": "User requests purchase of real-time BTC/USD market data"},
+            "task": {
+                "type": "purchase",
+                "description": "User requests purchase of real-time BTC/USD data",
+            },
             "decision_process": [
                 {
                     "step": 1,
@@ -66,7 +67,7 @@ async def test_buyer_agent_flow():
                 "resource": "http://localhost:8000/api/market-data?symbol=BTC/USD",
                 "price": "1.0",
                 "currency": "USDC",
-            }
+            },
         }
 
         session_request = {
@@ -75,7 +76,7 @@ async def test_buyer_agent_flow():
             "metadata": {"sdk_version": "1.0.0", "environment": "test"},
         }
 
-        print(f"Trace context summary:")
+        print("Trace context summary:")
         print(f"  - Agent DID: {trace_context['agent_did']}")
         print(f"  - Task: {trace_context['task']['description']}")
         print(f"  - Decision steps: {len(trace_context['decision_process'])}")
@@ -91,7 +92,7 @@ async def test_buyer_agent_flow():
         session_url = session_response["session_url"]
         digest = session_response["digest"]
 
-        print(f"\n✅ Session created successfully!")
+        print("\n✅ Session created successfully!")
         print(f"  - Session URL: {session_url}")
         print(f"  - Digest: {digest}")
 
@@ -125,12 +126,12 @@ async def test_buyer_agent_flow():
             "subject": "did:agent:test-buyer-001",
         }
 
-        print(f"PaymentMandate request:")
+        print("PaymentMandate request:")
         print(f"  - Merchant: {mandate_request['binding']['merchant_id']}")
         print(f"  - Resource: {mandate_request['binding']['resource_url']}")
-        print(
-            f"  - Amount: {mandate_request['binding']['amount']} {mandate_request['binding']['asset']}"
-        )
+        amount = mandate_request["binding"]["amount"]
+        asset = mandate_request["binding"]["asset"]
+        print(f"  - Amount: {amount} {asset}")
         print(f"  - Session URL: {mandate_request['risk_payload']['session_url']}")
 
         response = await client.post(f"{PROXY_URL}/ap2/payment/issue", json=mandate_request)
@@ -145,7 +146,7 @@ async def test_buyer_agent_flow():
         risk_score = mandate_response["risk_score"]
         reason = mandate_response["reason"]
 
-        print(f"\n✅ Risk approval received!")
+        print("\n✅ Risk approval received!")
         print(f"  - Payment UID: {payment_uid}")
         print(f"  - Approved: {approved}")
         print(f"  - Risk Score: {risk_score}")
@@ -177,7 +178,7 @@ async def test_buyer_agent_flow():
             },
         }
 
-        print(f"x402 payment request built:")
+        print("x402 payment request built:")
         print(f"  - ap2Ref.url: {x402_payment['payload']['ap2Ref']['url']}")
         print(f"  - ap2Ref.digest: {x402_payment['payload']['ap2Ref']['digest']}")
         print(f"  - Payment UID: {payment_uid}")
@@ -226,10 +227,10 @@ async def test_seller_verify(buyer_result):
         }
 
         print("📤 Calling /verify endpoint...")
-        print(f"  - Verify ap2Ref")
-        print(f"  - Check trace context")
-        print(f"  - Verify function stack hashes")
-        print(f"  - Evaluate risk")
+        print("  - Verify ap2Ref")
+        print("  - Check trace context")
+        print("  - Verify function stack hashes")
+        print("  - Evaluate risk")
 
         response = await client.post(f"{PROXY_URL}/verify", json=verify_request)
 
@@ -296,10 +297,16 @@ Flow:
         async with httpx.AsyncClient() as client:
             response = await client.get(f"{PROXY_URL}/health")
             if response.status_code != 200:
-                print("❌ Proxy not running, please start first: PROXY_LOCAL_RISK=1 python3 run_facilitator_proxy.py")
+                print(
+                    "❌ Proxy not running, please start first: "
+                    "PROXY_LOCAL_RISK=1 python3 run_facilitator_proxy.py"
+                )
                 return
-    except:
-        print("❌ Unable to connect to Proxy, please start first: PROXY_LOCAL_RISK=1 python3 run_facilitator_proxy.py")
+    except Exception:
+        print(
+            "❌ Unable to connect to Proxy, please start first: "
+            "PROXY_LOCAL_RISK=1 python3 run_facilitator_proxy.py"
+        )
         return
 
     # Execute test flow

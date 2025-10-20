@@ -14,7 +14,7 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 2. **Install from PyPI:**
    ```bash
    pip install "x402-secure[examples]"
-   
+
    # For agent examples (buyer_agent_openai.py), also install:
    pip install "x402-secure[agent]"
    # Or alternatively: pip install openai
@@ -26,7 +26,7 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
    # Edit .env and add:
    # - BUYER_PRIVATE_KEY (required)
    # - OPENAI_API_KEY (required for agent example)
-   # 
+   #
    # ⚠️ IMPORTANT: Never commit .env to version control - it contains secrets!
    ```
 

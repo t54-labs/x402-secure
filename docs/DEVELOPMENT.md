@@ -20,19 +20,19 @@ graph TB
         A1[BuyerClient] --> A2[Trace Collector]
         A3[SellerClient] --> A4[Payment Validator]
     end
-    
+
     subgraph "Facilitator Proxy"
         B1[FastAPI Server] --> B2[Risk Evaluator]
         B2 --> B3[Payment Forwarder]
         B2 --> B4[Evidence Storage]
     end
-    
+
     subgraph "External Services"
         C1[Trustline Risk Engine]
         C2[x402.org Facilitator]
         C3[Blockchain RPC]
     end
-    
+
     A1 --> B1
     A3 --> B1
     B2 --> C1
@@ -50,16 +50,16 @@ sequenceDiagram
     participant Risk as Trustline
     participant X402 as x402.org
     participant Chain as Blockchain
-    
+
     Agent->>SDK: Initialize payment
     SDK->>SDK: Collect trace
     SDK->>Risk: Submit trace
     Risk-->>SDK: Return trace_id
-    
+
     SDK->>Proxy: Payment request + trace_id
     Proxy->>Risk: Evaluate risk
     Risk-->>Proxy: Risk decision
-    
+
     alt Risk Approved
         Proxy->>X402: Forward payment
         X402->>Chain: Execute transaction
@@ -234,7 +234,7 @@ gunicorn -w 4 -k uvicorn.workers.UvicornWorker \
    ```bash
    # Run tests
    uv run pytest
-   
+
    # Run linting
    uv run ruff check .
    uv run mypy .
@@ -266,7 +266,7 @@ class TestBuyerClient:
             proxy_url="http://test.proxy",
             private_key="0x" + "00" * 32
         )
-    
+
     @pytest.mark.asyncio
     async def test_protected_payment(self, client, mock_trace):
         result = await client.protected_payment(
@@ -275,7 +275,7 @@ class TestBuyerClient:
             reason="Test payment",
             trace=mock_trace
         )
-        
+
         assert result.approved
         assert result.protection_id is not None
 ```
@@ -295,8 +295,8 @@ class OpenAITraceCollector:
         self.model_config: Dict[str, Any] = {}
         self.started_at: Optional[float] = None
         self.completed_at: Optional[float] = None
-    
-    def set_model_config(self, *, provider: str = "openai", model: str, 
+
+    def set_model_config(self, *, provider: str = "openai", model: str,
                          tools_enabled: Optional[List[str]] = None) -> None:
         """Set model configuration for trace context."""
         self.model_config = {
@@ -304,7 +304,7 @@ class OpenAITraceCollector:
             "model": model,
             "tools_enabled": tools_enabled or []
         }
-    
+
     async def process_stream(self, stream, tools: dict) -> dict:
         """Process OpenAI stream and execute tools, collecting events."""
         # Processes stream, collects events automatically
@@ -332,11 +332,11 @@ class RiskClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self.http = httpx.AsyncClient(timeout=15.0)
-    
-    async def create_session(self, *, agent_did: str, app_id: Optional[str], 
+
+    async def create_session(self, *, agent_did: str, app_id: Optional[str],
                              device: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Create a risk session with agent identification.
-        
+
         Returns: Dict containing 'sid' (session ID) and other metadata
         """
         r = await self.http.post(
@@ -345,10 +345,10 @@ class RiskClient:
         )
         r.raise_for_status()
         return r.json()  # {"sid": "...", "expires_at": "..."}
-    
+
     async def create_trace(self, *, sid: str, agent_trace: Dict[str, Any]) -> Dict[str, Any]:
         """Upload agent trace data linked to a session.
-        
+
         Returns: Dict containing 'tid' (trace ID)
         """
         r = await self.http.post(
@@ -371,18 +371,18 @@ async def process_payment_headers(request: Request) -> dict:
     # Extract and validate required headers
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     x_risk_session = request.headers.get("X-RISK-SESSION")
-    
+
     if not x_payment_secure:
         raise HeaderError("X-PAYMENT-SECURE required")
-    
+
     # Parse session ID (required) and optional trace ID
     sid, tid = parse_risk_ids(x_risk_session, None)
-    
+
     # Parse W3C trace context from X-PAYMENT-SECURE
     # Format: 'w3c.v1;tp=<traceparent>;ts=<url-encoded-tracestate>'
     tc = parse_x_payment_secure(x_payment_secure)
     # Returns: {"tp": "00-...-...-00", "ts": "..."}
-    
+
     # Extract tid from tracestate if present and not in header
     extracted_tid = tid
     if not extracted_tid and "ts" in tc:
@@ -394,7 +394,7 @@ async def process_payment_headers(request: Request) -> dict:
             extracted_tid = ts_json.get("tid")
         except Exception:
             pass
-    
+
     return {
         "sid": sid,
         "tid": extracted_tid,
@@ -413,23 +413,23 @@ async def evaluate_risk(context: dict, payment_context: dict) -> dict:
         "trace_context": context["trace_context"],  # Required: {"tp": "...", "ts": "..."}
         "payment": payment_context,  # Payment details
     }
-    
+
     # Include tid if available (links to uploaded agent trace)
     if context.get("tid"):
         evaluate_json["tid"] = context["tid"]
-    
+
     # Call Risk Engine
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
             f"{risk_engine_url}/risk/evaluate",
             json=evaluate_json
         )
-    
+
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail=response.text)
-    
+
     risk_data = response.json()
-    
+
     # Response format:
     # {
     #   "decision": "allow" | "deny" | "challenge",
@@ -437,7 +437,7 @@ async def evaluate_risk(context: dict, payment_context: dict) -> dict:
     #   "ttl_seconds": 300,
     #   "reasons": ["..."]
     # }
-    
+
     return risk_data
 ```
 
@@ -458,13 +458,13 @@ def verify_payment_signature(
     # Decode receipt
     receipt_data = base64.b64decode(receipt)
     receipt_json = json.loads(receipt_data)
-    
+
     # Create message hash
     message = encode_defunct(receipt_data)
-    
+
     # Recover signer
     signer = Account.recover_message(message, signature=signature)
-    
+
     return signer.lower() == expected_signer.lower()
 ```
 
@@ -497,20 +497,20 @@ class ValidationCache:
     def __init__(self, ttl=300):  # 5 minute TTL
         self.cache = TTLCache(maxsize=10000, ttl=ttl)
         self.locks = {}
-    
+
     async def get_or_compute(self, key: str, compute_fn):
         if key in self.cache:
             return self.cache[key]
-        
+
         # Prevent duplicate computation
         if key not in self.locks:
             self.locks[key] = asyncio.Lock()
-        
+
         async with self.locks[key]:
             # Double-check after acquiring lock
             if key in self.cache:
                 return self.cache[key]
-            
+
             # Compute and cache
             result = await compute_fn()
             self.cache[key] = result
@@ -533,10 +533,10 @@ class PooledHTTPClient:
             ),
             timeout=httpx.Timeout(10.0)
         )
-    
+
     async def __aenter__(self):
         return self.client
-    
+
     async def __aexit__(self, *args):
         await self.client.aclose()
 ```
@@ -549,7 +549,7 @@ class PooledHTTPClient:
    ```python
    # Add retry logic
    from tenacity import retry, stop_after_attempt, wait_exponential
-   
+
    @retry(
        stop=stop_after_attempt(3),
        wait=wait_exponential(multiplier=1, min=4, max=10)
@@ -563,15 +563,15 @@ class PooledHTTPClient:
    ```python
    # Debug signature issues
    import logging
-   
+
    logger = logging.getLogger(__name__)
-   
+
    def debug_signature_failure(receipt, signature, expected_signer):
        logger.error(f"Signature validation failed")
        logger.error(f"Receipt: {receipt[:50]}...")
        logger.error(f"Signature: {signature}")
        logger.error(f"Expected signer: {expected_signer}")
-       
+
        # Try to recover actual signer
        try:
            actual_signer = recover_signer(receipt, signature)
@@ -585,16 +585,16 @@ class PooledHTTPClient:
    # Profile slow endpoints
    import time
    from contextvars import ContextVar
-   
+
    request_id = ContextVar('request_id', default=None)
-   
+
    @app.middleware("http")
    async def timing_middleware(request: Request, call_next):
        start = time.time()
        request_id.set(str(uuid.uuid4()))
-       
+
        response = await call_next(request)
-       
+
        duration = time.time() - start
        if duration > 1.0:  # Log slow requests
            logger.warning(
@@ -602,7 +602,7 @@ class PooledHTTPClient:
                f"took {duration:.2f}s "
                f"(request_id: {request_id.get()})"
            )
-       
+
        return response
    ```
 

@@ -14,7 +14,7 @@
 **Trustline** is t54's agent-native risk engine that makes autonomous AI payments safe and reliable. It provides:
 
 - **Logic-level Risk Assessment**: Analyzes complete agent reasoning chains, not just transactions
-- **Real-time Fraud Detection**: Identifies compromised agents, prompt injections, and malicious patterns  
+- **Real-time Fraud Detection**: Identifies compromised agents, prompt injections, and malicious patterns
 - **Dispute Resolution**: Cryptographic evidence of agent behavior for clear liability boundaries
 - **Regulatory Compliance**: Built for the agentic economy with audit trails and compliance tools
 
@@ -103,7 +103,7 @@ x402-secure provides **clear responsibility boundaries** through:
 
 ### What You Get
 - ✅ **Automatic liability protection** - Approved transactions are protected from disputes
-- ✅ **Simple integration** - Just a few lines of code  
+- ✅ **Simple integration** - Just a few lines of code
 - ✅ **Evidence storage** - Complete reasoning chain for every transaction
 - ✅ **Pre-payment risk check** - Risky transactions blocked before money moves
 
@@ -227,24 +227,24 @@ async def your_api(request: Request, param: str):
         "payTo": "0xYourWalletAddress",
         "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC
     }
-    
+
     # Check for payment headers
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
-    
+
     if not all([x_payment, x_payment_secure, risk_session]):
         # Return 402 Payment Required
         return JSONResponse(
-            {"accepts": [payment_requirements], "error": "Payment required"}, 
+            {"accepts": [payment_requirements], "error": "Payment required"},
             status_code=402
         )
-    
+
     # Verify and settle payment
     try:
         import base64, json
         payment_data = json.loads(base64.b64decode(x_payment))
-        
+
         result = await seller.verify_then_settle(
             payment_data,
             payment_requirements,
@@ -253,15 +253,15 @@ async def your_api(request: Request, param: str):
             x_payment_secure=x_payment_secure,
             risk_sid=risk_session
         )
-        
+
         # Payment successful - deliver your service
         service_result = {"data": f"Processed: {param}"}
-        
+
         return JSONResponse(
             service_result,
             headers={"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
         )
-        
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=402)
 ```
@@ -294,67 +294,67 @@ sequenceDiagram
     participant Risk as Trustline
     participant Upstream as Upstream Facilitator
     participant OpenAI as OpenAI API
-    
+
     Note over Buyer,Upstream: Phase 1: Create Risk Session
-    
+
     Buyer->>Gateway: POST /risk/session
     Note right of Buyer: agent_id: 0x-address<br/>device: ua=x402-agent
     Gateway->>Risk: Forward to risk engine
     Risk-->>Gateway: Return session info
     Gateway-->>Buyer: {"sid": "uuid", "expires_at": "timestamp"}
-    
+
     Note over Buyer,Upstream: Phase 2: AI Agent Interaction & SDK Trace Collection
-    
+
     Buyer->>OpenAI: Stream conversation request
     Note right of Buyer: Task: "Buy BTC price data"
-    
+
     loop AI Tool Calls (SDK OpenAITraceCollector)
         OpenAI-->>Buyer: Tool call event
         Buyer->>Buyer: Execute local tools<br/>(list_merchants, prepare_payment)
         Buyer->>Buyer: SDK collects trace events<br/>(reasoning, tool calls, responses)
     end
-    
+
     OpenAI-->>Buyer: Complete response
-    
+
     Buyer->>Gateway: POST /risk/trace
     Note right of Buyer: sid: uuid<br/>agent_trace with:<br/>- task: Buy BTC price<br/>- events array<br/>- model_config
     Gateway->>Risk: Store trace data
     Risk-->>Gateway: Return trace ID
     Gateway-->>Buyer: {"tid": "uuid"}
-    
+
     Note over Buyer,Upstream: Phase 3: Execute Payment Request
-    
+
     Buyer->>Seller: GET /api/market-data?symbol=BTC/USD
     Seller-->>Buyer: 402 Payment Required
     Note left of Seller: Return payment requirements<br/>with accepts array
-    
+
     Buyer->>Buyer: Sign EIP-3009 authorization
     Buyer->>Buyer: SDK builds payment headers
     Note right of Buyer: Required headers:<br/>X-PAYMENT: base64<br/>X-PAYMENT-SECURE: w3c.v1 (SDK)<br/>X-RISK-SESSION: sid (SDK)<br/><br/>Optional:<br/>X-AP2-EVIDENCE (if available)
-    
+
     Buyer->>Seller: GET /api/market-data
     Note right of Buyer: Request with payment headers
-    
+
     Note over Seller,Upstream: Phase 4: Payment Verification & Settlement
-    
+
     Seller->>Gateway: POST /x402/verify
     Note right of Seller: Forward all payment headers
-    
+
     Gateway->>Risk: POST /risk/evaluate
     Note right of Gateway: sid: uuid<br/>tid: uuid<br/>trace_context: object
     Risk-->>Gateway: Risk decision
     Note left of Risk: decision: allow<br/>decision_id: uuid<br/>risk_level: low<br/>ttl_seconds: 300
-    
+
     Gateway->>Gateway: Strip AP2 custom fields
     Gateway->>Upstream: Forward standard x402 verify
     Upstream-->>Gateway: Verification result
     Gateway-->>Seller: {"isValid": true, "payer": "0x-address"}
-    
+
     Seller->>Gateway: POST /x402/settle
     Gateway->>Upstream: Forward settle request
     Upstream-->>Gateway: Settlement result
     Gateway-->>Seller: {"success": true, "transaction": "0x-hash"}
-    
+
     Seller-->>Buyer: 200 OK + Business data
     Note left of Seller: {"symbol": "BTC/USD",<br/>"price": 63500.12}<br/>X-PAYMENT-RESPONSE: base64
 ```

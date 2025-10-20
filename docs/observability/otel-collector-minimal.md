@@ -36,4 +36,3 @@ Config Details
 
 Note (Production)
 - For production, replace the logging exporter with your APM backend (e.g., OTLP to a vendor) and add auth/headers as needed.
-

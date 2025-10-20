@@ -47,7 +47,7 @@ from x402_secure_client import BuyerClient, BuyerConfig, setup_otel_from_env
 async def main():
     # Optional: Initialize OpenTelemetry for observability
     setup_otel_from_env()
-    
+
     # Initialize buyer client
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="https://test.example.com",
@@ -55,14 +55,14 @@ async def main():
         buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
         network="base-sepolia"  # Use testnet for development
     ))
-    
+
     # Create risk session (requires app_id and device info)
     session = await buyer.create_risk_session(
         app_id=None,
         device={"ua": "quickstart-demo"}
     )
     sid = session['sid']
-    
+
     # For testing: create a simple trace without AI
     tid = await buyer.store_agent_trace(
         sid=sid,
@@ -74,7 +74,7 @@ async def main():
         },
         events=[]  # Empty events for testing
     )
-    
+
     # Execute payment
     result = await buyer.execute_with_tid(
         endpoint="/api/test",
@@ -83,7 +83,7 @@ async def main():
         sid=sid,
         tid=tid
     )
-    
+
     print(f"✅ Payment completed: {result}")
 
 # Run it
@@ -104,7 +104,7 @@ from x402_secure_client import (
 async def shopping_agent():
     # Initialize OpenTelemetry for observability
     setup_otel_from_env()
-    
+
     # Initialize buyer client
     buyer = BuyerClient(BuyerConfig(
         seller_base_url="https://shop.example.com",
@@ -112,24 +112,24 @@ async def shopping_agent():
         buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
         network="base-sepolia"
     ))
-    
+
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     tracer = OpenAITraceCollector()
-    
+
     # Configure model info for trace context
     tracer.set_model_config(
         provider="openai",
         model="gpt-4",
         tools_enabled=["purchase_item"]
     )
-    
+
     # Create risk session (requires app_id and device info)
     session = await buyer.create_risk_session(
         app_id=None,
         device={"ua": "shopping-agent"}
     )
     sid = session['sid']
-    
+
     # Define purchase tool
     @tracer.tool
     def purchase_item(item: str, price: str, merchant: str):
@@ -139,13 +139,13 @@ async def shopping_agent():
             "price": price,
             "merchant": merchant
         }
-    
+
     # Agent interaction with OpenAI streaming
     messages = [
         {"role": "system", "content": "You are a shopping assistant."},
         {"role": "user", "content": "Buy me a coffee maker under $50"}
     ]
-    
+
     with openai_client.responses.stream(
         model="gpt-4",
         input=messages,
@@ -163,11 +163,11 @@ async def shopping_agent():
             stream=stream,
             tools={"purchase_item": purchase_item}
         )
-    
+
     # Check if purchase was made
     if "purchase_item" in result.get("tool_results", {}):
         purchase = result["tool_results"]["purchase_item"]
-        
+
         # Store trace and get trace ID
         tid = await buyer.store_agent_trace(
             sid=sid,
@@ -181,7 +181,7 @@ async def shopping_agent():
             model_config=tracer.model_config,
             session_context={"user_intent": "buy coffee maker"}
         )
-        
+
         # Execute protected payment
         payment_result = await buyer.execute_with_tid(
             endpoint="/api/purchase",
@@ -190,7 +190,7 @@ async def shopping_agent():
             sid=sid,
             tid=tid
         )
-        
+
         print(f"✅ Payment completed: {payment_result}")
 
 # Run it
@@ -247,18 +247,18 @@ async def generate_content(request: Request, prompt: str):
         "payTo": "0xYourWallet",
         "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
     }
-    
+
     # Check payment headers
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
-    
+
     if not all([x_payment, x_payment_secure, risk_session]):
         return JSONResponse(
             {"x402Version": 1, "accepts": [pr], "error": "Payment required"},
             status_code=402
         )
-    
+
     # Verify and settle
     payment_data = json.loads(base64.b64decode(x_payment))
     result = await seller.verify_then_settle(
@@ -268,10 +268,10 @@ async def generate_content(request: Request, prompt: str):
         x_payment_secure=x_payment_secure,
         risk_sid=risk_session
     )
-    
+
     # Provide service
     content = f"Generated content for: {prompt}"
-    
+
     return JSONResponse(
         {"result": content},
         headers={"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
@@ -301,19 +301,19 @@ async def analyze_data():
         "payTo": "0xYourWallet",
         "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
     }
-    
+
     # Check payment headers
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
-    
+
     if not all([x_payment, x_payment_secure, risk_session]):
         return jsonify({
             "x402Version": 1,
             "accepts": [pr],
             "error": "Payment required"
         }), 402
-    
+
     # Verify and settle payment
     payment_data = json.loads(base64.b64decode(x_payment))
     result = await seller.verify_then_settle(
@@ -323,11 +323,11 @@ async def analyze_data():
         x_payment_secure=x_payment_secure,
         risk_sid=risk_session
     )
-    
+
     # Process request
     data = request.args.get("data", "test data")
     analysis_result = f"Analysis complete for: {data}"
-    
+
     response = make_response(jsonify({"result": analysis_result}))
     response.headers["X-PAYMENT-RESPONSE"] = base64.b64encode(
         json.dumps(result).encode()

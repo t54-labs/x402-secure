@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import httpx
+
 from .risk import RiskClient
 
 
@@ -50,7 +51,7 @@ class BuyerClient:
             self.address = os.getenv("BUYER_ADDRESS") or ("0x" + os.urandom(20).hex())
 
         self.risk = RiskClient(cfg.agent_gateway_url)
-        
+
     async def _first_request_402(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         r = await self.http.get(url, params=params)
         if r.status_code != 402:
@@ -93,7 +94,7 @@ class BuyerClient:
             auth["nonce"] = auth["nonce"].hex()
         acct = Account.from_key(self.cfg.buyer_private_key)
         encoded = exact.sign_payment_header(acct, pr_model, header)
-        payload = exact.decode_payment(encoded)
+        _ = exact.decode_payment(encoded)  # Validate but not used
 
         origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
         headers: Dict[str, str] = {
@@ -166,6 +167,7 @@ class BuyerClient:
     ) -> Any:
         """Execute paid request with trace ID."""
         from .headers import build_payment_secure_header
+
         xps = build_payment_secure_header(agent_trace_context={"tid": tid})
         return await self.execute_paid_request(
             endpoint,
@@ -174,4 +176,3 @@ class BuyerClient:
             risk_sid=sid,
             extra_headers=xps,
         )
-

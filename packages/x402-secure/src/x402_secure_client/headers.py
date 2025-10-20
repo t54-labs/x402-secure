@@ -10,7 +10,9 @@ from urllib.parse import quote
 from opentelemetry.propagate import inject
 
 
-def build_payment_secure_header(agent_trace_context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+def build_payment_secure_header(
+    agent_trace_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
     carrier: Dict[str, str] = {}
     inject(carrier)
     tp = carrier.get("traceparent")
@@ -19,7 +21,9 @@ def build_payment_secure_header(agent_trace_context: Optional[Dict[str, Any]] = 
 
     ts = carrier.get("tracestate")
     if agent_trace_context is not None:
-        agent_trace_json = json.dumps(agent_trace_context, separators=(",", ":"), ensure_ascii=False)
+        agent_trace_json = json.dumps(
+            agent_trace_context, separators=(",", ":"), ensure_ascii=False
+        )
         agent_trace_b64 = base64.b64encode(agent_trace_json.encode()).decode()
         ts = quote(agent_trace_b64, safe="")
 
@@ -34,4 +38,3 @@ def start_client_span(name: str):
 
     tracer = trace.get_tracer("x402_agent.buyer")
     return tracer.start_as_current_span(name)
-

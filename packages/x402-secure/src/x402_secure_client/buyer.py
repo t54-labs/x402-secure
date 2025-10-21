@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -11,10 +10,6 @@ from urllib.parse import urlparse
 import httpx
 
 from .risk import RiskClient
-
-
-def _now() -> int:
-    return int(time.time())
 
 
 def _normalize_pr_keys(pr: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,7 +60,7 @@ class BuyerClient:
             raise RuntimeError("seller preflight missing 'accepts'")
         return accepts[0]
 
-    async def execute_paid_request(
+    async def execute_paid_request_with_headers(
         self,
         endpoint: str,
         *,
@@ -156,7 +151,7 @@ class BuyerClient:
         res = await self.risk.create_trace(sid=sid, agent_trace=agent_trace)
         return res["tid"]
 
-    async def execute_with_tid(
+    async def execute_paid_request(
         self,
         *,
         endpoint: str,
@@ -165,14 +160,15 @@ class BuyerClient:
         sid: str,
         tid: str,
     ) -> Any:
-        """Execute paid request with trace ID."""
-        from .headers import build_payment_secure_header
+        """Execute paid request using risk sid + trace tid."""
+        from .headers import build_payment_secure_header, start_client_span
 
-        xps = build_payment_secure_header(agent_trace_context={"tid": tid})
-        return await self.execute_paid_request(
-            endpoint,
-            task=task,
-            params=params,
-            risk_sid=sid,
-            extra_headers=xps,
-        )
+        with start_client_span("buyer.payment"):
+            xps = build_payment_secure_header(agent_trace_context={"tid": tid})
+            return await self.execute_paid_request_with_headers(
+                endpoint,
+                task=task,
+                params=params,
+                risk_sid=sid,
+                extra_headers=xps,
+            )

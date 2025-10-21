@@ -7,7 +7,6 @@ import os
 
 from dotenv import load_dotenv
 from x402_secure_client import BuyerClient, BuyerConfig, setup_otel_from_env
-from x402_secure_client.headers import start_client_span
 
 load_dotenv()
 
@@ -44,15 +43,13 @@ async def main():
         },
     )
 
-    # Execute payment within an OpenTelemetry span context
-    with start_client_span("buyer.execute_payment"):
-        res = await buyer.execute_with_tid(
-            endpoint="/api/market-data",
-            task="Get BTC price",
-            params={"symbol": "BTC/USD"},
-            sid=sid,
-            tid=tid,
-        )
+    res = await buyer.execute_paid_request(
+        endpoint="/api/market-data",
+        task="Get BTC price",
+        params={"symbol": "BTC/USD"},
+        sid=sid,
+        tid=tid,
+    )
     print(res)
 
 

@@ -36,7 +36,6 @@ from x402_secure_client import (
     OpenAITraceCollector,
     setup_otel_from_env,
 )
-from x402_secure_client.headers import start_client_span
 
 
 def _usdc_for_network(network: str) -> str:
@@ -259,15 +258,13 @@ async def main() -> None:
         model_config=tracer.model_config,
         session_context=session_context,
     )
-
-    with start_client_span("buyer.execute_payment"):
-        result = await buyer.execute_with_tid(
-            endpoint=plan["endpoint"],
-            task="Buy BTC price",
-            params=plan.get("params") or {"symbol": "BTC/USD"},
-            sid=sid,
-            tid=tid,
-        )
+    result = await buyer.execute_paid_request(
+        endpoint=plan["endpoint"],
+        task="Buy BTC price",
+        params=plan.get("params") or {"symbol": "BTC/USD"},
+        sid=sid,
+        tid=tid,
+    )
 
     print(json.dumps(result, indent=2))
 

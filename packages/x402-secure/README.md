@@ -41,7 +41,7 @@ async def main():
     )
 
     # Execute payment with trace ID
-    res = await buyer.execute_with_tid(
+    res = await buyer.execute_paid_request(
         endpoint="/api/market-data",
         task="Buy BTC price",
         params={"symbol": "BTC/USD"},

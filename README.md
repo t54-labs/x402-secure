@@ -150,7 +150,7 @@ tid = await buyer.store_agent_trace(
 )
 
 # 6. Execute payment with protection
-payment_result = await buyer.execute_with_tid(
+payment_result = await buyer.execute_paid_request(
     endpoint="/api/purchase",
     task="Purchase item",
     params={"item": "coffee maker"},

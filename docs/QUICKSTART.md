@@ -76,7 +76,7 @@ async def main():
     )
 
     # Execute payment
-    result = await buyer.execute_with_tid(
+    result = await buyer.execute_paid_request(
         endpoint="/api/test",
         task="Test payment",
         params={"amount": "1.00"},
@@ -183,7 +183,7 @@ async def shopping_agent():
         )
 
         # Execute protected payment
-        payment_result = await buyer.execute_with_tid(
+        payment_result = await buyer.execute_paid_request(
             endpoint="/api/purchase",
             task="Purchase coffee maker",
             params=purchase,

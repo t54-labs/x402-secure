@@ -7,7 +7,7 @@ import os
 from typing import Any, Dict, Optional
 
 from .buyer import BuyerClient
-from .headers import build_payment_secure_header, start_client_span
+from .headers import start_client_span
 from .risk import RiskClient
 
 
@@ -56,13 +56,12 @@ async def execute_payment_with_tid(
     tid: str,
 ) -> Any:
     with start_client_span("buyer.payment"):
-        xps = build_payment_secure_header(agent_trace_context={"tid": tid})
         return await buyer.execute_paid_request(
-            endpoint,
+            endpoint=endpoint,
             task=task,
             params=params,
-            risk_sid=sid,
-            extra_headers=xps,
+            sid=sid,
+            tid=tid,
         )
 
 

@@ -15,7 +15,9 @@ When you run the demo (using `PROXY_LOCAL_RISK=1`), the proxy prints **two forma
 
 ```json
 {
-  "agent_id": "0xedE5Ff927607e8E83490fd07436c09A30c81FD09",
+  "agent_did": "0xedE5Ff927607e8E83490fd07436c09A30c81FD09",
+  "wallet_address": "0xedE5Ff927607e8E83490fd07436c09A30c81FD09",
+  "agent_endpoint": "https://agent.example.com",
   "app_id": null,
   "device": {
     "ua": "oss-agent"
@@ -24,6 +26,15 @@ When you run the demo (using `PROXY_LOCAL_RISK=1`), the proxy prints **two forma
 ```
 
 This is the **raw data format** sent from the buyer to the proxy.
+
+**Required fields:**
+- `agent_did`: Agent DID (current phase: often same as wallet; future: did:eip8004:...)
+- `wallet_address`: EVM wallet address (0x...)
+
+**Optional fields:**
+- `agent_endpoint`: Agent callback/base URL
+- `app_id`: Application identifier
+- `device`: Device information
 
 ---
 

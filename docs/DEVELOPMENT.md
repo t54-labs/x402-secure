@@ -333,15 +333,30 @@ class RiskClient:
         self.base_url = base_url.rstrip("/")
         self.http = httpx.AsyncClient(timeout=15.0)
 
-    async def create_session(self, *, agent_did: str, app_id: Optional[str],
-                             device: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    async def create_session(self, *, agent_did: str, wallet_address: str,
+                             agent_endpoint: Optional[str] = None,
+                             app_id: Optional[str] = None,
+                             device: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Create a risk session with agent identification.
+
+        Args:
+            agent_did: Agent DID (current phase: often same as wallet; future: did:eip8004:...)
+            wallet_address: EVM wallet address (0x...)
+            agent_endpoint: Optional agent callback/base URL
+            app_id: Optional application identifier
+            device: Device information dict
 
         Returns: Dict containing 'sid' (session ID) and other metadata
         """
         r = await self.http.post(
             f"{self.base_url}/risk/session",
-            json={"agent_did": agent_did, "app_id": app_id, "device": device}
+            json={
+                "agent_did": agent_did,
+                "wallet_address": wallet_address,
+                "agent_endpoint": agent_endpoint,
+                "app_id": app_id,
+                "device": device
+            }
         )
         r.raise_for_status()
         return r.json()  # {"sid": "...", "expires_at": "..."}

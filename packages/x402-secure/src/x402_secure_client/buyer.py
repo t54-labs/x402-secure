@@ -110,12 +110,31 @@ class BuyerClient:
         self,
         *,
         agent_did: Optional[str] = None,
+        wallet_address: Optional[str] = None,
+        agent_endpoint: Optional[str] = None,
         app_id: Optional[str] = None,
         device: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Create a risk session. Uses buyer's address as agent_did if not provided."""
+        """Create a risk session.
+
+        Both agent_did and wallet_address are required by the server.
+        If not provided, buyer's address will be used as default for both fields.
+
+        Args:
+            agent_did: Agent DID (defaults to buyer's address)
+            wallet_address: EVM wallet address (defaults to buyer's address)
+            agent_endpoint: Optional agent callback/base URL
+            app_id: Optional application identifier
+            device: Device information dict
+
+        Returns:
+            Dict containing 'sid' (session ID) and other session metadata
+        """
+        addr = wallet_address or self.address
         return await self.risk.create_session(
-            agent_did=agent_did or self.address,
+            agent_did=agent_did or addr,
+            wallet_address=addr,
+            agent_endpoint=agent_endpoint,
             app_id=app_id,
             device=device,
         )

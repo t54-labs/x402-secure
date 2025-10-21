@@ -98,7 +98,7 @@ Risks API
 POST /risk/session
 - Caller: Buyer agent (client SDK). Public entrypoint on our server; forwards to remote Risk service when configured.
 - Auth: Public (server-side rate limits apply).
-- Request: `{ "agent_id": "0x...wallet", "app_id": "optional", "device": { ... } }`
+- Request: `{ "agent_did": "0x...wallet", "wallet_address": "0x...wallet", "agent_endpoint": "optional", "app_id": "optional", "device": { ... } }`
 - Response: `{ "sid": "uuid", "expires_at": "RFC3339" }`
 - Errors: 400 invalid, 429 rate limit
 

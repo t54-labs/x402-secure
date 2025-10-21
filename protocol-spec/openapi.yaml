@@ -37,6 +37,11 @@ paths:
       description: |
         Create a new risk session for an AI agent. This session will be used to track
         agent behavior and make risk decisions through Trustline's logic-level assessment.
+
+        Both agent_did and wallet_address are required:
+        - agent_did: Agent DID (current phase often same as wallet; future: did:eip8004:...)
+        - wallet_address: EVM wallet address (0x...) - current phase; future: multi-chain
+        - agent_endpoint: Optional agent callback/base URL
       tags:
         - Risk Management
       requestBody:
@@ -45,11 +50,25 @@ paths:
           application/json:
             schema:
               type: object
-              required: [agent_id]
+              required: [agent_did, wallet_address]
               properties:
-                agent_id: { type: string, description: Buyer agent wallet/address }
-                app_id: { type: string, nullable: true }
-                device: { type: object, additionalProperties: true, nullable: true }
+                agent_did:
+                  type: string
+                  description: Agent DID (currently often same as wallet address; future DID formats)
+                wallet_address:
+                  type: string
+                  description: EVM wallet address (0x...; future multi-chain support)
+                agent_endpoint:
+                  type: string
+                  nullable: true
+                  description: Optional agent callback/base URL
+                app_id:
+                  type: string
+                  nullable: true
+                device:
+                  type: object
+                  additionalProperties: true
+                  nullable: true
       responses:
         '200':
           description: Session created

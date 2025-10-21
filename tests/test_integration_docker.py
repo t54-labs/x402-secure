@@ -82,6 +82,7 @@ class TestDockerIntegration:
             f"{GATEWAY_URL}/risk/session",
             json={
                 "agent_did": "0x" + "a" * 40,
+                "wallet_address": "0x" + "a" * 40,
                 "app_id": "docker-test",
                 "device": {"user_agent": "integration-test/1.0"},
             },
@@ -128,7 +129,8 @@ class TestDockerIntegration:
         """Test complete payment verification flow."""
         # Create session
         session_response = await http_client.post(
-            f"{GATEWAY_URL}/risk/session", json={"agent_did": "0x" + "b" * 40}
+            f"{GATEWAY_URL}/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
         )
         sid = session_response.json()["sid"]
 
@@ -205,7 +207,8 @@ class TestDockerIntegration:
         """Test complete payment settlement flow."""
         # Create session
         session_response = await http_client.post(
-            f"{GATEWAY_URL}/risk/session", json={"agent_did": "0x" + "b" * 40}
+            f"{GATEWAY_URL}/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
         )
         sid = session_response.json()["sid"]
 
@@ -268,7 +271,8 @@ class TestDockerIntegration:
         """Test risk evaluation endpoint."""
         # Create session and trace
         session_response = await http_client.post(
-            f"{GATEWAY_URL}/risk/session", json={"agent_did": "0x" + "b" * 40}
+            f"{GATEWAY_URL}/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
         )
         sid = session_response.json()["sid"]
 

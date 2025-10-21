@@ -29,7 +29,9 @@ tail -f logs/proxy.log
 📥 [RISK] POST /risk/session - RAW Input Payload (JSON):
 ================================================================================
 {
-  "agent_id": "0xYourAgentAddress...",
+  "agent_did": "0xYourAgentAddress...",
+  "wallet_address": "0xYourAgentAddress...",
+  "agent_endpoint": "https://agent.example.com",
   "app_id": null,
   "device": {
     "ua": "oss-agent"
@@ -367,7 +369,9 @@ After running agent demo, you should see:
 ```bash
 # Terminal 1 (Proxy) output:
 📥 [RISK] POST /risk/session - Input Payload:
-  agent_id: 0x123...
+  agent_did: 0x123...
+  wallet_address: 0x123...
+  agent_endpoint: https://agent.example.com
 ✅ [RISK] Session created: sid=abc-123
 
 📥 [RISK] POST /risk/trace - Input Payload:

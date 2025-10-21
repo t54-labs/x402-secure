@@ -15,25 +15,39 @@ class RiskClient:
         self.http = httpx.AsyncClient(timeout=15.0)
 
     async def create_session(
-        self, *, agent_did: str, app_id: Optional[str], device: Optional[Dict[str, Any]]
+        self,
+        *,
+        agent_did: str,
+        wallet_address: str,
+        app_id: Optional[str] = None,
+        device: Optional[Dict[str, Any]] = None,
+        agent_endpoint: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Create a risk session with agent identification.
+        """Create a risk session with agent identification.
 
         Args:
             agent_did: Agent decentralized identifier. Currently accepts wallet address (0x...).
                       TODO: Support EIP-8004 DID format
                       (did:eip8004:{chain_id}:{contract}:{token_id})
                       when integrating with on-chain agent identity (ERC-721 based).
+            wallet_address: EVM wallet address (0x...) - required in current phase
+            agent_endpoint: Optional agent callback/base URL
             app_id: Optional application identifier
             device: Device information dict
 
         Returns:
             Dict containing 'sid' (session ID) and other session metadata
         """
+        payload = {
+            "agent_did": agent_did,
+            "wallet_address": wallet_address,
+            "agent_endpoint": agent_endpoint,
+            "app_id": app_id,
+            "device": device,
+        }
         r = await self.http.post(
             f"{self.base_url}/risk/session",
-            json={"agent_did": agent_did, "app_id": app_id, "device": device},
+            json=payload,
         )
         r.raise_for_status()
         if (r.headers.get("content-type") or "").split(";", 1)[

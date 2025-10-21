@@ -14,19 +14,38 @@ import httpx
 from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(prefix="/risk", tags=["risk-public"])
 logger = logging.getLogger(__name__)
 
 
 class RiskSessionRequest(BaseModel):
-    # TODO: Add EIP-8004 DID format support
-    # Currently accepts wallet address (0x...), future: did:eip8004:chain:contract:tokenId
-    # EIP-8004 enables decentralized AI agent identity via ERC-721 tokens
-    agent_did: str
+    # Both agent_did and wallet_address are required
+    # - agent_did: Agent DID (currently often same as wallet address; future: did:eip8004:...)
+    # - wallet_address: EVM wallet address (0x...) - current phase; future: multi-chain support
+    # - agent_endpoint: Optional agent callback/base URL
+    agent_did: str = Field(
+        ..., description="Agent DID (currently often same as wallet address; future: did:eip...)"
+    )
+    wallet_address: str = Field(..., description="EVM wallet address (0x...)")
+    agent_endpoint: Optional[str] = Field(None, description="Agent base/endpoint URL")
     app_id: Optional[str] = None
     device: Optional[Dict[str, Any]] = None
+
+    @field_validator("agent_did")
+    @classmethod
+    def validate_agent_did(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("agent_did must be a non-empty string")
+        return v
+
+    @field_validator("wallet_address")
+    @classmethod
+    def validate_wallet_address(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.startswith("0x") or len(v) != 42:
+            raise ValueError("wallet_address must be an EVM address (0x...)")
+        return v
 
 
 class RiskSessionResponse(BaseModel):
@@ -124,17 +143,24 @@ def _external_compat_enabled() -> bool:
 def _adapt_payload_for_external_api(payload: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
     """Adapt payload for external Risk Engine compatibility.
 
-    - Session: agent_did -> agent_id, ensure device exists
+    - Session: Map to agent_id (priority: agent_did > wallet_address), ensure device exists
     - Trace: fingerprint/telemetry dict -> JSON string (Trustline requires string|null)
     """
     p: Dict[str, Any] = dict(payload)
 
     # Session create
     if endpoint.endswith("/risk/session"):
-        if "agent_did" in p:
-            p["agent_id"] = p.pop("agent_did")
+        # Priority: agent_did first, then wallet_address
+        if p.get("agent_did"):
+            p["agent_id"] = p["agent_did"]
+        elif p.get("wallet_address"):
+            p["agent_id"] = p["wallet_address"]
+
         if "agent_id" in p and "device" not in p:
             p["device"] = {"ua": "x402-proxy"}
+
+        # Keep only fields recognized by external risk engine (compatibility mode)
+        p = {k: p[k] for k in ("agent_id", "app_id", "device") if k in p}
 
     # Trace create
     if endpoint.endswith("/risk/trace"):
@@ -157,6 +183,8 @@ class _LocalStore:
         exp = datetime.utcnow() + timedelta(seconds=self.sessions.ttl or 900)  # type: ignore[attr-defined]
         self.sessions[sid] = {
             "agent_did": req.agent_did,
+            "wallet_address": req.wallet_address,
+            "agent_endpoint": req.agent_endpoint,
             "app_id": req.app_id,
             "device": req.device,
             "expires_at": exp,

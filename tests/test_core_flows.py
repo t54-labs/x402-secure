@@ -38,6 +38,7 @@ class TestCompletePaymentFlow:
             "/risk/session",
             json={
                 "agent_did": "0x" + "b" * 40,
+                "wallet_address": "0x" + "b" * 40,
                 "app_id": "test-app",
                 "device": {"user_agent": "x402-agent/1.0"},
             },
@@ -54,7 +55,10 @@ class TestCompletePaymentFlow:
     ):
         """Test submitting agent trace."""
         # First create a session
-        session_response = client.post("/risk/session", json={"agent_did": "0x" + "b" * 40})
+        session_response = client.post(
+            "/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
+        )
         sid = session_response.json()["sid"]
 
         # Submit trace
@@ -81,7 +85,10 @@ class TestCompletePaymentFlow:
         mock_httpx.return_value.__aenter__.return_value.post.return_value = mock_response
 
         # Create session first
-        session_response = client.post("/risk/session", json={"agent_did": "0x" + "b" * 40})
+        session_response = client.post(
+            "/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
+        )
         sid = session_response.json()["sid"]
 
         # Verify payment
@@ -120,7 +127,10 @@ class TestCompletePaymentFlow:
         mock_httpx.return_value.__aenter__.return_value.post.return_value = mock_response
 
         # Create session
-        session_response = client.post("/risk/session", json={"agent_did": "0x" + "b" * 40})
+        session_response = client.post(
+            "/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
+        )
         sid = session_response.json()["sid"]
 
         # Settle payment
@@ -166,7 +176,10 @@ class TestRiskEvaluation:
     async def test_risk_evaluation_allow(self, client: TestClient):
         """Test risk evaluation with allow decision."""
         # Create session
-        session_response = client.post("/risk/session", json={"agent_did": "0x" + "b" * 40})
+        session_response = client.post(
+            "/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
+        )
         sid = session_response.json()["sid"]
 
         # Submit trace

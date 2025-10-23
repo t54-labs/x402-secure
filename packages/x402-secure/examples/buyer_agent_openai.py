@@ -27,6 +27,7 @@ import os
 import uuid
 from typing import Any, Dict
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI, pydantic_function_tool
 from pydantic import BaseModel
@@ -258,15 +259,30 @@ async def main() -> None:
         model_config=tracer.model_config,
         session_context=session_context,
     )
-    result = await buyer.execute_paid_request(
-        endpoint=plan["endpoint"],
-        task="Buy BTC price",
-        params=plan.get("params") or {"symbol": "BTC/USD"},
-        sid=sid,
-        tid=tid,
-    )
 
-    print(json.dumps(result, indent=2))
+    try:
+        result = await buyer.execute_paid_request(
+            endpoint=plan["endpoint"],
+            task="Buy BTC price",
+            params=plan.get("params") or {"symbol": "BTC/USD"},
+            sid=sid,
+            tid=tid,
+        )
+        print("✅ Payment successful!")
+        print(json.dumps(result, indent=2))
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            error_detail = e.response.json().get("detail", "Unknown risk denial")
+            print(f"\n❌ Payment denied by risk engine: {error_detail}")
+            decision_id = e.response.headers.get("X-Risk-Decision-ID")
+            risk_decision = e.response.headers.get("X-Risk-Decision")
+            if decision_id:
+                print(f"   Decision ID: {decision_id}")
+            if risk_decision:
+                print(f"   Risk Decision: {risk_decision}")
+        else:
+            print(f"\n❌ HTTP error {e.response.status_code}: {e}")
+        raise
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 import asyncio
 import os
 
+import httpx
 from dotenv import load_dotenv
 from x402_secure_client import BuyerClient, BuyerConfig, setup_otel_from_env
 
@@ -43,14 +44,33 @@ async def main():
         },
     )
 
-    res = await buyer.execute_paid_request(
-        endpoint="/api/market-data",
-        task="Get BTC price",
-        params={"symbol": "BTC/USD"},
-        sid=sid,
-        tid=tid,
-    )
-    print(res)
+    try:
+        res = await buyer.execute_paid_request(
+            endpoint="/api/market-data",
+            task="Get BTC price",
+            params={"symbol": "BTC/USD"},
+            sid=sid,
+            tid=tid,
+        )
+        print("✅ Payment successful!")
+        print(res)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            error_detail = e.response.json().get("detail", "Unknown risk denial")
+            print(f"\n❌ Payment denied by risk engine: {error_detail}")
+            # Access additional information from response headers
+            decision_id = e.response.headers.get("X-Risk-Decision-ID")
+            risk_decision = e.response.headers.get("X-Risk-Decision")
+            ttl_seconds = e.response.headers.get("X-Risk-TTL-Seconds")
+            if decision_id:
+                print(f"   Decision ID: {decision_id}")
+            if risk_decision:
+                print(f"   Risk Decision: {risk_decision}")
+            if ttl_seconds:
+                print(f"   TTL: {ttl_seconds}s")
+        else:
+            print(f"\n❌ HTTP error {e.response.status_code}: {e}")
+        raise
 
 
 if __name__ == "__main__":

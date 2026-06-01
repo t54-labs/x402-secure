@@ -68,6 +68,8 @@ class BuyerClient:
         params: Optional[Dict[str, Any]] = None,
         risk_sid: str,
         extra_headers: Optional[Dict[str, str]] = None,
+        verifiable_intent_header: Optional[str] = None,
+        ap2_evidence_header: Optional[str] = None,
     ) -> Any:
         params = params or {}
         url = f"{self.cfg.seller_base_url.rstrip('/')}{endpoint}"
@@ -99,6 +101,10 @@ class BuyerClient:
         }
         if extra_headers:
             headers.update(extra_headers)
+        if verifiable_intent_header:
+            headers["X-VERIFIABLE-INTENT"] = verifiable_intent_header
+        if ap2_evidence_header:
+            headers["X-AP2-EVIDENCE"] = ap2_evidence_header
         if "X-PAYMENT-SECURE" not in headers:
             raise RuntimeError("X-PAYMENT-SECURE missing in extra_headers")
 
@@ -178,6 +184,8 @@ class BuyerClient:
         params: Dict[str, Any],
         sid: str,
         tid: str,
+        verifiable_intent_header: Optional[str] = None,
+        ap2_evidence_header: Optional[str] = None,
     ) -> Any:
         """Execute paid request using risk sid + trace tid."""
         from .headers import build_payment_secure_header, start_client_span
@@ -190,4 +198,6 @@ class BuyerClient:
                 params=params,
                 risk_sid=sid,
                 extra_headers=xps,
+                verifiable_intent_header=verifiable_intent_header,
+                ap2_evidence_header=ap2_evidence_header,
             )

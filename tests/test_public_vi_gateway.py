@@ -80,6 +80,7 @@ def _body_json(body: ProxyVerifyRequest) -> Dict[str, Any]:
 def _proxy_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("PROXY_LOCAL_RISK", "1")
     monkeypatch.setenv("PROXY_UPSTREAM_VERIFY_URL", "http://testserver/upstream/verify")
+    monkeypatch.setenv("PROXY_UPSTREAM_SETTLE_URL", "http://testserver/upstream/settle")
 
     from x402_proxy import risk_router, router
 
@@ -90,6 +91,15 @@ def _proxy_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     @app.post("/upstream/verify")
     async def upstream_verify(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"isValid": True, "payer": "0x" + ("b" * 40)}
+
+    @app.post("/upstream/settle")
+    async def upstream_settle(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "payer": "0x" + ("b" * 40),
+            "transaction": "0x" + ("e" * 64),
+            "network": "base-sepolia",
+        }
 
     return TestClient(app)
 
@@ -375,3 +385,132 @@ def test_proxy_verify_blocks_trustline_review_with_block_policy(monkeypatch) -> 
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "VI_DENIED"
+
+
+def test_proxy_settle_records_vi_receipt_when_decision_header_present(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    captured: Dict[str, Any] = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        return {
+            "receipt_id": "vi_rcpt_1",
+            "decision_id": payload["decisionId"],
+            "status": "success",
+        }
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/settle",
+        json=_body_json(_body()),
+        headers={
+            "X-VI-DECISION-ID": "vi_dec_1",
+            "X-VI-EVIDENCE-REF": "tl_evd_1",
+            "X-SETTLEMENT-ATTEMPT-ID": "settle_attempt_1",
+            "X-IDEMPOTENCY-KEY": "idem_1",
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-vi-receipt-status"] == "recorded"
+    assert response.headers["x-vi-receipt-id"] == "vi_rcpt_1"
+    assert captured["path"] == "verifiable-intent-receipt"
+    assert captured["payload"]["decisionId"] == "vi_dec_1"
+    assert captured["payload"]["evidenceRef"] == "tl_evd_1"
+    assert captured["payload"]["settlementAttemptId"] == "settle_attempt_1"
+    assert captured["payload"]["idempotencyKey"] == "idem_1"
+    assert captured["payload"]["payment"]["settlementStatus"] == "success"
+    assert captured["payload"]["payment"]["transaction"] == "0x" + ("e" * 64)
+
+
+def test_proxy_settle_without_vi_does_not_call_trustline(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise AssertionError("Trustline should not be called for non-VI settle")
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/settle",
+        json=_body_json(_body()),
+        headers={"Origin": "https://merchant.example"},
+    )
+
+    assert response.status_code == 200
+    assert "x-vi-receipt-status" not in response.headers
+
+
+def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(status_code=502, detail="Trustline unavailable")
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/settle",
+        json=_body_json(_body()),
+        headers={
+            "X-VI-DECISION-ID": "vi_dec_1",
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-vi-receipt-status"] == "failed"
+    assert response.json()["success"] is True
+
+
+def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
+    monkeypatch,
+) -> None:
+    client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+    calls = []
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append((path, payload))
+        if path == "assess-verifiable-intent":
+            return {
+                "decision": "allow",
+                "decision_id": "vi_dec_settle",
+                "vi": {"verified": True, "evidence_ref": "tl_evd_settle"},
+                "binding": payload["binding"],
+            }
+        return {
+            "receipt_id": "vi_rcpt_settle",
+            "decision_id": payload["decisionId"],
+            "status": "success",
+        }
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/settle",
+        json=_body_json(
+            _body(
+                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+                verifiableIntent={"presentationRef": "tl://evidence/body"},
+            )
+        ),
+        headers={
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-vi-decision"] == "allow"
+    assert response.headers["x-vi-decision-id"] == "vi_dec_settle"
+    assert response.headers["x-vi-receipt-status"] == "recorded"
+    assert [path for path, _payload in calls] == [
+        "assess-verifiable-intent",
+        "verifiable-intent-receipt",
+    ]
+    assert calls[1][1]["decisionId"] == "vi_dec_settle"

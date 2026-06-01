@@ -957,6 +957,47 @@ async def assess_public_verifiable_intent(
     }
 
 
+async def post_public_vi_receipt(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await post_trustline_validation("verifiable-intent-receipt", payload)
+
+
+def build_public_vi_receipt_payload(
+    body: ProxySettleRequest,
+    request: Request,
+    *,
+    decision_id: str,
+    evidence_ref: Optional[str],
+    settlement_attempt_id: Optional[str],
+    idempotency_key: Optional[str],
+    settle_response: Dict[str, Any],
+    origin: Optional[str],
+) -> Dict[str, Any]:
+    payment_context = build_public_payment_context(body, request, origin)
+    settlement_id = settlement_attempt_id or f"xs_settle_{uuid.uuid4().hex}"
+    transaction = (
+        settle_response.get("transaction")
+        or settle_response.get("txHash")
+        or settle_response.get("transactionHash")
+    )
+    return {
+        "decisionId": decision_id,
+        "evidenceRef": evidence_ref,
+        "settlementAttemptId": settlement_id,
+        "idempotencyKey": idempotency_key or settlement_id,
+        "payment": {
+            **payment_context,
+            "settlementStatus": "success" if settle_response.get("success") else "failed",
+            "transaction": transaction,
+            "network": settle_response.get("network") or payment_context.get("network"),
+            "errorReason": settle_response.get("errorReason") or settle_response.get("error"),
+        },
+        "metadata": {
+            "source": "x402_secure_public_gateway",
+            "origin": origin,
+        },
+    }
+
+
 def _proxy_local_risk_enabled() -> bool:
     """Check if proxy should use local risk storage instead of forwarding."""
     return os.getenv("PROXY_LOCAL_RISK", "0").lower() in {"1", "true", "yes"}
@@ -1243,13 +1284,21 @@ async def proxy_settle(
     body: ProxySettleRequest,
     request: Request,
     x_ap2_evidence: Optional[str] = Header(None, alias="X-AP2-EVIDENCE"),
+    x_verifiable_intent: Optional[str] = Header(None, alias="X-VERIFIABLE-INTENT"),
     x_payment_secure: Optional[str] = Header(None, alias="X-PAYMENT-SECURE"),
     x_risk_session: Optional[str] = Header(None, alias="X-RISK-SESSION"),
+    x_risk_trace: Optional[str] = Header(None, alias="X-RISK-TRACE"),
+    x_vi_decision_id: Optional[str] = Header(None, alias="X-VI-DECISION-ID"),
+    x_vi_evidence_ref: Optional[str] = Header(None, alias="X-VI-EVIDENCE-REF"),
+    x_settlement_attempt_id: Optional[str] = Header(None, alias="X-SETTLEMENT-ATTEMPT-ID"),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-IDEMPOTENCY-KEY"),
     origin: Optional[str] = Header(None, alias="Origin"),
     cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg),
     response: Response = None,
 ):
     req_id = uuid.uuid4().hex
+    settle_vi_decision_id = x_vi_decision_id
+    settle_vi_evidence_ref = x_vi_evidence_ref
     if response is not None:
         response.headers["X-Request-ID"] = req_id
     try:
@@ -1372,6 +1421,58 @@ async def proxy_settle(
             )
             if response is not None:
                 response.headers["X-Risk-Decision"] = "skipped"
+
+        vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
+        if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
+            if not settle_vi_decision_id:
+                sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
+                if not x_payment_secure:
+                    raise HeaderError("X-PAYMENT-SECURE required")
+                tc = parse_x_payment_secure(x_payment_secure)
+                mandate = parse_x_ap2_evidence(x_ap2_evidence) if x_ap2_evidence else None
+                trace_context = {
+                    "traceparent": tc["tp"],
+                    **({"tracestate": tc["ts"]} if "ts" in tc else {}),
+                    **({"riskTrace": tid} if tid else {}),
+                    "riskSession": sid,
+                }
+                vi_payload = build_public_vi_assessment_payload(
+                    body,
+                    request,
+                    vi_header=x_verifiable_intent,
+                    trace_context=trace_context,
+                    ap2_context=_ap2_context_from_mandate_header(mandate),
+                    risk_session=sid,
+                    risk_trace=tid,
+                    origin=origin,
+                )
+                vi_assessment = await assess_public_verifiable_intent(vi_payload)
+                vi_decision = vi_assessment["decision"]
+                settle_vi_decision_id = vi_assessment["decision_id"]
+                vi_details = vi_assessment.get("vi") or {}
+                settle_vi_evidence_ref = (
+                    settle_vi_evidence_ref
+                    or vi_details.get("evidence_ref")
+                    or vi_details.get("evidenceRef")
+                )
+                if response is not None:
+                    response.headers["X-VI-Decision"] = vi_decision
+                    response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
+                    if "verified" in vi_details:
+                        response.headers["X-VI-Verified"] = str(
+                            bool(vi_details["verified"])
+                        ).lower()
+                    if settle_vi_evidence_ref:
+                        response.headers["X-VI-Evidence-Ref"] = str(settle_vi_evidence_ref)
+                if vi_decision == "deny":
+                    msg = "VI denied" + (
+                        f": {', '.join(vi_assessment['reasons'])}"
+                        if vi_assessment.get("reasons")
+                        else ""
+                    )
+                    raise HTTPException(status_code=403, detail=msg)
+                if vi_decision == "review":
+                    raise HTTPException(status_code=403, detail="VI review required")
     except HTTPException as e:
         return _error_response(e, req_id)
     except HeaderError as e:
@@ -1451,6 +1552,28 @@ async def proxy_settle(
             HTTPException(status_code=resp.status_code, detail=resp.text), req_id
         )
     data = resp_json or {}
+    if settle_vi_decision_id:
+        receipt_payload = build_public_vi_receipt_payload(
+            body,
+            request,
+            decision_id=settle_vi_decision_id,
+            evidence_ref=settle_vi_evidence_ref,
+            settlement_attempt_id=x_settlement_attempt_id,
+            idempotency_key=x_idempotency_key,
+            settle_response=data,
+            origin=origin,
+        )
+        try:
+            receipt = await post_public_vi_receipt(receipt_payload)
+            if response is not None:
+                response.headers["X-VI-Receipt-Status"] = "recorded"
+                receipt_id = receipt.get("receipt_id") or receipt.get("receiptId")
+                if receipt_id:
+                    response.headers["X-VI-Receipt-ID"] = str(receipt_id)
+        except HTTPException as e:
+            logger.warning("[%s] [PROXY] VI receipt post failed: %s", req_id, e.detail)
+            if response is not None:
+                response.headers["X-VI-Receipt-Status"] = "failed"
     return SettleResponse(
         success=bool(data.get("success")),
         payer=str(data.get("payer", "")),

@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -49,6 +49,9 @@ from x402.encoding import safe_base64_decode, safe_base64_encode
 from x402.types import PaymentPayload, PaymentRequirements
 
 logger = logging.getLogger(__name__)
+
+PaymentPayloadLike = Union[PaymentPayload, Dict[str, Any]]
+PaymentRequirementsLike = Union[PaymentRequirements, Dict[str, Any]]
 
 # Debug: store last upstream interactions
 LAST_VERIFY: Optional[Dict[str, Any]] = None
@@ -140,6 +143,117 @@ def _network_to_chain_id(network: str) -> int:
     return mapping.get(network, 0)
 
 
+def _to_dict(obj: Any) -> Dict[str, Any]:
+    if isinstance(obj, dict):
+        return dict(obj)
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(by_alias=True, exclude_none=True)
+    return dict(obj)
+
+
+def _get_value(obj: Any, alias: str, attr: Optional[str] = None, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        if alias in obj:
+            return obj[alias]
+        if attr and attr in obj:
+            return obj[attr]
+        return default
+    if attr and hasattr(obj, attr):
+        return getattr(obj, attr)
+    if hasattr(obj, alias):
+        return getattr(obj, alias)
+    return default
+
+
+def _get_extra(payment_requirements: PaymentRequirementsLike) -> Dict[str, Any]:
+    extra = _get_value(payment_requirements, "extra", default={}) or {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def _is_xrpl_network(network: Optional[str]) -> bool:
+    return str(network or "").lower().startswith("xrpl")
+
+
+def _payment_header(request: Request) -> Optional[str]:
+    return request.headers.get("X-PAYMENT") or request.headers.get("PAYMENT-SIGNATURE")
+
+
+def _decode_payment_header(header_value: str) -> Optional[Dict[str, Any]]:
+    try:
+        decoded = safe_base64_decode(header_value)
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _payment_payload_dict(body: "ProxyVerifyRequest", request: Request) -> Dict[str, Any]:
+    header_value = _payment_header(request)
+    if header_value:
+        decoded = _decode_payment_header(header_value)
+        if decoded is not None:
+            return decoded
+    return _to_dict(body.paymentPayload)
+
+
+def _payment_context_from_payload(payment_payload: Dict[str, Any]) -> Dict[str, Any]:
+    accepted = payment_payload.get("accepted")
+    if not isinstance(accepted, dict):
+        accepted = {}
+    context: Dict[str, Any] = {
+        "protocol": payment_payload.get("protocol")
+        or payment_payload.get("scheme")
+        or accepted.get("scheme"),
+        "version": payment_payload.get("version") or payment_payload.get("x402Version"),
+        "network": payment_payload.get("network") or accepted.get("network"),
+        "payload": payment_payload.get("payload", {}),
+    }
+    if accepted:
+        context["extra"] = {"accepted": accepted}
+    return context
+
+
+def _payment_requirements_for_upstream(
+    payment_requirements: PaymentRequirementsLike,
+) -> Dict[str, Any]:
+    req = {k: v for k, v in _to_dict(payment_requirements).items() if v is not None}
+    if _is_xrpl_network(req.get("network")):
+        return req
+
+    extra = req.get("extra")
+    if isinstance(extra, dict):
+        standard_fields: Dict[str, Any] = {}
+        if "name" in extra:
+            standard_fields["name"] = extra["name"]
+        if "version" in extra:
+            standard_fields["version"] = extra["version"]
+        req["extra"] = standard_fields if standard_fields else {}
+    return req
+
+
+def _facilitator_request_json(body: "ProxyVerifyRequest", request: Request) -> Dict[str, Any]:
+    payment_payload = _payment_payload_dict(body, request)
+    req_json = {
+        "x402Version": body.x402Version,
+        "paymentPayload": payment_payload,
+        "paymentRequirements": _payment_requirements_for_upstream(body.paymentRequirements),
+    }
+    header_value = _payment_header(request)
+    try:
+        req_json["paymentHeader"] = header_value or safe_base64_encode(
+            json.dumps(payment_payload, separators=(",", ":"))
+        )
+    except Exception:
+        pass
+    return req_json
+
+
+def _nullable_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
+
+
 # -------------------------------
 # Models
 # -------------------------------
@@ -147,8 +261,8 @@ def _network_to_chain_id(network: str) -> int:
 
 class ProxyVerifyRequest(BaseModel):
     x402Version: int = Field(1, description="x402 API version")
-    paymentPayload: PaymentPayload
-    paymentRequirements: PaymentRequirements
+    paymentPayload: PaymentPayloadLike
+    paymentRequirements: PaymentRequirementsLike
     ap2EvidenceHeader: Optional[str] = Field(
         None, description="base64(JSON Evidence) if not in header"
     )
@@ -156,7 +270,7 @@ class ProxyVerifyRequest(BaseModel):
 
 class VerifyResponse(BaseModel):
     isValid: bool
-    payer: str
+    payer: Optional[str] = None
     invalidReason: Optional[str] = None
 
 
@@ -166,7 +280,7 @@ class ProxySettleRequest(ProxyVerifyRequest):
 
 class SettleResponse(BaseModel):
     success: bool
-    payer: str
+    payer: Optional[str] = None
     transaction: Optional[str] = None
     network: Optional[str] = None
     errorReason: Optional[str] = None
@@ -201,8 +315,8 @@ class AP2Policy(BaseModel):
     acceptedMerchantIds: Optional[List[str]] = None
 
 
-def extract_ap2_policy(payment_requirements: PaymentRequirements) -> AP2Policy:
-    extra = getattr(payment_requirements, "extra", {}) or {}
+def extract_ap2_policy(payment_requirements: PaymentRequirementsLike) -> AP2Policy:
+    extra = _get_extra(payment_requirements)
     ap2 = extra.get("ap2") or extra.get("ap2-evidence") or {}
     try:
         return AP2Policy(**ap2)
@@ -236,27 +350,31 @@ def enforce_policy_flags(policy: AP2Policy, ev: AP2Evidence) -> None:
 
 
 def verify_origin_binding(
-    ev: AP2Evidence, payment_requirements: PaymentRequirements, origin_header: Optional[str]
+    ev: AP2Evidence, payment_requirements: PaymentRequirementsLike, origin_header: Optional[str]
 ) -> None:
     if origin_header:
         origin = origin_header
     else:
-        parsed = urlparse(payment_requirements.resource)
+        resource = str(_get_value(payment_requirements, "resource", default=""))
+        parsed = urlparse(resource)
         origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
     expected = _sha256_lower_origin(origin)
     if _b32(ev.originHash).hex() != expected.hex():
         raise HTTPException(status_code=422, detail="AP2: originHash mismatch")
 
 
-def verify_congruence(ev: AP2Evidence, payment_requirements: PaymentRequirements) -> None:
-    pr = payment_requirements
-    if ev.resource != pr.resource:
+def verify_congruence(ev: AP2Evidence, payment_requirements: PaymentRequirementsLike) -> None:
+    resource = str(_get_value(payment_requirements, "resource", default=""))
+    network = str(_get_value(payment_requirements, "network", default=""))
+    pay_to = str(_get_value(payment_requirements, "payTo", "pay_to", ""))
+    asset = str(_get_value(payment_requirements, "asset", default="") or "")
+    if ev.resource != resource:
         raise HTTPException(status_code=422, detail="AP2: resource mismatch")
-    if ev.network != pr.network:
+    if ev.network != network:
         raise HTTPException(status_code=422, detail="AP2: network mismatch")
-    if ev.payTo.lower() != pr.pay_to.lower():
+    if ev.payTo.lower() != pay_to.lower():
         raise HTTPException(status_code=422, detail="AP2: payTo mismatch")
-    asset_req = (pr.asset or "").lower()
+    asset_req = asset.lower()
     if asset_req and ev.asset.lower() != asset_req:
         raise HTTPException(status_code=422, detail="AP2: asset mismatch")
 
@@ -272,15 +390,14 @@ def verify_ttl(ev: AP2Evidence) -> None:
 
 
 def compute_expected_payment_hash(request: Request, payload_obj: Dict[str, Any]) -> bytes:
-    x_payment = request.headers.get("X-PAYMENT")
-    if x_payment:
+    payment_header = _payment_header(request)
+    if payment_header:
         try:
-            # Use x402 safe decoder for robustness (handles padding/urlsafe)
-            decoded_str = safe_base64_decode(x_payment)
+            decoded_str = safe_base64_decode(payment_header)
             decoded = decoded_str.encode("utf-8")
             return _keccak(decoded)
         except Exception:  # pragma: no cover - input validation
-            raise HTTPException(status_code=422, detail="Invalid X-PAYMENT header base64")
+            raise HTTPException(status_code=422, detail="Invalid payment header base64")
     try:
         b64 = _canon_b64_json(payload_obj)
         return _keccak(b64)
@@ -289,18 +406,19 @@ def compute_expected_payment_hash(request: Request, payload_obj: Dict[str, Any])
 
 
 def verify_payment_hash_binding(
-    ev: AP2Evidence, req: Request, payment_payload: PaymentPayload
+    ev: AP2Evidence, req: Request, payment_payload: PaymentPayloadLike
 ) -> None:
-    payload_obj = payment_payload.model_dump(by_alias=True)
+    payload_obj = _to_dict(payment_payload)
     expected = compute_expected_payment_hash(req, payload_obj)
     if _b32(ev.paymentHash) != expected:
         raise HTTPException(status_code=422, detail="AP2: paymentHash mismatch")
 
 
-def verify_merchant_identity(policy: AP2Policy, pr: PaymentRequirements) -> None:
+def verify_merchant_identity(policy: AP2Policy, pr: PaymentRequirementsLike) -> None:
     if not policy.acceptedMerchantIds:
         return
-    host = urlparse(pr.resource).netloc.lower()
+    resource = str(_get_value(pr, "resource", default=""))
+    host = urlparse(resource).netloc.lower()
     ok = any(
         mid.startswith("did:web:") and mid.split(":", 2)[2].lower() in (host, host.split(":")[0])
         for mid in policy.acceptedMerchantIds
@@ -310,7 +428,7 @@ def verify_merchant_identity(policy: AP2Policy, pr: PaymentRequirements) -> None
 
 
 def verify_eip712_signature_if_present(
-    ev: AP2Evidence, pr: PaymentRequirements, payer: Optional[str]
+    ev: AP2Evidence, pr: PaymentRequirementsLike, payer: Optional[str]
 ) -> None:
     if not ev.sig:
         return
@@ -318,13 +436,14 @@ def verify_eip712_signature_if_present(
         raise HTTPException(
             status_code=422, detail="EIP-712 verification unavailable; install eth-account"
         )
-    chain_id = _network_to_chain_id(pr.network)
+    network = str(_get_value(pr, "network", default=""))
+    chain_id = _network_to_chain_id(network)
     if not chain_id:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Unsupported network: {pr.network}. Configure PROXY_NETWORK_CHAIN_MAP to include "
-                f"'{pr.network}:<chainId>' or omit EIP-712 signature."
+                f"Unsupported network: {network}. Configure PROXY_NETWORK_CHAIN_MAP to include "
+                f"'{network}:<chainId>' or omit EIP-712 signature."
             ),
         )
     domain = {
@@ -389,19 +508,22 @@ def verify_eip712_signature_if_present(
 
 
 def enforce_amount_and_asset(
-    payment_payload: PaymentPayload, payment_requirements: PaymentRequirements
+    payment_payload: PaymentPayloadLike, payment_requirements: PaymentRequirementsLike
 ) -> None:
-    # Enforce amount <= maxAmountRequired when provided
-    pr = payment_requirements
-    pp = payment_payload.model_dump(by_alias=True)
+    if _is_xrpl_network(_get_value(payment_requirements, "network", default=None)):
+        return
+    pp = _to_dict(payment_payload)
     value: Optional[int] = None
     try:
         value = int(pp.get("payload", {}).get("authorization", {}).get("value"))
     except Exception:
         pass
-    if value is not None and pr.max_amount_required is not None:
+    max_amount = _get_value(
+        payment_requirements, "maxAmountRequired", "max_amount_required", default=None
+    )
+    if value is not None and max_amount is not None:
         try:
-            max_amt = int(pr.max_amount_required)
+            max_amt = int(max_amount)
             if value > max_amt:
                 raise HTTPException(status_code=422, detail="Amount exceeds maxAmountRequired")
         except Exception:
@@ -499,7 +621,7 @@ def verify_ap2(
     verify_origin_binding(ev, body.paymentRequirements, origin_header)
     verify_payment_hash_binding(ev, request, body.paymentPayload)
     verify_merchant_identity(policy, body.paymentRequirements)
-    payer = _extract_payer_from_payment_payload(body.paymentPayload.model_dump(by_alias=True))
+    payer = _extract_payer_from_payment_payload(_to_dict(body.paymentPayload))
     verify_eip712_signature_if_present(ev, body.paymentRequirements, payer)
     enforce_amount_and_asset(body.paymentPayload, body.paymentRequirements)
 
@@ -638,23 +760,8 @@ async def proxy_verify(
             except Exception as e:
                 logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
 
-        # Construct payment context from paymentPayload
-        payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
-        xpay = request.headers.get("X-PAYMENT")
-        if xpay:
-            try:
-                # Decode X-PAYMENT to preserve all fields
-                payment_payload_dict = json.loads(safe_base64_decode(xpay))
-            except Exception:
-                pass  # Fall back to Pydantic serialization
-
-        payment_context = {
-            "protocol": payment_payload_dict.get("protocol") or payment_payload_dict.get("scheme"),
-            "version": payment_payload_dict.get("version")
-            or payment_payload_dict.get("x402Version"),
-            "network": payment_payload_dict.get("network"),
-            "payload": payment_payload_dict.get("payload", {}),
-        }
+        payment_payload_dict = _payment_payload_dict(body, request)
+        payment_context = _payment_context_from_payload(payment_payload_dict)
 
         evaluate_json: Dict[str, Any] = {
             "sid": sid,
@@ -735,57 +842,8 @@ async def proxy_verify(
             transport = ASGITransport(app=request.app)
     except Exception:
         transport = None
-    # Build request compatible with both facilitator shapes (paymentPayload or paymentHeader)
-    xpay = request.headers.get("X-PAYMENT")
-
-    # Preserve original payment payload fields (including ap2Ref) by decoding X-PAYMENT directly
-    # instead of using Pydantic model_dump which may strip extra fields
-    payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
-    if xpay:
-        try:
-            # Decode X-PAYMENT to preserve all fields including ap2Ref
-            payment_payload_dict = json.loads(safe_base64_decode(xpay))
-        except Exception:
-            pass  # Fall back to Pydantic serialization
-
-    # Strip custom AP2 fields from PaymentRequirements before forwarding to upstream
-    # The proxy has already validated AP2, so upstream (e.g., CDP) only needs standard x402 fields
-    payment_requirements_dict = body.paymentRequirements.model_dump(
-        by_alias=True, exclude_none=True
-    )
-    if "extra" in payment_requirements_dict:
-        extra = payment_requirements_dict["extra"]
-        # Remove ALL custom fields - keep only standard x402 token metadata
-        # CDP expects only: name, version (for EIP-3009 signing)
-        standard_fields = {}
-        if "name" in extra:
-            standard_fields["name"] = extra["name"]
-        if "version" in extra:
-            standard_fields["version"] = extra["version"]
-        payment_requirements_dict["extra"] = standard_fields if standard_fields else {}
-
-    # Remove null fields that CDP doesn't like
-    payment_requirements_dict = {
-        k: v for k, v in payment_requirements_dict.items() if v is not None
-    }
-
-    req_json = {
-        "x402Version": body.x402Version,
-        "paymentPayload": payment_payload_dict,
-        "paymentRequirements": payment_requirements_dict,
-    }
-
-    try:
-        if xpay:
-            # Pass through exact header form for facilitators expecting paymentHeader
-            req_json["paymentHeader"] = xpay
-        else:
-            # Fallback: create header from canonicalized payload
-            req_json["paymentHeader"] = safe_base64_encode(
-                json.dumps(req_json["paymentPayload"], separators=(",", ":"))
-            )
-    except Exception:
-        pass
+    req_json = _facilitator_request_json(body, request)
+    payment_requirements_dict = req_json["paymentRequirements"]
 
     # Debug: log what we're sending to upstream
     logger.info(f"[{req_id}] 📤 Forwarding to upstream: {cfg.upstream_verify_url}")
@@ -827,7 +885,7 @@ async def proxy_verify(
     data = resp_json or {}
     return VerifyResponse(
         isValid=bool(data.get("isValid")),
-        payer=str(data.get("payer", "")),
+        payer=_nullable_str(data.get("payer")),
         invalidReason=data.get("invalidReason") or data.get("error") or None,
     )
 
@@ -874,24 +932,8 @@ async def proxy_settle(
                 except Exception as e:
                     logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
 
-            # Construct payment context from paymentPayload
-            payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
-            xpay = request.headers.get("X-PAYMENT")
-            if xpay:
-                try:
-                    # Decode X-PAYMENT to preserve all fields
-                    payment_payload_dict = json.loads(safe_base64_decode(xpay))
-                except Exception:
-                    pass  # Fall back to Pydantic serialization
-
-            payment_context = {
-                "protocol": payment_payload_dict.get("protocol")
-                or payment_payload_dict.get("scheme"),
-                "version": payment_payload_dict.get("version")
-                or payment_payload_dict.get("x402Version"),
-                "network": payment_payload_dict.get("network"),
-                "payload": payment_payload_dict.get("payload", {}),
-            }
+            payment_payload_dict = _payment_payload_dict(body, request)
+            payment_context = _payment_context_from_payload(payment_payload_dict)
 
             evaluate_json: Dict[str, Any] = {
                 "sid": sid,
@@ -979,40 +1021,8 @@ async def proxy_settle(
     except Exception:
         transport = None
 
-    # Strip custom AP2 fields from PaymentRequirements before forwarding to upstream
-    payment_requirements_dict = body.paymentRequirements.model_dump(
-        by_alias=True, exclude_none=True
-    )
-    if "extra" in payment_requirements_dict:
-        extra = payment_requirements_dict["extra"]
-        # Keep only standard x402 token metadata
-        standard_fields = {}
-        if "name" in extra:
-            standard_fields["name"] = extra["name"]
-        if "version" in extra:
-            standard_fields["version"] = extra["version"]
-        payment_requirements_dict["extra"] = standard_fields if standard_fields else {}
-
-    # Remove null fields that CDP doesn't like
-    payment_requirements_dict = {
-        k: v for k, v in payment_requirements_dict.items() if v is not None
-    }
-
-    req_json = {
-        "x402Version": body.x402Version,
-        "paymentPayload": body.paymentPayload.model_dump(by_alias=True),
-        "paymentRequirements": payment_requirements_dict,
-    }
-    xpay = request.headers.get("X-PAYMENT")
-    try:
-        if xpay:
-            req_json["paymentHeader"] = xpay
-        else:
-            req_json["paymentHeader"] = safe_base64_encode(
-                json.dumps(req_json["paymentPayload"], separators=(",", ":"))
-            )
-    except Exception:
-        pass
+    req_json = _facilitator_request_json(body, request)
+    payment_requirements_dict = req_json["paymentRequirements"]
     async with httpx.AsyncClient(
         timeout=cfg.timeout_s, transport=transport, follow_redirects=True
     ) as client:
@@ -1028,6 +1038,7 @@ async def proxy_settle(
         "status_code": resp.status_code,
         "origin": origin,
         "request_id": req_id,
+        "sent_payment_requirements": payment_requirements_dict,
     }
     try:
         resp_json = resp.json()
@@ -1047,7 +1058,7 @@ async def proxy_settle(
     data = resp_json or {}
     return SettleResponse(
         success=bool(data.get("success")),
-        payer=str(data.get("payer", "")),
+        payer=_nullable_str(data.get("payer")),
         transaction=data.get("transaction"),
         network=data.get("network"),
         errorReason=data.get("errorReason") or data.get("error") or None,

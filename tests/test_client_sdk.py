@@ -57,6 +57,31 @@ class TestBuyerClient:
             assert pr["network"] == "base-sepolia"
             mock_get.assert_called_once()
 
+    async def test_execute_xrpl_signed_request_headers(self, buyer_client):
+        """Test that BuyerClient can send a pre-signed XRPL payment."""
+        final_response = Mock()
+        final_response.status_code = 200
+        final_response.json.return_value = {"ok": True}
+        final_response.raise_for_status = Mock()
+
+        with patch.object(buyer_client.http, "get") as mock_get:
+            mock_get.return_value = final_response
+
+            result = await buyer_client.execute_paid_request_xrpl_with_signature(
+                "/api/xrpl-data",
+                params={"symbol": "XRP/USD"},
+                risk_sid="925ca6ee-aa4b-4508-955b-10b1c02c69bb",
+                payment_signature_b64="xrpl-payment-signature",
+                extra_headers={"X-PAYMENT-SECURE": "w3c.v1;tp=test"},
+            )
+
+            assert result["ok"] is True
+            _, kwargs = mock_get.call_args
+            headers = kwargs["headers"]
+            assert headers["PAYMENT-SIGNATURE"] == "xrpl-payment-signature"
+            assert headers["X-RISK-SESSION"] == "925ca6ee-aa4b-4508-955b-10b1c02c69bb"
+            assert "X-PAYMENT" not in headers
+
 
 @pytest.mark.asyncio
 class TestRiskClient:
@@ -83,6 +108,7 @@ class TestRiskClient:
 
             session = await risk_client.create_session(
                 agent_did="0x" + "b" * 40,
+                wallet_address="0x" + "b" * 40,
                 app_id="test-app",
                 device={"user_agent": "x402-agent/1.0"},
             )
@@ -168,6 +194,118 @@ class TestSellerClient:
 
             assert result["success"] is True
             assert result["txHash"].startswith("0x")
+
+    async def test_verify_xrpl_payment(self, seller_client):
+        """Test XRPL payment verification uses PAYMENT-SIGNATURE."""
+        with patch.object(seller_client.http, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = {"isValid": True, "payer": "rBuyer"}
+            mock_response.raise_for_status = Mock()
+            mock_response.headers = {"content-type": "application/json"}
+            mock_post.return_value = mock_response
+
+            payment_requirements = {
+                "scheme": "exact",
+                "network": "xrpl:1",
+                "asset": "XRP",
+                "payTo": "rMerchant",
+                "amount": "1000",
+                "maxTimeoutSeconds": 600,
+                "extra": {"sourceTag": 804681468, "invoiceId": "INV-test"},
+            }
+            payment_payload = {
+                "x402Version": 2,
+                "accepted": payment_requirements,
+                "payload": {"signedTxBlob": "00"},
+            }
+
+            result = await seller_client.verify_xrpl(
+                payment_payload,
+                payment_requirements,
+                payment_signature_b64="xrpl-payment-signature",
+                origin="https://seller.example",
+                x_payment_secure="w3c.v1;tp=test",
+                risk_sid="925ca6ee-aa4b-4508-955b-10b1c02c69bb",
+            )
+
+            assert result["isValid"] is True
+            _, kwargs = mock_post.call_args
+            assert kwargs["json"]["x402Version"] == 2
+            assert kwargs["headers"]["PAYMENT-SIGNATURE"] == "xrpl-payment-signature"
+            assert "X-PAYMENT" not in kwargs["headers"]
+
+    async def test_verify_then_settle_xrpl_payment(self, seller_client):
+        """Test XRPL verify-then-settle flow."""
+        with patch.object(seller_client.http, "post") as mock_post:
+            verify_response = Mock()
+            verify_response.json.return_value = {"isValid": True, "payer": "rBuyer"}
+            verify_response.raise_for_status = Mock()
+            verify_response.headers = {"content-type": "application/json"}
+
+            settle_response = Mock()
+            settle_response.json.return_value = {
+                "success": True,
+                "payer": "rBuyer",
+                "transaction": "ABC123",
+                "network": "xrpl:1",
+            }
+            settle_response.raise_for_status = Mock()
+            settle_response.headers = {"content-type": "application/json"}
+            mock_post.side_effect = [verify_response, settle_response]
+
+            payment_requirements = {
+                "scheme": "exact",
+                "network": "xrpl:1",
+                "asset": "XRP",
+                "payTo": "rMerchant",
+                "amount": "1000",
+                "maxTimeoutSeconds": 600,
+                "extra": {"sourceTag": 804681468, "invoiceId": "INV-test"},
+            }
+            payment_payload = {
+                "x402Version": 2,
+                "accepted": payment_requirements,
+                "payload": {"signedTxBlob": "00"},
+            }
+
+            result = await seller_client.verify_then_settle_xrpl(
+                payment_payload,
+                payment_requirements,
+                payment_signature_b64="xrpl-payment-signature",
+                origin="https://seller.example",
+                x_payment_secure="w3c.v1;tp=test",
+                risk_sid="925ca6ee-aa4b-4508-955b-10b1c02c69bb",
+            )
+
+            assert result["success"] is True
+            assert mock_post.call_count == 2
+
+
+def test_xrpl_payment_helpers_round_trip():
+    """Test XRPL payment helper encoding."""
+    from x402_secure_client import (
+        build_xrpl_payment_payload,
+        build_xrpl_payment_required_response,
+        decode_xrpl_payment_signature,
+        encode_xrpl_payment_signature,
+    )
+
+    payment_requirements = {
+        "scheme": "exact",
+        "network": "xrpl:1",
+        "asset": "XRP",
+        "payTo": "rMerchant",
+        "amount": "1000",
+        "maxTimeoutSeconds": 600,
+        "extra": {"sourceTag": 804681468, "invoiceId": "INV-test"},
+    }
+    payload = build_xrpl_payment_payload(payment_requirements, signed_tx_blob="00")
+    encoded = encode_xrpl_payment_signature(payload)
+
+    assert decode_xrpl_payment_signature(encoded) == payload
+    assert build_xrpl_payment_required_response(payment_requirements)["accepts"] == [
+        payment_requirements
+    ]
 
 
 @pytest.mark.asyncio

@@ -10,8 +10,9 @@ A FastAPI-based proxy that validates AP2 (Attestation Protocol 2) evidence and f
 - ✅ **UID-Based Risk Assessment** - Fetches trace context and PaymentMandate from Risk Engine using UIDs
 - ✅ **Cryptographic Validation** - Payment hash binding, origin binding, TTL checks
 - ✅ **EIP-712 Signatures** - Optional payer signature verification
-- ✅ **Clean x402 Forwarding** - Strips custom fields before forwarding to upstream
+- ✅ **Clean x402 Forwarding** - Strips EVM-only AP2 fields while preserving XRPL facilitator metadata
 - ✅ **Flexible Upstream** - Works with CDP facilitator, local Risk Engine, or stubs
+- ✅ **XRPL Exact Payments** - Accepts v2 `PAYMENT-SIGNATURE` payloads for XRPL x402 facilitators
 
 ## Installation
 
@@ -49,6 +50,10 @@ Configure via environment variables:
 export PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
 export PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
 
+# XRPL example
+export PROXY_UPSTREAM_VERIFY_URL=https://xrpl-facilitator-testnet.t54.ai/verify
+export PROXY_UPSTREAM_SETTLE_URL=https://xrpl-facilitator-testnet.t54.ai/settle
+
 # Risk Engine for AP2 UID lookups
 export RISK_ENGINE_URL=http://localhost:8001
 
@@ -83,7 +88,7 @@ app.dependency_overrides[get_proxy_cfg] = custom_proxy_cfg
 ### Flow Diagram
 
 ```
-Buyer (X-PAYMENT + X-AP2-EVIDENCE)
+Buyer (X-PAYMENT or PAYMENT-SIGNATURE + X-AP2-EVIDENCE)
   ↓
 Seller
   ↓
@@ -96,8 +101,9 @@ Facilitator Proxy (/x402/verify)
   ├─ 6. Verify payment hash binding (paymentHash)
   ├─ 7. Fetch trace context via trace_uid (from Risk Engine)
   ├─ 8. Fetch PaymentMandate VC via payment_uid (from Risk Engine)
-  ├─ 9. Strip custom AP2 fields from PaymentRequirements
-  └─ 10. Forward clean x402 to upstream facilitator
+  ├─ 9. Strip custom AP2 fields from EVM PaymentRequirements
+  ├─ 10. Preserve XRPL extra.sourceTag / extra.invoiceId for XRPL networks
+  └─ 11. Forward clean x402 to upstream facilitator
        ↓
 Upstream x402 Facilitator (CDP, local, etc.)
   └─ Validates standard x402 payment and returns result

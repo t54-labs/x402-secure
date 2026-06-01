@@ -199,6 +199,7 @@ result = await run_agent_payment(
 - ✅ **Protection from disputes** - Evidence of agent behavior
 - ✅ **Simple integration** - Standard x402 with risk headers
 - ✅ **Higher conversion** - Don't block all agents, just risky ones
+- ✅ **Multi-chain x402** - Base/Solana flows plus XRPL exact payments via `PAYMENT-SIGNATURE`
 
 ### Quick Integration (10 minutes)
 
@@ -264,6 +265,50 @@ async def your_api(request: Request, param: str):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=402)
+```
+
+### XRPL Exact Payments
+
+XRPL x402 uses the v2 `PAYMENT-SIGNATURE` header with a payer-signed XRPL
+`Payment` transaction blob. The proxy accepts XRPL requirements such as
+`network: "xrpl:1"`, `amount`, `asset: "XRP"`, and `extra.sourceTag` /
+`extra.invoiceId`, then forwards them unchanged to the XRPL facilitator.
+
+```python
+from x402_secure_client import (
+    SellerClient,
+    build_xrpl_payment_payload,
+    build_xrpl_payment_required_response,
+    encode_xrpl_payment_signature,
+)
+
+seller = SellerClient("https://x402-proxy.t54.ai")
+
+payment_requirements = {
+    "scheme": "exact",
+    "network": "xrpl:1",
+    "asset": "XRP",
+    "payTo": "rMerchantAddress",
+    "amount": "1000",
+    "maxTimeoutSeconds": 600,
+    "extra": {"sourceTag": 804681468, "invoiceId": "INV-123"},
+}
+
+# Return this from your endpoint when PAYMENT-SIGNATURE is missing.
+payment_required = build_xrpl_payment_required_response(payment_requirements)
+
+# After the buyer signs an XRPL Payment transaction:
+payment_payload = build_xrpl_payment_payload(payment_requirements, signed_tx_blob="...")
+payment_signature = encode_xrpl_payment_signature(payment_payload)
+
+result = await seller.verify_then_settle_xrpl(
+    payment_payload,
+    payment_requirements,
+    payment_signature_b64=payment_signature,
+    origin="https://seller.example",
+    x_payment_secure="w3c.v1;tp=...",
+    risk_sid="925ca6ee-aa4b-4508-955b-10b1c02c69bb",
+)
 ```
 
 ### Risk Scoring

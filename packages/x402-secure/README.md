@@ -3,7 +3,8 @@
 Open-source x402 client SDKs for buyers and sellers that integrate with a unified gateway for risk session/trace and a seller proxy for verify/settle.
 
 - Buyer SDK: create risk session/trace via `AGENT_GATEWAY_URL`, build `X-PAYMENT-SECURE` from OpenTelemetry context.
-- Seller SDK: call proxy `/x402/verify` and `/x402/settle` with a simple `verify_then_settle(...)` wrapper.
+- Seller SDK: call proxy `/x402/verify` and `/x402/settle` with `verify_then_settle(...)` or XRPL `verify_then_settle_xrpl(...)`.
+- XRPL helpers: encode/decode v2 `PAYMENT-SIGNATURE` payloads and build XRPL 402 responses.
 
 Fail-fast principles:
 - Non-200 responses raise immediately (`HTTPStatusError`).
@@ -54,6 +55,43 @@ asyncio.run(main())
 ```
 
 See `examples/` for runnable scripts.
+
+## XRPL
+
+XRPL x402 payments use `x402Version=2` and the `PAYMENT-SIGNATURE` header. The
+signature payload is JSON containing the accepted XRPL payment requirements and
+`payload.signedTxBlob`.
+
+```python
+from x402_secure_client import (
+    SellerClient,
+    build_xrpl_payment_payload,
+    encode_xrpl_payment_signature,
+)
+
+seller = SellerClient("https://x402-proxy.t54.ai")
+
+requirements = {
+    "scheme": "exact",
+    "network": "xrpl:1",
+    "asset": "XRP",
+    "payTo": "rMerchantAddress",
+    "amount": "1000",
+    "maxTimeoutSeconds": 600,
+    "extra": {"sourceTag": 804681468, "invoiceId": "INV-123"},
+}
+payload = build_xrpl_payment_payload(requirements, signed_tx_blob="...")
+payment_signature = encode_xrpl_payment_signature(payload)
+
+result = await seller.verify_then_settle_xrpl(
+    payload,
+    requirements,
+    payment_signature_b64=payment_signature,
+    origin="https://seller.example",
+    x_payment_secure="w3c.v1;tp=...",
+    risk_sid="925ca6ee-aa4b-4508-955b-10b1c02c69bb",
+)
+```
 
 ## License
 

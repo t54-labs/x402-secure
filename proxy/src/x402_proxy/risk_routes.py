@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 class RiskSessionRequest(BaseModel):
     # Both agent_did and wallet_address are required
     # - agent_did: Agent DID (currently often same as wallet address; future: did:eip8004:...)
-    # - wallet_address: EVM wallet address (0x...) - current phase; future: multi-chain support
+    # - wallet_address: Chain wallet address used by the payer/agent
     # - agent_endpoint: Optional agent callback/base URL
     agent_did: str = Field(
         ..., description="Agent DID (currently often same as wallet address; future: did:eip...)"
     )
-    wallet_address: str = Field(..., description="EVM wallet address (0x...)")
+    wallet_address: str = Field(..., description="Wallet address")
     agent_endpoint: Optional[str] = Field(None, description="Agent base/endpoint URL")
     app_id: Optional[str] = None
     device: Optional[Dict[str, Any]] = None
@@ -43,9 +43,9 @@ class RiskSessionRequest(BaseModel):
     @field_validator("wallet_address")
     @classmethod
     def validate_wallet_address(cls, v: str) -> str:
-        if not isinstance(v, str) or not v.startswith("0x") or len(v) != 42:
-            raise ValueError("wallet_address must be an EVM address (0x...)")
-        return v
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("wallet_address must be a non-empty string")
+        return v.strip()
 
 
 class RiskSessionResponse(BaseModel):

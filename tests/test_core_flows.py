@@ -8,7 +8,7 @@ payment verification and settlement.
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 
@@ -49,6 +49,139 @@ class TestCompletePaymentFlow:
         assert "sid" in data
         assert "expires_at" in data
         assert len(data["sid"]) == 36  # UUID format
+
+    async def test_xrpl_risk_session_creation(self, client: TestClient):
+        """Test creating a risk session with an XRPL wallet address."""
+        response = client.post(
+            "/risk/session",
+            json={
+                "agent_did": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                "wallet_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+            },
+        )
+
+        assert response.status_code == 200
+        assert "sid" in response.json()
+
+    async def test_xrpl_verify_forwards_payment_signature(self, test_env, monkeypatch):
+        """Test XRPL verify preserves PAYMENT-SIGNATURE and XRPL extra fields."""
+        from x402_proxy import risk_router, router
+        from x402_secure_client import encode_xrpl_payment_signature
+
+        monkeypatch.setenv("PROXY_UPSTREAM_VERIFY_URL", "http://testserver/xrpl/verify")
+
+        app = FastAPI(title="Test x402 Proxy")
+        app.include_router(risk_router)
+        app.include_router(router)
+
+        @app.post("/xrpl/verify")
+        async def xrpl_verify(request: Request):
+            data = await request.json()
+            app.state.last_xrpl_verify = data
+            return {"isValid": True, "payer": "rBuyer"}
+
+        client = TestClient(app)
+        session_response = client.post(
+            "/risk/session",
+            json={"agent_did": "0x" + "b" * 40, "wallet_address": "0x" + "b" * 40},
+        )
+        sid = session_response.json()["sid"]
+
+        payment_requirements = {
+            "scheme": "exact",
+            "network": "xrpl:1",
+            "asset": "XRP",
+            "payTo": "rMerchant",
+            "amount": "1000",
+            "maxTimeoutSeconds": 600,
+            "extra": {"sourceTag": 804681468, "invoiceId": "INV-test"},
+        }
+        payment_payload = {
+            "x402Version": 2,
+            "accepted": payment_requirements,
+            "payload": {"signedTxBlob": "00"},
+        }
+        payment_signature = encode_xrpl_payment_signature(payment_payload)
+
+        response = client.post(
+            "/x402/verify",
+            json={
+                "x402Version": 2,
+                "paymentPayload": payment_payload,
+                "paymentRequirements": payment_requirements,
+            },
+            headers={
+                "PAYMENT-SIGNATURE": payment_signature,
+                "X-PAYMENT-SECURE": (
+                    "w3c.v1;tp=00-4bf92f3577b34da6a3ce929d0e0e4736-"
+                    "00f067aa0ba902b7-01"
+                ),
+                "X-RISK-SESSION": sid,
+                "Origin": "https://seller.example",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["payer"] == "rBuyer"
+        forwarded = app.state.last_xrpl_verify
+        assert forwarded["paymentHeader"] == payment_signature
+        assert forwarded["paymentPayload"] == payment_payload
+        assert forwarded["paymentRequirements"]["extra"]["sourceTag"] == 804681468
+
+    async def test_xrpl_settle_allows_null_payer(self, test_env, monkeypatch):
+        """Test XRPL settle can forward a null payer response from the facilitator."""
+        from x402_proxy import router
+        from x402_secure_client import encode_xrpl_payment_signature
+
+        monkeypatch.setenv("PROXY_UPSTREAM_SETTLE_URL", "http://testserver/xrpl/settle")
+
+        app = FastAPI(title="Test x402 Proxy")
+        app.include_router(router)
+
+        @app.post("/xrpl/settle")
+        async def xrpl_settle(request: Request):
+            data = await request.json()
+            app.state.last_xrpl_settle = data
+            return {
+                "success": False,
+                "payer": None,
+                "transaction": "",
+                "network": "xrpl:1",
+                "errorReason": "invalid_payload",
+            }
+
+        client = TestClient(app)
+        payment_requirements = {
+            "scheme": "exact",
+            "network": "xrpl:1",
+            "asset": "XRP",
+            "payTo": "rMerchant",
+            "amount": "1000",
+            "maxTimeoutSeconds": 600,
+            "extra": {"sourceTag": 804681468, "invoiceId": "INV-test"},
+        }
+        payment_payload = {
+            "x402Version": 2,
+            "accepted": payment_requirements,
+            "payload": {"signedTxBlob": "00"},
+        }
+        payment_signature = encode_xrpl_payment_signature(payment_payload)
+
+        response = client.post(
+            "/x402/settle",
+            json={
+                "x402Version": 2,
+                "paymentPayload": payment_payload,
+                "paymentRequirements": payment_requirements,
+            },
+            headers={"PAYMENT-SIGNATURE": payment_signature},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["payer"] is None
+        forwarded = app.state.last_xrpl_settle
+        assert forwarded["paymentHeader"] == payment_signature
+        assert forwarded["paymentRequirements"]["extra"]["invoiceId"] == "INV-test"
 
     async def test_agent_trace_submission(
         self, client: TestClient, sample_risk_session, sample_agent_trace

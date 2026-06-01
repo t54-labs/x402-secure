@@ -26,11 +26,11 @@ class RiskClient:
         """Create a risk session with agent identification.
 
         Args:
-            agent_did: Agent decentralized identifier. Currently accepts wallet address (0x...).
+            agent_did: Agent decentralized identifier. Currently accepts wallet address.
                       TODO: Support EIP-8004 DID format
                       (did:eip8004:{chain_id}:{contract}:{token_id})
                       when integrating with on-chain agent identity (ERC-721 based).
-            wallet_address: EVM wallet address (0x...) - required in current phase
+            wallet_address: Chain wallet address used by the payer/agent.
             agent_endpoint: Optional agent callback/base URL
             app_id: Optional application identifier
             device: Device information dict

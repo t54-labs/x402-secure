@@ -7,6 +7,12 @@ from .otel import setup_otel_from_env
 from .risk import RiskClient
 from .seller import SellerClient
 from .tracing import OpenAITraceCollector
+from .xrpl import (
+    build_xrpl_payment_payload,
+    build_xrpl_payment_required_response,
+    decode_xrpl_payment_signature,
+    encode_xrpl_payment_signature,
+)
 
 __all__ = [
     "build_payment_secure_header",
@@ -20,4 +26,8 @@ __all__ = [
     "execute_payment_with_tid",
     "run_agent_payment",
     "setup_otel_from_env",
+    "build_xrpl_payment_payload",
+    "build_xrpl_payment_required_response",
+    "decode_xrpl_payment_signature",
+    "encode_xrpl_payment_signature",
 ]

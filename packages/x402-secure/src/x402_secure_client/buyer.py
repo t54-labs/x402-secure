@@ -106,6 +106,32 @@ class BuyerClient:
         final.raise_for_status()
         return final.json()
 
+    async def execute_paid_request_xrpl_with_signature(
+        self,
+        endpoint: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        risk_sid: str,
+        payment_signature_b64: str,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        params = params or {}
+        url = f"{self.cfg.seller_base_url.rstrip('/')}{endpoint}"
+        origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        headers: Dict[str, str] = {
+            "PAYMENT-SIGNATURE": payment_signature_b64,
+            "Origin": origin,
+            "X-RISK-SESSION": risk_sid,
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        if "X-PAYMENT-SECURE" not in headers:
+            raise RuntimeError("X-PAYMENT-SECURE missing in extra_headers")
+
+        final = await self.http.get(url, params=params, headers=headers)
+        final.raise_for_status()
+        return final.json()
+
     async def create_risk_session(
         self,
         *,

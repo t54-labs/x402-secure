@@ -1153,7 +1153,9 @@ async def proxy_verify(
             vi_decision = vi_assessment["decision"]
             if response is not None:
                 response.headers["X-VI-Decision"] = vi_decision
+                response.headers["X-Risk-Decision"] = vi_decision
                 response.headers["X-VI-Decision-ID"] = vi_assessment["decision_id"]
+                response.headers["X-Risk-Decision-ID"] = vi_assessment["decision_id"]
                 vi_details = vi_assessment.get("vi") or {}
                 if "verified" in vi_details:
                     response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
@@ -1457,7 +1459,9 @@ async def proxy_settle(
                 )
                 if response is not None:
                     response.headers["X-VI-Decision"] = vi_decision
+                    response.headers["X-Risk-Decision"] = vi_decision
                     response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
+                    response.headers["X-Risk-Decision-ID"] = settle_vi_decision_id
                     if "verified" in vi_details:
                         response.headers["X-VI-Verified"] = str(
                             bool(vi_details["verified"])

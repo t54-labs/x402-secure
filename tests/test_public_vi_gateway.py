@@ -260,6 +260,8 @@ def test_proxy_verify_calls_trustline_when_vi_policy_required(monkeypatch) -> No
     assert response.status_code == 200
     assert response.headers["x-vi-decision"] == "allow"
     assert response.headers["x-vi-decision-id"] == "vi_dec_1"
+    assert response.headers["x-risk-decision"] == "allow"
+    assert response.headers["x-risk-decision-id"] == "vi_dec_1"
     assert response.headers["x-vi-verified"] == "true"
     assert response.headers["x-vi-evidence-ref"] == "tl_evd_1"
     assert captured["path"] == "assess-verifiable-intent"
@@ -508,6 +510,8 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
     assert response.status_code == 200
     assert response.headers["x-vi-decision"] == "allow"
     assert response.headers["x-vi-decision-id"] == "vi_dec_settle"
+    assert response.headers["x-risk-decision"] == "allow"
+    assert response.headers["x-risk-decision-id"] == "vi_dec_settle"
     assert response.headers["x-vi-receipt-status"] == "recorded"
     assert [path for path, _payload in calls] == [
         "assess-verifiable-intent",

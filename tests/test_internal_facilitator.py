@@ -179,6 +179,34 @@ def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None
     assert captured["payload"]["binding"]["amount"] == "2.5"
 
 
+def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload()
+    body["payment"]["paymentPayloadHash"] = "sha256:facilitator_payload_hash"
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_hash",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["paymentContext"]["payloadHash"] == "sha256:facilitator_payload_hash"
+    assert captured["payload"]["binding"]["hashes"]["paymentPayloadHash"] == "sha256:facilitator_payload_hash"
+
+
 def test_internal_evaluate_blocks_review_when_policy_says_block(monkeypatch) -> None:
     client = _client(monkeypatch)
 

@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,11 @@ class InternalPaymentContext(BaseModel):
         default=None,
         alias="paymentRequirementsHash",
     )
-    payload_hash: Optional[str] = Field(default=None, alias="payloadHash")
+    payload_hash: Optional[str] = Field(
+        default=None,
+        alias="payloadHash",
+        validation_alias=AliasChoices("payloadHash", "paymentPayloadHash"),
+    )
     payload: Dict[str, Any] = Field(default_factory=dict)
     payment_requirements: Dict[str, Any] = Field(
         default_factory=dict,

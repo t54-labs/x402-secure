@@ -27,7 +27,7 @@ from .headers import (
     parse_x_payment_secure,
     parse_x_verifiable_intent,
 )
-from .internal_facilitator import InternalPolicy
+from .internal_facilitator import InternalPolicy, post_trustline_validation
 from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps
@@ -600,6 +600,13 @@ def _error_code_from_message(msg: str) -> str:
         # Risk outcome gating
         "risk denied": "RISK_DENIED",
         "risk review": "RISK_REVIEW",
+        "unsupported x-verifiable-intent version": "VI_HEADER_UNSUPPORTED",
+        "x-verifiable-intent": "VI_HEADER_INVALID",
+        "verifiable intent required": "VI_EVIDENCE_MISSING",
+        "ap2 payment mandate required": "AP2_PAYMENT_MANDATE_MISSING",
+        "trace context required": "TRACE_CONTEXT_MISSING",
+        "vi denied": "VI_DENIED",
+        "vi review required": "VI_REVIEW_REQUIRED",
     }
     for k, v in mapping.items():
         if k in m:
@@ -790,6 +797,7 @@ def build_public_vi_assessment_payload(
     *,
     vi_header: Optional[str],
     trace_context: Optional[Dict[str, Any]],
+    ap2_context: Optional[Dict[str, Any]] = None,
     risk_session: Optional[str],
     risk_trace: Optional[str],
     origin: Optional[str],
@@ -802,6 +810,7 @@ def build_public_vi_assessment_payload(
     payment_context = build_public_payment_context(body, request, origin)
     trace = trace_context or body.trace_context or {}
     merchant_id = _merchant_id_from_origin(origin, body.paymentRequirements.resource)
+    merged_ap2_context = {**(ap2_context or {}), **(body.ap2_context or {})}
 
     return {
         "agentId": payment_context.get("payer"),
@@ -809,7 +818,7 @@ def build_public_vi_assessment_payload(
         "merchantId": merchant_id,
         "policy": policy.model_dump(by_alias=True),
         "verifiableIntent": verifiable_intent or {},
-        "ap2Context": body.ap2_context or {},
+        "ap2Context": merged_ap2_context,
         "traceContext": trace,
         "paymentContext": payment_context,
         "binding": build_public_binding(payment_context),
@@ -819,6 +828,132 @@ def build_public_vi_assessment_payload(
             "riskTrace": risk_trace,
             "origin": origin,
         },
+    }
+
+
+def public_vi_assessment_requested(
+    policy: InternalPolicy,
+    body: ProxyVerifyRequest,
+    vi_header: Optional[str],
+) -> bool:
+    return any(
+        [
+            policy.require_verifiable_intent,
+            policy.require_verified_intent,
+            policy.require_payment_mandate,
+            policy.require_holder_binding,
+            policy.require_trace,
+            bool(policy.accepted_issuers),
+            bool(body.policy),
+            bool(body.vi_policy),
+            bool(body.verifiable_intent),
+            bool(body.ap2_context),
+            bool(vi_header),
+        ]
+    )
+
+
+def _has_ap2_payment_mandate(ap2_context: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(ap2_context, dict):
+        return False
+    return any(
+        ap2_context.get(key)
+        for key in (
+            "paymentMandateRef",
+            "payment_mandate_ref",
+            "paymentMandateHash",
+            "payment_mandate_hash",
+            "paymentUid",
+            "payment_uid",
+        )
+    )
+
+
+def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
+    policy = InternalPolicy(**(payload.get("policy") or {}))
+    verifiable_intent = payload.get("verifiableIntent")
+    ap2_context = payload.get("ap2Context")
+    trace_context = payload.get("traceContext")
+
+    vi_required = any(
+        [
+            policy.require_verifiable_intent,
+            policy.require_verified_intent,
+            policy.require_holder_binding,
+            bool(policy.accepted_issuers),
+        ]
+    )
+    if vi_required and not verifiable_intent:
+        raise HTTPException(status_code=422, detail="Verifiable Intent required")
+    if policy.require_payment_mandate and not _has_ap2_payment_mandate(ap2_context):
+        raise HTTPException(status_code=422, detail="AP2 payment mandate required")
+    if policy.require_trace and not trace_context:
+        raise HTTPException(status_code=422, detail="Trace context required")
+
+
+def _normalize_vi_decision(value: Any) -> str:
+    normalized = str(value or "review").lower()
+    if normalized in {"approve", "approved", "accept", "accepted"}:
+        return "allow"
+    if normalized in {"reject", "rejected", "decline", "declined", "block", "blocked"}:
+        return "deny"
+    if normalized not in {"allow", "deny", "review"}:
+        return "review"
+    return normalized
+
+
+def _ap2_context_from_mandate_header(mandate: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    if not mandate:
+        return {}
+    return {
+        "paymentMandateRef": mandate["mr"],
+        "paymentMandateHash": mandate["ms"],
+        "paymentMandateMime": mandate["mt"],
+        "paymentMandateSize": int(mandate["sz"]),
+    }
+
+
+def effective_public_vi_decision(
+    trustline_decision: Any,
+    policy: InternalPolicy,
+    warnings: List[str],
+) -> str:
+    normalized = _normalize_vi_decision(trustline_decision)
+    if normalized != "review":
+        return normalized
+    if policy.review_mode == "allow":
+        warnings.append("Trustline returned review; policy reviewMode=allow converted it to allow.")
+        return "allow"
+    if policy.review_mode == "block":
+        warnings.append("Trustline returned review; policy reviewMode=block converted it to deny.")
+        return "deny"
+    return "review"
+
+
+async def assess_public_verifiable_intent(
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    enforce_public_vi_policy_inputs(payload)
+    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    warnings = list(trustline_response.get("warnings") or [])
+    policy = InternalPolicy(**(payload.get("policy") or {}))
+    decision = effective_public_vi_decision(
+        trustline_response.get("decision"),
+        policy,
+        warnings,
+    )
+    return {
+        "decision": decision,
+        "decision_id": trustline_response.get("decision_id")
+        or trustline_response.get("decisionId")
+        or f"xs_vi_{uuid.uuid4().hex}",
+        "risk_level": trustline_response.get("risk_level", "medium"),
+        "ttl_seconds": trustline_response.get("ttl_seconds", 300),
+        "vi": trustline_response.get("vi") or {},
+        "binding": trustline_response.get("binding") or payload.get("binding") or {},
+        "reasons": trustline_response.get("reasons") or [],
+        "warnings": warnings,
+        "trustline_assessment": trustline_response.get("trustline_assessment") or {},
     }
 
 
@@ -832,8 +967,10 @@ async def proxy_verify(
     body: ProxyVerifyRequest,
     request: Request,
     x_ap2_evidence: Optional[str] = Header(None, alias="X-AP2-EVIDENCE"),
+    x_verifiable_intent: Optional[str] = Header(None, alias="X-VERIFIABLE-INTENT"),
     x_payment_secure: Optional[str] = Header(None, alias="X-PAYMENT-SECURE"),
     x_risk_session: Optional[str] = Header(None, alias="X-RISK-SESSION"),
+    x_risk_trace: Optional[str] = Header(None, alias="X-RISK-TRACE"),
     origin: Optional[str] = Header(None, alias="Origin"),
     cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg),
     response: Response = None,
@@ -843,7 +980,7 @@ async def proxy_verify(
         response.headers["X-Request-ID"] = req_id
     try:
         # Parse required IDs and trace context; optional mandate
-        sid, tid = parse_risk_ids(x_risk_session, None)
+        sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
         if not x_payment_secure:
             raise HeaderError("X-PAYMENT-SECURE required")
         tc = parse_x_payment_secure(x_payment_secure)
@@ -952,6 +1089,45 @@ async def proxy_verify(
                 f": {', '.join(risk_response.reasons)}" if risk_response.reasons else ""
             )
             raise HTTPException(status_code=403, detail=msg)
+
+        trace_context = {
+            "traceparent": tc["tp"],
+            **({"tracestate": tc["ts"]} if "ts" in tc else {}),
+            **({"riskTrace": extracted_tid} if extracted_tid else {}),
+            "riskSession": sid,
+        }
+        vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
+        if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
+            vi_payload = build_public_vi_assessment_payload(
+                body,
+                request,
+                vi_header=x_verifiable_intent,
+                trace_context=trace_context,
+                ap2_context=_ap2_context_from_mandate_header(mandate),
+                risk_session=sid,
+                risk_trace=extracted_tid,
+                origin=origin,
+            )
+            vi_assessment = await assess_public_verifiable_intent(vi_payload)
+            vi_decision = vi_assessment["decision"]
+            if response is not None:
+                response.headers["X-VI-Decision"] = vi_decision
+                response.headers["X-VI-Decision-ID"] = vi_assessment["decision_id"]
+                vi_details = vi_assessment.get("vi") or {}
+                if "verified" in vi_details:
+                    response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
+                evidence_ref = vi_details.get("evidence_ref") or vi_details.get("evidenceRef")
+                if evidence_ref:
+                    response.headers["X-VI-Evidence-Ref"] = str(evidence_ref)
+            if vi_decision == "deny":
+                msg = "VI denied" + (
+                    f": {', '.join(vi_assessment['reasons'])}"
+                    if vi_assessment.get("reasons")
+                    else ""
+                )
+                raise HTTPException(status_code=403, detail=msg)
+            if vi_decision == "review":
+                raise HTTPException(status_code=403, detail="VI review required")
     except HTTPException as e:
         return _error_response(e, req_id)
     except HeaderError as e:

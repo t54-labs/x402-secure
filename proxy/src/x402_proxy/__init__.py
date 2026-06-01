@@ -17,6 +17,7 @@ from .headers import (
     parse_x_ap2_evidence,
     parse_x_payment_secure,
 )
+from .internal_facilitator import internal_router
 from .risk_routes import router as risk_router
 from .routes import (
     AP2Evidence,
@@ -55,4 +56,5 @@ __all__ = [
     "parse_x_ap2_evidence",
     "parse_risk_ids",
     "risk_router",
+    "internal_router",
 ]

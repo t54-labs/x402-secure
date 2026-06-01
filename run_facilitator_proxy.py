@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv  # type: ignore
 from fastapi import Depends, FastAPI
-from x402_proxy import ProxyRuntimeConfig, get_proxy_cfg, risk_router, router
+from x402_proxy import ProxyRuntimeConfig, get_proxy_cfg, internal_router, risk_router, router
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -57,6 +57,8 @@ def build_app() -> FastAPI:
     app.include_router(router)
     # Mount public Risk API (/risk/*) at the unified gateway
     app.include_router(risk_router)
+    # Mount hosted-facilitator internal API (/internal/x402-secure/facilitator/*)
+    app.include_router(internal_router)
 
     logger.info("Facilitator Proxy app initialized")
     return app

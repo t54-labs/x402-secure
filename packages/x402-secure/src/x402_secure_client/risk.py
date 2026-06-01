@@ -18,7 +18,7 @@ class RiskClient:
         self,
         *,
         agent_did: str,
-        wallet_address: str,
+        wallet_address: Optional[str] = None,
         app_id: Optional[str] = None,
         device: Optional[Dict[str, Any]] = None,
         agent_endpoint: Optional[str] = None,
@@ -30,7 +30,8 @@ class RiskClient:
                       TODO: Support EIP-8004 DID format
                       (did:eip8004:{chain_id}:{contract}:{token_id})
                       when integrating with on-chain agent identity (ERC-721 based).
-            wallet_address: EVM wallet address (0x...) - required in current phase
+            wallet_address: EVM wallet address (0x...). Defaults to agent_did
+                for backward compatibility when the agent DID is the wallet.
             agent_endpoint: Optional agent callback/base URL
             app_id: Optional application identifier
             device: Device information dict
@@ -38,6 +39,8 @@ class RiskClient:
         Returns:
             Dict containing 'sid' (session ID) and other session metadata
         """
+        if wallet_address is None:
+            wallet_address = agent_did
         payload = {
             "agent_did": agent_did,
             "wallet_address": wallet_address,

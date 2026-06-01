@@ -214,8 +214,8 @@ from x402_secure_client import SellerClient
 
 app = FastAPI()
 
-# Initialize seller client with your proxy endpoint
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+# Initialize seller client with your proxy base URL
+seller = SellerClient("https://x402-proxy.t54.ai")
 
 @app.get("/api/your-service")
 async def your_api(request: Request, param: str):

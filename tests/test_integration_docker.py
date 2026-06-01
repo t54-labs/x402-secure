@@ -5,6 +5,8 @@ Integration tests using Docker containers.
 """
 
 import asyncio
+import base64
+import json
 import logging
 import os
 
@@ -266,6 +268,71 @@ class TestDockerIntegration:
         assert data["success"] is True
         assert data["transaction"].startswith("0x")
         assert data["network"] == "base-sepolia"
+
+    async def test_xrpl_payment_verify_and_settle_flow(
+        self, http_client: httpx.AsyncClient, wait_for_services
+    ):
+        """Test XRPL payment verification and settlement through proxy and mock facilitator."""
+        session_response = await http_client.post(
+            f"{GATEWAY_URL}/risk/session",
+            json={
+                "agent_did": "rBuyer",
+                "wallet_address": "rBuyer",
+                "app_id": "docker-xrpl-test",
+            },
+        )
+        assert session_response.status_code == 200
+        sid = session_response.json()["sid"]
+
+        payment_requirements = {
+            "scheme": "exact",
+            "network": "xrpl:1",
+            "asset": "XRP",
+            "payTo": "rMerchant",
+            "amount": "1000",
+            "maxTimeoutSeconds": 600,
+            "extra": {"sourceTag": 804681468, "invoiceId": "INV-docker-xrpl"},
+        }
+        payment_payload = {
+            "x402Version": 2,
+            "accepted": payment_requirements,
+            "payer": "rBuyer",
+            "payload": {"signedTxBlob": "00"},
+        }
+        payment_signature = base64.b64encode(
+            json.dumps(payment_payload, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        payment_data = {
+            "x402Version": 2,
+            "paymentPayload": payment_payload,
+            "paymentRequirements": payment_requirements,
+        }
+        headers = {
+            "PAYMENT-SIGNATURE": payment_signature,
+            "X-PAYMENT-SECURE": (
+                "w3c.v1;tp=00-4bf92f3577b34da6a3ce929d0e0e4736-"
+                "00f067aa0ba902b7-01"
+            ),
+            "X-RISK-SESSION": sid,
+            "Origin": "https://test.example.com",
+        }
+
+        verify_response = await http_client.post(
+            f"{GATEWAY_URL}/x402/verify", json=payment_data, headers=headers
+        )
+        assert verify_response.status_code == 200
+        verify_data = verify_response.json()
+        assert verify_data["isValid"] is True
+        assert verify_data["payer"] == "rBuyer"
+
+        settle_response = await http_client.post(
+            f"{GATEWAY_URL}/x402/settle", json=payment_data, headers=headers
+        )
+        assert settle_response.status_code == 200
+        settle_data = settle_response.json()
+        assert settle_data["success"] is True
+        assert settle_data["transaction"] == "XRPL_MOCK_TX"
+        assert settle_data["network"] == "xrpl:1"
 
     async def test_risk_evaluation_flow(self, http_client: httpx.AsyncClient, wait_for_services):
         """Test risk evaluation endpoint."""

@@ -47,12 +47,13 @@ async def health():
 async def verify_payment(
     request: PaymentRequest,
     x_payment: Optional[str] = Header(None, alias="X-PAYMENT"),
+    payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"),
 ):
     """Mock payment verification."""
     logger.info(f"Verify request: {request.dict()}")
 
     # Check for paymentHeader in request body (sent by proxy)
-    payment_header = getattr(request, "paymentHeader", None) or x_payment
+    payment_header = getattr(request, "paymentHeader", None) or x_payment or payment_signature
     if not payment_header and hasattr(request, "__dict__") and "paymentHeader" in request.__dict__:
         payment_header = request.__dict__["paymentHeader"]
 
@@ -63,11 +64,14 @@ async def verify_payment(
     # Extract payer from nested payload structure
     payer = None
     if isinstance(payload, dict):
+        accepted = payload.get("accepted", {})
+        if isinstance(accepted, dict) and str(accepted.get("network", "")).startswith("xrpl"):
+            payer = payload.get("payer") or "rBuyer"
         # Handle nested structure from x402 types
         inner_payload = payload.get("payload", {})
         if isinstance(inner_payload, dict):
             auth = inner_payload.get("authorization", {})
-            if isinstance(auth, dict):
+            if isinstance(auth, dict) and auth.get("from"):
                 payer = auth.get("from")
         # Fallback to direct from field
         if not payer:
@@ -84,17 +88,26 @@ async def verify_payment(
 async def settle_payment(
     request: PaymentRequest,
     x_payment: Optional[str] = Header(None, alias="X-PAYMENT"),
+    payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"),
 ):
     """Mock payment settlement."""
     logger.info(f"Settle request: {request.dict()}")
 
     # Check for paymentHeader in request body (sent by proxy)
-    payment_header = getattr(request, "paymentHeader", None) or x_payment
+    payment_header = getattr(request, "paymentHeader", None) or x_payment or payment_signature
     if not payment_header and hasattr(request, "__dict__") and "paymentHeader" in request.__dict__:
         payment_header = request.__dict__["paymentHeader"]
 
     payload = request.paymentPayload
     requirements = request.paymentRequirements
+
+    if str(requirements.get("network", "")).startswith("xrpl"):
+        return SettleResponse(
+            success=True,
+            payer=payload.get("payer", "rBuyer"),
+            transaction="XRPL_MOCK_TX",
+            network=requirements.get("network", "xrpl:1"),
+        )
 
     # Mock settlement - always successful for testing
     accept = requirements.get("accepts", [{}])[0]

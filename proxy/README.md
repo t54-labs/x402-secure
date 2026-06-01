@@ -151,8 +151,17 @@ Required APIs (read by the proxy):
 ## Testing
 
 ```bash
-cd sdk/secure_x402
-pytest
+uv run pytest
+./scripts/test_docker.sh
+```
+
+Live XRPL testnet smoke tests are opt-in because they spend testnet XRP:
+
+```bash
+XRPL_LIVE_SMOKE=1 \
+XRPL_TESTNET_SEED=... \
+XRPL_TESTNET_PAY_TO=... \
+uv run pytest tests/test_xrpl_live_smoke.py -q -s
 ```
 
 ## License

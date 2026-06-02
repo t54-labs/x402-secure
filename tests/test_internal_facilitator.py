@@ -60,7 +60,26 @@ def _evaluate_payload(*, amount: Any = "10.00") -> Dict[str, Any]:
                 },
                 "trace": {
                     "riskSession": "risk_sess_1",
+                    "traceRef": "tl://evidence/trace_123",
+                    "traceHash": "sha256:trace_hash",
                     "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                    "currentTask": "staging_xrpl_verifiable_intent_payment",
+                    "userInstruction": "Buy the merchant dataset if it costs no more than 20 XRP.",
+                    "reasoningProcess": "The agent checked that the XRPL payment matches the VI constraints.",
+                    "promptTrace": [
+                        {"role": "user", "content": "Pay the merchant dataset only if it is within the VI limit."},
+                        {"role": "assistant", "content": "I will bind the payment to the Verifiable Intent."},
+                        {"role": "toolCall", "content": "build_verifiable_intent(chain=xrpl, asset=XRP)"},
+                        {"role": "toolResult", "content": "VI presentation created."},
+                    ],
+                    "toolCalls": [
+                        {
+                            "name": "build_verifiable_intent",
+                            "arguments": {"chain": "xrpl", "asset": "XRP"},
+                            "result": "holder_bound_presentation_created",
+                        }
+                    ],
+                    "finalDecision": "Proceed only if X402 Secure allows the VI-bound payment.",
                 },
             }
         },
@@ -149,6 +168,20 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
     assert payload["paymentContext"]["destination"] == "rMerchantDestination"
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
     assert payload["binding"]["paymentBound"] is True
+    assert payload["traceContext"]["traceRef"] == "tl://evidence/trace_123"
+    assert payload["traceContext"]["traceHash"] == "sha256:trace_hash"
+    assert payload["traceContext"]["currentTask"] == "staging_xrpl_verifiable_intent_payment"
+    assert payload["traceContext"]["current_task"] == "staging_xrpl_verifiable_intent_payment"
+    assert payload["traceContext"]["userInstruction"].startswith("Buy the merchant dataset")
+    assert payload["traceContext"]["user_instruction"].startswith("Buy the merchant dataset")
+    assert payload["traceContext"]["reasoningProcess"].startswith("The agent checked")
+    assert payload["traceContext"]["reasoning_process"].startswith("The agent checked")
+    assert payload["traceContext"]["promptTrace"][2]["role"] == "toolCall"
+    assert payload["traceContext"]["prompt_trace"][2]["role"] == "toolCall"
+    assert payload["traceContext"]["toolCalls"][0]["name"] == "build_verifiable_intent"
+    assert payload["traceContext"]["tool_calls"][0]["name"] == "build_verifiable_intent"
+    assert payload["traceContext"]["finalDecision"].startswith("Proceed only")
+    assert payload["traceContext"]["final_decision"].startswith("Proceed only")
 
 
 def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:

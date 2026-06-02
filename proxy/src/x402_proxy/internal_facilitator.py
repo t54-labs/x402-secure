@@ -75,8 +75,15 @@ class TraceReferenceSet(BaseModel):
     risk_session: Optional[str] = Field(default=None, alias="riskSession")
     trace_id: Optional[str] = Field(default=None, alias="traceId")
     trace_ref: Optional[str] = Field(default=None, alias="traceRef")
+    trace_hash: Optional[str] = Field(default=None, alias="traceHash")
     traceparent: Optional[str] = None
     tracestate: Optional[str] = None
+    current_task: Optional[str] = Field(default=None, alias="currentTask")
+    user_instruction: Optional[str] = Field(default=None, alias="userInstruction")
+    reasoning_process: Optional[str] = Field(default=None, alias="reasoningProcess")
+    prompt_trace: List[Dict[str, Any]] = Field(default_factory=list, alias="promptTrace")
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list, alias="toolCalls")
+    final_decision: Optional[str] = Field(default=None, alias="finalDecision")
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -401,6 +408,28 @@ def _extract_extension(extensions: Dict[str, Any]) -> X402SecureExtension:
     return X402SecureExtension(**raw)
 
 
+def _trace_context_payload(trace: Optional[TraceReferenceSet]) -> Dict[str, Any]:
+    if not trace:
+        return {}
+    context = trace.model_dump(by_alias=True, exclude_none=True)
+    aliases = {
+        "riskSession": "risk_session",
+        "traceId": "trace_id",
+        "traceRef": "trace_ref",
+        "traceHash": "trace_hash",
+        "currentTask": "current_task",
+        "userInstruction": "user_instruction",
+        "reasoningProcess": "reasoning_process",
+        "promptTrace": "prompt_trace",
+        "toolCalls": "tool_calls",
+        "finalDecision": "final_decision",
+    }
+    for alias, field_name in aliases.items():
+        if alias in context and field_name not in context:
+            context[field_name] = context[alias]
+    return context
+
+
 def _trustline_base_url() -> str:
     return (
         os.getenv("TRUSTLINE_API_URL")
@@ -451,9 +480,7 @@ def build_trustline_assessment_payload(
         request.merchant.get("origin"),
         request.merchant.get("url"),
     )
-    trace_context = (
-        extension.trace.model_dump(by_alias=True, exclude_none=True) if extension.trace else {}
-    )
+    trace_context = _trace_context_payload(extension.trace)
     if request.metadata.get("traceparent") and "traceparent" not in trace_context:
         trace_context["traceparent"] = request.metadata["traceparent"]
 

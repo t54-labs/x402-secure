@@ -585,7 +585,11 @@ async def evaluate_facilitator_payment(
         decision,
         trustline_response.get("decision"),
     )
-    decision_id = trustline_response.get("decision_id") or f"xs_dec_{uuid.uuid4().hex}"
+    decision_id = (
+        trustline_response.get("decision_id")
+        or trustline_response.get("decisionId")
+        or f"xs_dec_{uuid.uuid4().hex}"
+    )
     return {
         "decision": decision,
         "decision_id": decision_id,

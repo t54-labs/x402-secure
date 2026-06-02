@@ -1446,57 +1446,56 @@ async def proxy_settle(
 
         vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
         if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
-            if not settle_vi_decision_id:
-                sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
-                if not x_payment_secure:
-                    raise HeaderError("X-PAYMENT-SECURE required")
-                tc = parse_x_payment_secure(x_payment_secure)
-                mandate = parse_x_ap2_evidence(x_ap2_evidence) if x_ap2_evidence else None
-                trace_context = {
-                    "traceparent": tc["tp"],
-                    **({"tracestate": tc["ts"]} if "ts" in tc else {}),
-                    **({"riskTrace": tid} if tid else {}),
-                    "riskSession": sid,
-                }
-                vi_payload = build_public_vi_assessment_payload(
-                    body,
-                    request,
-                    vi_header=x_verifiable_intent,
-                    trace_context=trace_context,
-                    ap2_context=_ap2_context_from_mandate_header(mandate),
-                    risk_session=sid,
-                    risk_trace=tid,
-                    origin=origin,
+            sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
+            if not x_payment_secure:
+                raise HeaderError("X-PAYMENT-SECURE required")
+            tc = parse_x_payment_secure(x_payment_secure)
+            mandate = parse_x_ap2_evidence(x_ap2_evidence) if x_ap2_evidence else None
+            trace_context = {
+                "traceparent": tc["tp"],
+                **({"tracestate": tc["ts"]} if "ts" in tc else {}),
+                **({"riskTrace": tid} if tid else {}),
+                "riskSession": sid,
+            }
+            vi_payload = build_public_vi_assessment_payload(
+                body,
+                request,
+                vi_header=x_verifiable_intent,
+                trace_context=trace_context,
+                ap2_context=_ap2_context_from_mandate_header(mandate),
+                risk_session=sid,
+                risk_trace=tid,
+                origin=origin,
+            )
+            vi_assessment = await assess_public_verifiable_intent(vi_payload)
+            vi_decision = vi_assessment["decision"]
+            settle_vi_decision_id = vi_assessment["decision_id"]
+            vi_details = vi_assessment.get("vi") or {}
+            settle_vi_evidence_ref = (
+                settle_vi_evidence_ref
+                or vi_details.get("evidence_ref")
+                or vi_details.get("evidenceRef")
+            )
+            if response is not None:
+                response.headers["X-VI-Decision"] = vi_decision
+                response.headers["X-Risk-Decision"] = vi_decision
+                response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
+                response.headers["X-Risk-Decision-ID"] = settle_vi_decision_id
+                if "verified" in vi_details:
+                    response.headers["X-VI-Verified"] = str(
+                        bool(vi_details["verified"])
+                    ).lower()
+                if settle_vi_evidence_ref:
+                    response.headers["X-VI-Evidence-Ref"] = str(settle_vi_evidence_ref)
+            if vi_decision == "deny":
+                msg = "VI denied" + (
+                    f": {', '.join(vi_assessment['reasons'])}"
+                    if vi_assessment.get("reasons")
+                    else ""
                 )
-                vi_assessment = await assess_public_verifiable_intent(vi_payload)
-                vi_decision = vi_assessment["decision"]
-                settle_vi_decision_id = vi_assessment["decision_id"]
-                vi_details = vi_assessment.get("vi") or {}
-                settle_vi_evidence_ref = (
-                    settle_vi_evidence_ref
-                    or vi_details.get("evidence_ref")
-                    or vi_details.get("evidenceRef")
-                )
-                if response is not None:
-                    response.headers["X-VI-Decision"] = vi_decision
-                    response.headers["X-Risk-Decision"] = vi_decision
-                    response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
-                    response.headers["X-Risk-Decision-ID"] = settle_vi_decision_id
-                    if "verified" in vi_details:
-                        response.headers["X-VI-Verified"] = str(
-                            bool(vi_details["verified"])
-                        ).lower()
-                    if settle_vi_evidence_ref:
-                        response.headers["X-VI-Evidence-Ref"] = str(settle_vi_evidence_ref)
-                if vi_decision == "deny":
-                    msg = "VI denied" + (
-                        f": {', '.join(vi_assessment['reasons'])}"
-                        if vi_assessment.get("reasons")
-                        else ""
-                    )
-                    raise HTTPException(status_code=403, detail=msg)
-                if vi_decision == "review":
-                    raise HTTPException(status_code=403, detail="VI review required")
+                raise HTTPException(status_code=403, detail=msg)
+            if vi_decision == "review":
+                raise HTTPException(status_code=403, detail="VI review required")
     except HTTPException as e:
         return _error_response(e, req_id)
     except HeaderError as e:

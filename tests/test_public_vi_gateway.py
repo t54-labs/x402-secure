@@ -548,3 +548,45 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
         "verifiable-intent-receipt",
     ]
     assert calls[1][1]["decisionId"] == "vi_dec_settle"
+
+
+def test_proxy_settle_decision_header_does_not_bypass_required_vi_assessment(
+    monkeypatch,
+) -> None:
+    client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+    calls = []
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append((path, payload))
+        if path == "assess-verifiable-intent":
+            return {
+                "decision": "deny",
+                "decision_id": "vi_dec_denied",
+                "reasons": ["policy denied"],
+                "vi": {"verified": False, "evidence_ref": "tl_evd_denied"},
+                "binding": payload["binding"],
+            }
+        raise AssertionError("receipt should not be recorded after denied VI assessment")
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/settle",
+        json=_body_json(
+            _body(
+                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+                verifiableIntent={"presentationRef": "tl://evidence/body"},
+            )
+        ),
+        headers={
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
+            "X-VI-DECISION-ID": "client_supplied_decision",
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "VI_DENIED"
+    assert [path for path, _payload in calls] == ["assess-verifiable-intent"]

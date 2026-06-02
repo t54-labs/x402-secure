@@ -212,6 +212,29 @@ def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None
     assert captured["payload"]["binding"]["amount"] == "2.5"
 
 
+def test_internal_evaluate_accepts_camelcase_trustline_decision_id(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "decision": "allow",
+            "decisionId": "dec_camel",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["decision_id"] == "dec_camel"
+
+
 def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch) -> None:
     client = _client(monkeypatch)
     body = _evaluate_payload()

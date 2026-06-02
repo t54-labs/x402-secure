@@ -219,6 +219,10 @@ class TestSellerClient:
 
     async def test_verify_then_settle_carries_vi_decision_headers(self, seller_client):
         """Test VI decision headers from verify are passed to settle."""
+        seller_client.last_vi_headers = {
+            "X-VI-DECISION-ID": "stale_decision",
+            "X-VI-EVIDENCE-REF": "stale_evidence",
+        }
         with patch.object(seller_client.http, "post") as mock_post:
             verify_response = Mock()
             verify_response.json.return_value = {"isValid": True, "payer": "0x" + "b" * 40}

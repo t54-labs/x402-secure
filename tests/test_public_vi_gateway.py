@@ -185,6 +185,8 @@ def test_build_public_payment_context_hashes_payload_and_requirements() -> None:
     context = build_public_payment_context(_body(), _request(), "https://merchant.example")
 
     assert context["chain"] == "base-sepolia"
+    assert context["protocol"] == "x402"
+    assert context["scheme"] == "exact"
     assert context["amount"] == "1000000"
     assert context["destination"] == "0x" + ("c" * 40)
     assert context["payer"] == "0x" + ("b" * 40)
@@ -282,6 +284,34 @@ def test_proxy_verify_fails_fast_when_required_vi_missing(monkeypatch) -> None:
         "/x402/verify",
         json=_body_json(
             _body(extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}})
+        ),
+        headers={
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VI_EVIDENCE_MISSING"
+
+
+def test_proxy_verify_fails_fast_when_required_vi_has_claims_only(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise AssertionError("Trustline should not be called when VI evidence is claims-only")
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/verify",
+        json=_body_json(
+            _body(
+                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+                verifiableIntent={"claims": {"purpose": "market-data"}},
+            )
         ),
         headers={
             "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",

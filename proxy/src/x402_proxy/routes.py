@@ -753,7 +753,8 @@ def build_public_payment_context(
     payer = _extract_payer_from_payment_payload(payment_payload)
 
     return {
-        "protocol": _first_non_empty(payment_payload.get("scheme"), "x402"),
+        "protocol": "x402",
+        "scheme": payment_payload.get("scheme"),
         "chain": body.paymentRequirements.network,
         "network": body.paymentRequirements.network,
         "asset": body.paymentRequirements.asset,
@@ -869,6 +870,25 @@ def _has_ap2_payment_mandate(ap2_context: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def _has_verifiable_intent_evidence(verifiable_intent: Any) -> bool:
+    if not isinstance(verifiable_intent, dict) or not verifiable_intent:
+        return False
+    for key in (
+        "presentation",
+        "presentationRef",
+        "presentationHash",
+        "evidenceRef",
+        "evidenceHash",
+        "credentialId",
+    ):
+        if verifiable_intent.get(key):
+            return True
+    layers = verifiable_intent.get("layers")
+    if isinstance(layers, list):
+        return any(_has_verifiable_intent_evidence(layer) for layer in layers)
+    return False
+
+
 def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
     policy = InternalPolicy(**(payload.get("policy") or {}))
     verifiable_intent = payload.get("verifiableIntent")
@@ -883,7 +903,7 @@ def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
             bool(policy.accepted_issuers),
         ]
     )
-    if vi_required and not verifiable_intent:
+    if vi_required and not _has_verifiable_intent_evidence(verifiable_intent):
         raise HTTPException(status_code=422, detail="Verifiable Intent required")
     if policy.require_payment_mandate and not _has_ap2_payment_mandate(ap2_context):
         raise HTTPException(status_code=422, detail="AP2 payment mandate required")
@@ -1306,7 +1326,7 @@ async def proxy_settle(
     try:
         if cfg.settle_risk_enabled:
             # Full risk path (unchanged): require trace headers and call Risk Engine.
-            sid, tid = parse_risk_ids(x_risk_session, None)
+            sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
             if not x_payment_secure:
                 raise HeaderError("X-PAYMENT-SECURE required")
             tc = parse_x_payment_secure(x_payment_secure)

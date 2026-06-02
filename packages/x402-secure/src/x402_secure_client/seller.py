@@ -24,7 +24,18 @@ class SellerClient:
         self.http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
         self.last_vi_headers: Dict[str, str] = {}
 
-    async def verify(
+    @staticmethod
+    def _vi_headers_from_response(response: httpx.Response) -> Dict[str, str]:
+        return {
+            key: value
+            for key, value in {
+                "X-VI-DECISION-ID": response.headers.get("X-VI-DECISION-ID"),
+                "X-VI-EVIDENCE-REF": response.headers.get("X-VI-EVIDENCE-REF"),
+            }.items()
+            if value
+        }
+
+    async def _verify_with_vi_headers(
         self,
         payment_payload: Dict[str, Any],
         payment_requirements: Dict[str, Any],
@@ -39,7 +50,7 @@ class SellerClient:
         ap2_context: Optional[Dict[str, Any]] = None,
         vi_policy: Optional[Dict[str, Any]] = None,
         risk_trace: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any], Dict[str, str]]:
         headers = {
             "X-PAYMENT": x_payment_b64,
             "Origin": origin,
@@ -73,15 +84,41 @@ class SellerClient:
             0
         ].strip().lower() != "application/json":
             raise httpx.HTTPError("invalid content-type from /x402/verify")
-        self.last_vi_headers = {
-            key: value
-            for key, value in {
-                "X-VI-DECISION-ID": r.headers.get("X-VI-DECISION-ID"),
-                "X-VI-EVIDENCE-REF": r.headers.get("X-VI-EVIDENCE-REF"),
-            }.items()
-            if value
-        }
-        return r.json()
+        vi_headers = self._vi_headers_from_response(r)
+        self.last_vi_headers = vi_headers
+        return r.json(), vi_headers
+
+    async def verify(
+        self,
+        payment_payload: Dict[str, Any],
+        payment_requirements: Dict[str, Any],
+        *,
+        x_payment_b64: str,
+        origin: str,
+        x_payment_secure: str,
+        risk_sid: str,
+        x_ap2_evd: Optional[str] = None,
+        x_verifiable_intent: Optional[str] = None,
+        verifiable_intent: Optional[Dict[str, Any]] = None,
+        ap2_context: Optional[Dict[str, Any]] = None,
+        vi_policy: Optional[Dict[str, Any]] = None,
+        risk_trace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result, _vi_headers = await self._verify_with_vi_headers(
+            payment_payload,
+            payment_requirements,
+            x_payment_b64=x_payment_b64,
+            origin=origin,
+            x_payment_secure=x_payment_secure,
+            risk_sid=risk_sid,
+            x_ap2_evd=x_ap2_evd,
+            x_verifiable_intent=x_verifiable_intent,
+            verifiable_intent=verifiable_intent,
+            ap2_context=ap2_context,
+            vi_policy=vi_policy,
+            risk_trace=risk_trace,
+        )
+        return result
 
     async def settle(
         self,
@@ -171,7 +208,7 @@ class SellerClient:
         settlement_attempt_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        v = await self.verify(
+        v, vi_headers = await self._verify_with_vi_headers(
             payment_payload,
             payment_requirements,
             x_payment_b64=x_payment_b64,
@@ -200,7 +237,8 @@ class SellerClient:
             ap2_context=ap2_context,
             vi_policy=vi_policy,
             risk_trace=risk_trace,
-            use_last_vi_headers=True,
+            vi_decision_id=vi_headers.get("X-VI-DECISION-ID"),
+            vi_evidence_ref=vi_headers.get("X-VI-EVIDENCE-REF"),
             settlement_attempt_id=settlement_attempt_id,
             idempotency_key=idempotency_key,
         )

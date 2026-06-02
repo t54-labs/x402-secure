@@ -23,6 +23,7 @@ COPY packages/x402-secure/pyproject.toml packages/x402-secure/README.md packages
 # Create virtual environment and install dependencies
 RUN uv venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONPATH="/app/proxy/src:/app/packages/x402-secure/src"
 RUN uv pip install --no-cache -e .
 RUN uv pip install --no-cache -e ./proxy
 RUN uv pip install --no-cache -e ./packages/x402-secure

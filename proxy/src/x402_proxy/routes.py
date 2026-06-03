@@ -999,6 +999,7 @@ def build_public_vi_receipt_payload(
         or settle_response.get("txHash")
         or settle_response.get("transactionHash")
     )
+    settlement_status = "success" if settle_response.get("success") else "failed"
     return {
         "decisionId": decision_id,
         "evidenceRef": evidence_ref,
@@ -1006,7 +1007,8 @@ def build_public_vi_receipt_payload(
         "idempotencyKey": idempotency_key or settlement_id,
         "payment": {
             **payment_context,
-            "settlementStatus": "success" if settle_response.get("success") else "failed",
+            "status": settlement_status,
+            "settlementStatus": settlement_status,
             "transaction": transaction,
             "network": settle_response.get("network") or payment_context.get("network"),
             "errorReason": settle_response.get("errorReason") or settle_response.get("error"),
@@ -1591,6 +1593,15 @@ async def proxy_settle(
                     response.headers["X-VI-Receipt-ID"] = str(receipt_id)
         except HTTPException as e:
             logger.warning("[%s] [PROXY] VI receipt post failed: %s", req_id, e.detail)
+            if response is not None:
+                response.headers["X-VI-Receipt-Status"] = "failed"
+        except Exception as e:
+            logger.warning(
+                "[%s] [PROXY] VI receipt post failed: %s",
+                req_id,
+                e,
+                exc_info=True,
+            )
             if response is not None:
                 response.headers["X-VI-Receipt-Status"] = "failed"
     return SettleResponse(

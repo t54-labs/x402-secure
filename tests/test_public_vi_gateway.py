@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -497,6 +498,45 @@ def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
     assert calls == ["assess-verifiable-intent", "verifiable-intent-receipt"]
 
 
+def test_proxy_settle_receipt_network_failure_is_non_blocking(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+    calls = []
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append(path)
+        if path == "assess-verifiable-intent":
+            return {
+                "decision": "allow",
+                "decision_id": "vi_dec_1",
+                "vi": {"verified": True, "evidence_ref": "tl_evd_1"},
+                "binding": payload["binding"],
+            }
+        raise httpx.ConnectError("Trustline connection failed")
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/settle",
+        json=_body_json(
+            _body(
+                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+                verifiableIntent={"presentationRef": "tl://evidence/body"},
+            )
+        ),
+        headers={
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-vi-receipt-status"] == "failed"
+    assert response.json()["success"] is True
+    assert calls == ["assess-verifiable-intent", "verifiable-intent-receipt"]
+
+
 def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
     monkeypatch,
 ) -> None:
@@ -532,6 +572,7 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
         headers={
             "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
             "X-RISK-SESSION": sid,
+            "X-VI-EVIDENCE-REF": "client_supplied_evidence",
             "Origin": "https://merchant.example",
         },
     )
@@ -547,6 +588,9 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
         "verifiable-intent-receipt",
     ]
     assert calls[1][1]["decisionId"] == "vi_dec_settle"
+    assert calls[1][1]["evidenceRef"] == "tl_evd_settle"
+    assert calls[1][1]["payment"]["status"] == "success"
+    assert calls[1][1]["payment"]["settlementStatus"] == "success"
 
 
 def test_proxy_settle_decision_header_does_not_bypass_required_vi_assessment(

@@ -64,12 +64,27 @@ def _evaluate_payload(*, amount: Any = "10.00") -> Dict[str, Any]:
                     "traceHash": "sha256:trace_hash",
                     "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
                     "currentTask": "staging_xrpl_verifiable_intent_payment",
-                    "userInstruction": "Buy the merchant dataset if it costs no more than 20 XRP.",
-                    "reasoningProcess": "The agent checked that the XRPL payment matches the VI constraints.",
+                    "userInstruction": (
+                        "Buy the merchant dataset if it costs no more than 20 XRP."
+                    ),
+                    "reasoningProcess": (
+                        "The agent checked that the XRPL payment matches the VI constraints."
+                    ),
                     "promptTrace": [
-                        {"role": "user", "content": "Pay the merchant dataset only if it is within the VI limit."},
-                        {"role": "assistant", "content": "I will bind the payment to the Verifiable Intent."},
-                        {"role": "toolCall", "content": "build_verifiable_intent(chain=xrpl, asset=XRP)"},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Pay the merchant dataset only if it is within the VI limit."
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "I will bind the payment to the Verifiable Intent.",
+                        },
+                        {
+                            "role": "toolCall",
+                            "content": "build_verifiable_intent(chain=xrpl, asset=XRP)",
+                        },
                         {"role": "toolResult", "content": "VI presentation created."},
                     ],
                     "toolCalls": [
@@ -212,6 +227,43 @@ def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None
     assert captured["payload"]["binding"]["amount"] == "2.5"
 
 
+def test_internal_evaluate_extracts_xrpl_issued_currency_amount(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload(amount=None)
+    body["payment"].pop("asset")
+    body["payment"]["payload"]["Amount"] = {
+        "currency": "USD",
+        "issuer": "rIssuerAccount",
+        "value": "12.50",
+    }
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_issued",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["paymentContext"]["amount"] == "12.5"
+    assert captured["payload"]["paymentContext"]["asset"] == "USD"
+    assert captured["payload"]["paymentContext"]["issuer"] == "rIssuerAccount"
+    assert captured["payload"]["binding"]["asset"] == "USD"
+    assert captured["payload"]["binding"]["issuer"] == "rIssuerAccount"
+    assert captured["payload"]["binding"]["violations"] == []
+
+
 def test_internal_evaluate_accepts_camelcase_trustline_decision_id(monkeypatch) -> None:
     client = _client(monkeypatch)
 
@@ -260,7 +312,10 @@ def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch)
 
     assert response.status_code == 200
     assert captured["payload"]["paymentContext"]["payloadHash"] == "sha256:facilitator_payload_hash"
-    assert captured["payload"]["binding"]["hashes"]["paymentPayloadHash"] == "sha256:facilitator_payload_hash"
+    assert (
+        captured["payload"]["binding"]["hashes"]["paymentPayloadHash"]
+        == "sha256:facilitator_payload_hash"
+    )
 
 
 def test_internal_evaluate_blocks_review_when_policy_says_block(monkeypatch) -> None:

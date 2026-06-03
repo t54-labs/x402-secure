@@ -7,6 +7,14 @@ from typing import Any, Dict, Optional
 import httpx
 
 
+def _is_evm_address(value: str) -> bool:
+    return (
+        value.startswith("0x")
+        and len(value) == 42
+        and all(char in "0123456789abcdefABCDEF" for char in value[2:])
+    )
+
+
 class RiskClient:
     def __init__(self, base_url: str):
         if not base_url:
@@ -39,8 +47,10 @@ class RiskClient:
         Returns:
             Dict containing 'sid' (session ID) and other session metadata
         """
-        if wallet_address is None:
+        if wallet_address is None and _is_evm_address(agent_did):
             wallet_address = agent_did
+        if wallet_address is None:
+            raise ValueError("wallet_address required when agent_did is not an EVM address")
         payload = {
             "agent_did": agent_did,
             "wallet_address": wallet_address,

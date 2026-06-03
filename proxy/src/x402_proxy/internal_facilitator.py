@@ -289,9 +289,16 @@ def _add_violation(
 
 def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult:
     payload = payment.payload or {}
+    amount_object = payload.get("Amount") if isinstance(payload.get("Amount"), dict) else {}
     amount = _decimal_string(payment.amount) or _xrpl_amount_from_payload(payment)
-    asset = _first_present(payment.asset, payment.currency, payload.get("currency"), "XRP")
-    issuer = _first_present(payment.issuer, payload.get("issuer"))
+    asset = _first_present(
+        payment.asset,
+        payment.currency,
+        amount_object.get("currency"),
+        payload.get("currency"),
+        "XRP",
+    )
+    issuer = _first_present(payment.issuer, amount_object.get("issuer"), payload.get("issuer"))
     destination = _first_present(payment.destination, payment.pay_to, payload.get("Destination"))
     resource = _first_present(payment.resource, payment.merchant_origin)
     hashes = {

@@ -37,8 +37,7 @@ class TestHeaderHelpers:
 
         assert headers == {
             "X-AP2-EVIDENCE": (
-                "evd.v1;mr=tl://mandate/payment_1;ms=abc123;"
-                "mt=application/json;sz=42"
+                "evd.v1;mr=tl://mandate/payment_1;ms=abc123;mt=application/json;sz=42"
             )
         }
 
@@ -137,6 +136,28 @@ class TestRiskClient:
 
             assert session["sid"] == "925ca6ee-aa4b-4508-955b-10b1c02c69bb"
             mock_post.assert_called_once()
+
+    async def test_create_session_requires_wallet_for_non_evm_agent_did(self, risk_client):
+        """Test DID-style agent ids do not get sent as wallet addresses."""
+        with pytest.raises(ValueError, match="wallet_address required"):
+            await risk_client.create_session(
+                agent_did="did:eip8004:1:0xabc:123",
+                app_id="test-app",
+            )
+
+    async def test_create_session_defaults_wallet_when_agent_did_is_evm_address(self, risk_client):
+        """Test wallet default is kept only for EVM-address agent ids."""
+        with patch.object(risk_client.http, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = {"sid": "925ca6ee-aa4b-4508-955b-10b1c02c69bb"}
+            mock_response.raise_for_status = Mock()
+            mock_response.headers = {"content-type": "application/json"}
+            mock_post.return_value = mock_response
+
+            await risk_client.create_session(agent_did="0x" + "b" * 40)
+
+            payload = mock_post.call_args.kwargs["json"]
+            assert payload["wallet_address"] == "0x" + "b" * 40
 
     async def test_create_trace(self, risk_client):
         """Test submitting agent trace."""

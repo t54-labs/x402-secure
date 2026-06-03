@@ -27,10 +27,12 @@ RUN uv pip install --no-cache -e .
 RUN uv pip install --no-cache -e ./proxy
 RUN uv pip install --no-cache -e ./packages/x402-secure
 
-# Copy source code
+# Copy source code and refresh editable installs so src-layout packages are present.
 COPY proxy/src/ proxy/src/
 COPY packages/x402-secure/src/ packages/x402-secure/src/
 COPY run_facilitator_proxy.py .
+RUN uv pip install --no-cache -e ./proxy
+RUN uv pip install --no-cache -e ./packages/x402-secure
 
 # Runtime stage
 FROM python:3.11-slim
@@ -48,6 +50,7 @@ WORKDIR /app
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONPATH="/app/proxy/src:/app/packages/x402-secure/src"
 
 # Copy application from builder
 COPY --from=builder /build /app

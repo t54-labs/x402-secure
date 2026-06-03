@@ -18,14 +18,16 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .headers import (
     HeaderError,
     parse_risk_ids,
     parse_x_ap2_evidence,
     parse_x_payment_secure,
+    parse_x_verifiable_intent,
 )
+from .internal_facilitator import InternalPolicy, post_trustline_validation
 from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps
@@ -146,11 +148,37 @@ def _network_to_chain_id(network: str) -> int:
 
 
 class ProxyVerifyRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
     x402Version: int = Field(1, description="x402 API version")
     paymentPayload: PaymentPayload
     paymentRequirements: PaymentRequirements
     ap2EvidenceHeader: Optional[str] = Field(
         None, description="base64(JSON Evidence) if not in header"
+    )
+    verifiable_intent: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="verifiableIntent",
+        description="Inline Verifiable Intent evidence or reference metadata.",
+    )
+    ap2_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="ap2Context",
+        description="AP2 mandate references or inline mandate context.",
+    )
+    trace_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="traceContext",
+        description="Agent trace context supplied by SDKs or facilitators.",
+    )
+    vi_policy: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="viPolicy",
+        description="Per-request Verifiable Intent policy overrides.",
+    )
+    policy: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Generic policy object accepted for facilitator compatibility.",
     )
 
 
@@ -572,6 +600,13 @@ def _error_code_from_message(msg: str) -> str:
         # Risk outcome gating
         "risk denied": "RISK_DENIED",
         "risk review": "RISK_REVIEW",
+        "vi denied": "VI_DENIED",
+        "vi review required": "VI_REVIEW_REQUIRED",
+        "unsupported x-verifiable-intent version": "VI_HEADER_UNSUPPORTED",
+        "x-verifiable-intent": "VI_HEADER_INVALID",
+        "verifiable intent required": "VI_EVIDENCE_MISSING",
+        "ap2 payment mandate required": "AP2_PAYMENT_MANDATE_MISSING",
+        "trace context required": "TRACE_CONTEXT_MISSING",
     }
     for k, v in mapping.items():
         if k in m:
@@ -592,6 +627,557 @@ def _risk_engine_url() -> str:
     return os.getenv("RISK_ENGINE_URL", "http://localhost:8001")
 
 
+def _fingerprint_json(value: Any) -> str:
+    canonical = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _payment_payload_dict(body: ProxyVerifyRequest, request: Request) -> Dict[str, Any]:
+    x_payment = request.headers.get("X-PAYMENT")
+    if x_payment:
+        try:
+            decoded = json.loads(safe_base64_decode(x_payment))
+            if isinstance(decoded, dict):
+                return decoded
+        except Exception:
+            pass
+    return body.paymentPayload.model_dump(by_alias=True, exclude_none=True)
+
+
+def _payment_requirements_dict(
+    payment_requirements: PaymentRequirements,
+) -> Dict[str, Any]:
+    return payment_requirements.model_dump(by_alias=True, exclude_none=True)
+
+
+def _merchant_id_from_origin(origin: Optional[str], resource: Optional[str]) -> Optional[str]:
+    source = origin or resource
+    if not source:
+        return None
+    parsed = urlparse(source)
+    host = parsed.netloc or parsed.path
+    if not host:
+        return None
+    return f"did:web:{host.split(':', 1)[0].lower()}"
+
+
+_VI_POLICY_ALIASES = {
+    "require_verifiable_intent": "requireVerifiableIntent",
+    "require_verified_intent": "requireVerifiedIntent",
+    "require_payment_mandate": "requirePaymentMandate",
+    "require_holder_binding": "requireHolderBinding",
+    "require_trace": "requireTrace",
+    "accepted_issuers": "acceptedIssuers",
+    "review_mode": "reviewMode",
+}
+_VI_POLICY_BOOL_KEYS = {
+    "requireVerifiableIntent",
+    "requireVerifiedIntent",
+    "requirePaymentMandate",
+    "requireHolderBinding",
+    "requireTrace",
+}
+_VI_POLICY_REVIEW_RANK = {"allow": 0, "review": 1, "block": 2}
+
+
+def _canonical_vi_policy_key(key: str) -> str:
+    return _VI_POLICY_ALIASES.get(key, key)
+
+
+def _coerce_policy_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _normalize_policy_issuers(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return []
+
+
+def _merge_vi_policy_source(
+    policy_data: Dict[str, Any],
+    candidate: Optional[Dict[str, Any]],
+    *,
+    tightening_only: bool,
+) -> None:
+    if not isinstance(candidate, dict):
+        return
+
+    for raw_key, value in candidate.items():
+        key = _canonical_vi_policy_key(str(raw_key))
+        if not tightening_only:
+            policy_data[key] = value
+            continue
+
+        if key in _VI_POLICY_BOOL_KEYS:
+            incoming = _coerce_policy_bool(value)
+            existing = _coerce_policy_bool(policy_data.get(key, False))
+            if incoming is None or existing is None:
+                policy_data[key] = value
+            else:
+                policy_data[key] = existing or incoming
+            continue
+
+        if key == "reviewMode":
+            current = policy_data.get(key)
+            incoming = str(value).strip().lower()
+            if incoming not in _VI_POLICY_REVIEW_RANK:
+                policy_data[key] = value
+            elif current is None:
+                policy_data[key] = incoming
+            else:
+                current_normalized = str(current).strip().lower()
+                if current_normalized not in _VI_POLICY_REVIEW_RANK:
+                    policy_data[key] = current
+                else:
+                    policy_data[key] = max(
+                        (current_normalized, incoming),
+                        key=lambda item: _VI_POLICY_REVIEW_RANK[item],
+                    )
+            continue
+
+        if key == "acceptedIssuers":
+            existing = _normalize_policy_issuers(policy_data.get(key))
+            incoming = _normalize_policy_issuers(value)
+            if not existing:
+                policy_data[key] = incoming
+            elif incoming and set(incoming).issubset(set(existing)):
+                policy_data[key] = [item for item in existing if item in set(incoming)]
+            else:
+                policy_data[key] = existing
+            continue
+
+        if key not in policy_data:
+            policy_data[key] = value
+
+
+def extract_vi_policy(
+    payment_requirements: PaymentRequirements,
+    *policy_sources: Optional[Dict[str, Any]],
+) -> InternalPolicy:
+    extra = getattr(payment_requirements, "extra", {}) or {}
+    candidates: List[Optional[Dict[str, Any]]] = [
+        extra.get("vi") if isinstance(extra, dict) else None,
+        extra.get("verifiableIntent") if isinstance(extra, dict) else None,
+        (
+            extra.get("x402Secure", {}).get("policy")
+            if isinstance(extra, dict) and isinstance(extra.get("x402Secure"), dict)
+            else None
+        ),
+    ]
+    policy_data: Dict[str, Any] = {}
+    for candidate in candidates:
+        _merge_vi_policy_source(policy_data, candidate, tightening_only=False)
+    for candidate in policy_sources:
+        _merge_vi_policy_source(policy_data, candidate, tightening_only=True)
+    try:
+        return InternalPolicy(**policy_data)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid VI policy: {e}")
+
+
+def extract_verifiable_intent_evidence(
+    header_value: Optional[str],
+    body_value: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    evidence: Dict[str, Any] = {}
+    if header_value:
+        header_ref = parse_x_verifiable_intent(header_value)
+        evidence.update(
+            {
+                "presentationRef": header_ref["ref"],
+                "presentationHash": header_ref["sha256"],
+                "metadata": {
+                    "referenceHeader": {
+                        "mime": header_ref["mt"],
+                        "size": int(header_ref["sz"]),
+                    }
+                },
+            }
+        )
+    if isinstance(body_value, dict):
+        metadata = evidence.get("metadata", {})
+        body_metadata = body_value.get("metadata")
+        if isinstance(body_metadata, dict):
+            metadata = {**metadata, **body_metadata}
+        evidence.update({k: v for k, v in body_value.items() if k != "metadata"})
+        if metadata:
+            evidence["metadata"] = metadata
+    return evidence or None
+
+
+def build_public_payment_context(
+    body: ProxyVerifyRequest,
+    request: Request,
+    origin: Optional[str],
+) -> Dict[str, Any]:
+    payment_payload = _payment_payload_dict(body, request)
+    payment_requirements = _payment_requirements_dict(body.paymentRequirements)
+    auth = payment_payload.get("payload", {}).get("authorization", {})
+    if not isinstance(auth, dict):
+        auth = {}
+
+    amount = _first_non_empty(
+        auth.get("value"),
+        payment_payload.get("value"),
+        body.paymentRequirements.max_amount_required,
+    )
+    destination = _first_non_empty(
+        auth.get("to"),
+        payment_payload.get("to"),
+        body.paymentRequirements.pay_to,
+    )
+    payer = _extract_payer_from_payment_payload(payment_payload)
+
+    return {
+        "protocol": "x402",
+        "scheme": payment_payload.get("scheme"),
+        "chain": body.paymentRequirements.network,
+        "network": body.paymentRequirements.network,
+        "asset": body.paymentRequirements.asset,
+        "amount": str(amount) if amount is not None else None,
+        "currency": payment_requirements.get("extra", {}).get("name")
+        if isinstance(payment_requirements.get("extra"), dict)
+        else None,
+        "destination": destination,
+        "payTo": body.paymentRequirements.pay_to,
+        "resource": body.paymentRequirements.resource,
+        "merchantOrigin": origin,
+        "payer": payer,
+        "paymentHash": _fingerprint_json(payment_payload),
+        "payloadHash": _fingerprint_json(payment_payload),
+        "paymentRequirementsHash": _fingerprint_json(payment_requirements),
+        "payload": payment_payload,
+        "paymentRequirements": payment_requirements,
+    }
+
+
+def build_public_binding(payment_context: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "paymentBound": True,
+        "chain": payment_context.get("chain") or payment_context.get("network"),
+        "asset": payment_context.get("asset"),
+        "amount": payment_context.get("amount"),
+        "destination": payment_context.get("destination") or payment_context.get("payTo"),
+        "resource": payment_context.get("resource"),
+        "violations": [],
+        "hashes": {
+            "paymentHash": payment_context.get("paymentHash"),
+            "paymentPayloadHash": payment_context.get("payloadHash"),
+            "paymentRequirementsHash": payment_context.get("paymentRequirementsHash"),
+        },
+    }
+
+
+def build_public_vi_assessment_payload(
+    body: ProxyVerifyRequest,
+    request: Request,
+    *,
+    vi_header: Optional[str],
+    trace_context: Optional[Dict[str, Any]],
+    ap2_context: Optional[Dict[str, Any]] = None,
+    risk_session: Optional[str],
+    risk_trace: Optional[str],
+    origin: Optional[str],
+) -> Dict[str, Any]:
+    policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
+    verifiable_intent = extract_verifiable_intent_evidence(
+        vi_header,
+        body.verifiable_intent,
+    )
+    payment_context = build_public_payment_context(body, request, origin)
+    trace = trace_context or body.trace_context or {}
+    merchant_id = _merchant_id_from_origin(origin, body.paymentRequirements.resource)
+    merged_ap2_context = {**(ap2_context or {}), **(body.ap2_context or {})}
+
+    return {
+        "agentId": payment_context.get("payer"),
+        "walletAddress": payment_context.get("payer"),
+        "merchantId": merchant_id,
+        "policy": policy.model_dump(by_alias=True),
+        "verifiableIntent": verifiable_intent or {},
+        "ap2Context": merged_ap2_context,
+        "traceContext": trace,
+        "paymentContext": payment_context,
+        "binding": build_public_binding(payment_context),
+        "metadata": {
+            "source": "x402_secure_public_gateway",
+            "riskSession": risk_session,
+            "riskTrace": risk_trace,
+            "origin": origin,
+        },
+    }
+
+
+def public_vi_assessment_requested(
+    policy: InternalPolicy,
+    body: ProxyVerifyRequest,
+    vi_header: Optional[str],
+) -> bool:
+    return any(
+        [
+            policy.require_verifiable_intent,
+            policy.require_verified_intent,
+            policy.require_payment_mandate,
+            policy.require_holder_binding,
+            policy.require_trace,
+            bool(policy.accepted_issuers),
+            bool(body.policy),
+            bool(body.vi_policy),
+            bool(body.verifiable_intent),
+            bool(body.ap2_context),
+            bool(vi_header),
+        ]
+    )
+
+
+def _has_ap2_payment_mandate(ap2_context: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(ap2_context, dict):
+        return False
+    return bool(
+        _nested_vi_value(
+            ap2_context,
+            "paymentMandateRef",
+            "paymentMandateId",
+            "payment_mandate_ref",
+            "payment_mandate_id",
+            "paymentMandateHash",
+            "payment_mandate_hash",
+            "paymentUid",
+            "payment_uid",
+            "payment.id",
+            "payment.ref",
+            "payment.hash",
+            "mandates.payment.id",
+            "mandates.payment.ref",
+            "mandates.payment.hash",
+            "normalized.payment_mandate_id",
+            "normalized.paymentMandateId",
+            "normalized.payment_mandate_ref",
+            "normalized.paymentMandateRef",
+            "normalized.payment_mandate_hash",
+            "normalized.paymentMandateHash",
+        )
+    )
+
+
+def _nested_vi_value(mapping: Dict[str, Any], *paths: str) -> Any:
+    for path in paths:
+        current: Any = mapping
+        ok = True
+        for part in path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                ok = False
+                break
+        if ok and current not in (None, ""):
+            return current
+    return None
+
+
+def _has_verifiable_intent_evidence(verifiable_intent: Any) -> bool:
+    if not isinstance(verifiable_intent, dict) or not verifiable_intent:
+        return False
+    for key in (
+        "presentation",
+        "presentationRef",
+        "presentationHash",
+        "evidenceRef",
+        "evidenceHash",
+        "credentialId",
+    ):
+        if verifiable_intent.get(key):
+            return True
+    layers = verifiable_intent.get("layers")
+    if isinstance(layers, list):
+        return any(_has_verifiable_intent_evidence(layer) for layer in layers)
+    return False
+
+
+def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
+    policy = InternalPolicy(**(payload.get("policy") or {}))
+    verifiable_intent = payload.get("verifiableIntent")
+    ap2_context = payload.get("ap2Context")
+    trace_context = payload.get("traceContext")
+
+    vi_required = any(
+        [
+            policy.require_verifiable_intent,
+            policy.require_verified_intent,
+            policy.require_holder_binding,
+            bool(policy.accepted_issuers),
+        ]
+    )
+    if vi_required and not _has_verifiable_intent_evidence(verifiable_intent):
+        raise HTTPException(status_code=422, detail="Verifiable Intent required")
+    if policy.require_payment_mandate and not _has_ap2_payment_mandate(ap2_context):
+        raise HTTPException(status_code=422, detail="AP2 payment mandate required")
+    if policy.require_trace and not trace_context:
+        raise HTTPException(status_code=422, detail="Trace context required")
+
+
+def _normalize_vi_decision(value: Any) -> str:
+    normalized = str(value or "review").lower()
+    if normalized in {"approve", "approved", "accept", "accepted"}:
+        return "allow"
+    if normalized in {"reject", "rejected", "decline", "declined", "block", "blocked"}:
+        return "deny"
+    if normalized not in {"allow", "deny", "review"}:
+        return "review"
+    return normalized
+
+
+def _ap2_context_from_mandate_header(mandate: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    if not mandate:
+        return {}
+    return {
+        "paymentMandateRef": mandate["mr"],
+        "paymentMandateHash": mandate["ms"],
+        "paymentMandateMime": mandate["mt"],
+        "paymentMandateSize": int(mandate["sz"]),
+    }
+
+
+def effective_public_vi_decision(
+    trustline_decision: Any,
+    policy: InternalPolicy,
+    warnings: List[str],
+) -> str:
+    normalized = _normalize_vi_decision(trustline_decision)
+    if normalized != "review":
+        return normalized
+    if policy.review_mode == "allow":
+        warnings.append("Trustline returned review; policy reviewMode=allow converted it to allow.")
+        return "allow"
+    if policy.review_mode == "block":
+        warnings.append("Trustline returned review; policy reviewMode=block converted it to deny.")
+        return "deny"
+    return "review"
+
+
+def enforce_required_verified_vi_result(
+    decision: str,
+    policy: InternalPolicy,
+    vi_result: Dict[str, Any],
+    reasons: List[str],
+    warnings: List[str],
+) -> str:
+    if not policy.require_verified_intent or bool(vi_result.get("verified")):
+        return decision
+    reason = "Verified Verifiable Intent required"
+    if reason not in reasons:
+        reasons.append(reason)
+    warnings.append("Policy requireVerifiedIntent denied an unverified Trustline VI result.")
+    return "deny"
+
+
+async def assess_public_verifiable_intent(
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    enforce_public_vi_policy_inputs(payload)
+    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    warnings = list(trustline_response.get("warnings") or [])
+    policy = InternalPolicy(**(payload.get("policy") or {}))
+    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
+    reasons = list(trustline_response.get("reasons") or [])
+    decision = effective_public_vi_decision(
+        trustline_response.get("decision"),
+        policy,
+        warnings,
+    )
+    decision = enforce_required_verified_vi_result(
+        decision,
+        policy,
+        vi_result,
+        reasons,
+        warnings,
+    )
+    return {
+        "decision": decision,
+        "decision_id": trustline_response.get("decision_id")
+        or trustline_response.get("decisionId")
+        or f"xs_vi_{uuid.uuid4().hex}",
+        "risk_level": trustline_response.get("risk_level", "medium"),
+        "ttl_seconds": trustline_response.get("ttl_seconds", 300),
+        "vi": vi_result,
+        "binding": trustline_response.get("binding") or payload.get("binding") or {},
+        "reasons": reasons,
+        "warnings": warnings,
+        "trustline_assessment": trustline_response.get("trustline_assessment") or {},
+    }
+
+
+async def post_public_vi_receipt(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await post_trustline_validation("verifiable-intent-receipt", payload)
+
+
+def build_public_vi_receipt_payload(
+    body: ProxySettleRequest,
+    request: Request,
+    *,
+    decision_id: str,
+    evidence_ref: Optional[str],
+    settlement_attempt_id: Optional[str],
+    idempotency_key: Optional[str],
+    settle_response: Dict[str, Any],
+    origin: Optional[str],
+) -> Dict[str, Any]:
+    payment_context = build_public_payment_context(body, request, origin)
+    settlement_id = settlement_attempt_id or f"xs_settle_{uuid.uuid4().hex}"
+    transaction = (
+        settle_response.get("transaction")
+        or settle_response.get("txHash")
+        or settle_response.get("transactionHash")
+    )
+    settlement_status = "success" if settle_response.get("success") else "failed"
+    return {
+        "decisionId": decision_id,
+        "evidenceRef": evidence_ref,
+        "settlementAttemptId": settlement_id,
+        "idempotencyKey": idempotency_key or settlement_id,
+        "payment": {
+            **payment_context,
+            "status": settlement_status,
+            "settlementStatus": settlement_status,
+            "transaction": transaction,
+            "network": settle_response.get("network") or payment_context.get("network"),
+            "errorReason": settle_response.get("errorReason") or settle_response.get("error"),
+        },
+        "metadata": {
+            "source": "x402_secure_public_gateway",
+            "origin": origin,
+        },
+    }
+
+
 def _proxy_local_risk_enabled() -> bool:
     """Check if proxy should use local risk storage instead of forwarding."""
     return os.getenv("PROXY_LOCAL_RISK", "0").lower() in {"1", "true", "yes"}
@@ -602,8 +1188,10 @@ async def proxy_verify(
     body: ProxyVerifyRequest,
     request: Request,
     x_ap2_evidence: Optional[str] = Header(None, alias="X-AP2-EVIDENCE"),
+    x_verifiable_intent: Optional[str] = Header(None, alias="X-VERIFIABLE-INTENT"),
     x_payment_secure: Optional[str] = Header(None, alias="X-PAYMENT-SECURE"),
     x_risk_session: Optional[str] = Header(None, alias="X-RISK-SESSION"),
+    x_risk_trace: Optional[str] = Header(None, alias="X-RISK-TRACE"),
     origin: Optional[str] = Header(None, alias="Origin"),
     cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg),
     response: Response = None,
@@ -613,7 +1201,7 @@ async def proxy_verify(
         response.headers["X-Request-ID"] = req_id
     try:
         # Parse required IDs and trace context; optional mandate
-        sid, tid = parse_risk_ids(x_risk_session, None)
+        sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
         if not x_payment_secure:
             raise HeaderError("X-PAYMENT-SECURE required")
         tc = parse_x_payment_secure(x_payment_secure)
@@ -722,6 +1310,47 @@ async def proxy_verify(
                 f": {', '.join(risk_response.reasons)}" if risk_response.reasons else ""
             )
             raise HTTPException(status_code=403, detail=msg)
+
+        trace_context = {
+            "traceparent": tc["tp"],
+            **({"tracestate": tc["ts"]} if "ts" in tc else {}),
+            **({"riskTrace": extracted_tid} if extracted_tid else {}),
+            "riskSession": sid,
+        }
+        vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
+        if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
+            vi_payload = build_public_vi_assessment_payload(
+                body,
+                request,
+                vi_header=x_verifiable_intent,
+                trace_context=trace_context,
+                ap2_context=_ap2_context_from_mandate_header(mandate),
+                risk_session=sid,
+                risk_trace=extracted_tid,
+                origin=origin,
+            )
+            vi_assessment = await assess_public_verifiable_intent(vi_payload)
+            vi_decision = vi_assessment["decision"]
+            if response is not None:
+                response.headers["X-VI-Decision"] = vi_decision
+                response.headers["X-Risk-Decision"] = vi_decision
+                response.headers["X-VI-Decision-ID"] = vi_assessment["decision_id"]
+                response.headers["X-Risk-Decision-ID"] = vi_assessment["decision_id"]
+                vi_details = vi_assessment.get("vi") or {}
+                if "verified" in vi_details:
+                    response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
+                evidence_ref = vi_details.get("evidence_ref") or vi_details.get("evidenceRef")
+                if evidence_ref:
+                    response.headers["X-VI-Evidence-Ref"] = str(evidence_ref)
+            if vi_decision == "deny":
+                msg = "VI denied" + (
+                    f": {', '.join(vi_assessment['reasons'])}"
+                    if vi_assessment.get("reasons")
+                    else ""
+                )
+                raise HTTPException(status_code=403, detail=msg)
+            if vi_decision == "review":
+                raise HTTPException(status_code=403, detail="VI review required")
     except HTTPException as e:
         return _error_response(e, req_id)
     except HeaderError as e:
@@ -837,19 +1466,28 @@ async def proxy_settle(
     body: ProxySettleRequest,
     request: Request,
     x_ap2_evidence: Optional[str] = Header(None, alias="X-AP2-EVIDENCE"),
+    x_verifiable_intent: Optional[str] = Header(None, alias="X-VERIFIABLE-INTENT"),
     x_payment_secure: Optional[str] = Header(None, alias="X-PAYMENT-SECURE"),
     x_risk_session: Optional[str] = Header(None, alias="X-RISK-SESSION"),
+    x_risk_trace: Optional[str] = Header(None, alias="X-RISK-TRACE"),
+    x_vi_decision_id: Optional[str] = Header(None, alias="X-VI-DECISION-ID"),
+    x_vi_evidence_ref: Optional[str] = Header(None, alias="X-VI-EVIDENCE-REF"),
+    x_settlement_attempt_id: Optional[str] = Header(None, alias="X-SETTLEMENT-ATTEMPT-ID"),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-IDEMPOTENCY-KEY"),
     origin: Optional[str] = Header(None, alias="Origin"),
     cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg),
     response: Response = None,
 ):
     req_id = uuid.uuid4().hex
+    settle_vi_decision_id: Optional[str] = None
+    settle_vi_evidence_ref: Optional[str] = None
+    settle_vi_decision_assessed = False
     if response is not None:
         response.headers["X-Request-ID"] = req_id
     try:
         if cfg.settle_risk_enabled:
             # Full risk path (unchanged): require trace headers and call Risk Engine.
-            sid, tid = parse_risk_ids(x_risk_session, None)
+            sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
             if not x_payment_secure:
                 raise HeaderError("X-PAYMENT-SECURE required")
             tc = parse_x_payment_secure(x_payment_secure)
@@ -966,6 +1604,54 @@ async def proxy_settle(
             )
             if response is not None:
                 response.headers["X-Risk-Decision"] = "skipped"
+
+        vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
+        if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
+            sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
+            if not x_payment_secure:
+                raise HeaderError("X-PAYMENT-SECURE required")
+            tc = parse_x_payment_secure(x_payment_secure)
+            mandate = parse_x_ap2_evidence(x_ap2_evidence) if x_ap2_evidence else None
+            trace_context = {
+                "traceparent": tc["tp"],
+                **({"tracestate": tc["ts"]} if "ts" in tc else {}),
+                **({"riskTrace": tid} if tid else {}),
+                "riskSession": sid,
+            }
+            vi_payload = build_public_vi_assessment_payload(
+                body,
+                request,
+                vi_header=x_verifiable_intent,
+                trace_context=trace_context,
+                ap2_context=_ap2_context_from_mandate_header(mandate),
+                risk_session=sid,
+                risk_trace=tid,
+                origin=origin,
+            )
+            vi_assessment = await assess_public_verifiable_intent(vi_payload)
+            vi_decision = vi_assessment["decision"]
+            settle_vi_decision_id = vi_assessment["decision_id"]
+            settle_vi_decision_assessed = True
+            vi_details = vi_assessment.get("vi") or {}
+            settle_vi_evidence_ref = vi_details.get("evidence_ref") or vi_details.get("evidenceRef")
+            if response is not None:
+                response.headers["X-VI-Decision"] = vi_decision
+                response.headers["X-Risk-Decision"] = vi_decision
+                response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
+                response.headers["X-Risk-Decision-ID"] = settle_vi_decision_id
+                if "verified" in vi_details:
+                    response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
+                if settle_vi_evidence_ref:
+                    response.headers["X-VI-Evidence-Ref"] = str(settle_vi_evidence_ref)
+            if vi_decision == "deny":
+                msg = "VI denied" + (
+                    f": {', '.join(vi_assessment['reasons'])}"
+                    if vi_assessment.get("reasons")
+                    else ""
+                )
+                raise HTTPException(status_code=403, detail=msg)
+            if vi_decision == "review":
+                raise HTTPException(status_code=403, detail="VI review required")
     except HTTPException as e:
         return _error_response(e, req_id)
     except HeaderError as e:
@@ -1045,6 +1731,37 @@ async def proxy_settle(
             HTTPException(status_code=resp.status_code, detail=resp.text), req_id
         )
     data = resp_json or {}
+    if settle_vi_decision_assessed and settle_vi_decision_id:
+        receipt_payload = build_public_vi_receipt_payload(
+            body,
+            request,
+            decision_id=settle_vi_decision_id,
+            evidence_ref=settle_vi_evidence_ref,
+            settlement_attempt_id=x_settlement_attempt_id,
+            idempotency_key=x_idempotency_key,
+            settle_response=data,
+            origin=origin,
+        )
+        try:
+            receipt = await post_public_vi_receipt(receipt_payload)
+            if response is not None:
+                response.headers["X-VI-Receipt-Status"] = "recorded"
+                receipt_id = receipt.get("receipt_id") or receipt.get("receiptId")
+                if receipt_id:
+                    response.headers["X-VI-Receipt-ID"] = str(receipt_id)
+        except HTTPException as e:
+            logger.warning("[%s] [PROXY] VI receipt post failed: %s", req_id, e.detail)
+            if response is not None:
+                response.headers["X-VI-Receipt-Status"] = "failed"
+        except Exception as e:
+            logger.warning(
+                "[%s] [PROXY] VI receipt post failed: %s",
+                req_id,
+                e,
+                exc_info=True,
+            )
+            if response is not None:
+                response.headers["X-VI-Receipt-Status"] = "failed"
     return SettleResponse(
         success=bool(data.get("success")),
         payer=str(data.get("payer", "")),

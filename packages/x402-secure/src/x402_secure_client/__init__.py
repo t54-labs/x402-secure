@@ -2,7 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 from .agent import execute_payment_with_tid, run_agent_payment, store_agent_trace
 from .buyer import BuyerClient, BuyerConfig
-from .headers import build_payment_secure_header, start_client_span
+from .headers import (
+    attach_verifiable_intent_policy,
+    build_ap2_evidence_header,
+    build_payment_secure_header,
+    build_verifiable_intent_header,
+    start_client_span,
+)
 from .otel import setup_otel_from_env
 from .risk import RiskClient
 from .seller import SellerClient
@@ -10,6 +16,9 @@ from .tracing import OpenAITraceCollector
 
 __all__ = [
     "build_payment_secure_header",
+    "build_verifiable_intent_header",
+    "build_ap2_evidence_header",
+    "attach_verifiable_intent_policy",
     "start_client_span",
     "RiskClient",
     "BuyerConfig",

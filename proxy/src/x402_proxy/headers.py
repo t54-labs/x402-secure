@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 _HEX2 = re.compile(r"^[0-9a-f]{2}$")
+_SHA256_HEX = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class HeaderError(ValueError):
@@ -82,6 +83,34 @@ def parse_x_ap2_evidence(value: str) -> Dict[str, str]:
     _require(mt == "application/json", "mt must be application/json")
     _require(sz.isdigit(), "sz must be decimal size")
     return {"mr": mr, "ms": ms, "mt": mt, "sz": sz}
+
+
+def parse_x_verifiable_intent(value: str) -> Dict[str, str]:
+    """Parse X-VERIFIABLE-INTENT reference header.
+
+    Format: 'vi.v1;ref=<ref>;sha256=<sha256:hex>;mt=<media-type>;sz=<bytes>'
+    """
+    if len(value) > 4096:
+        raise HeaderError("X-VERIFIABLE-INTENT too large")
+    parts = [p.strip() for p in value.split(";") if p.strip()]
+    _require(parts and parts[0] == "vi.v1", "Unsupported X-VERIFIABLE-INTENT version")
+    kv: Dict[str, str] = {}
+    for p in parts[1:]:
+        if "=" not in p:
+            raise HeaderError("Malformed X-VERIFIABLE-INTENT segment")
+        k, v = p.split("=", 1)
+        kv[k] = v
+    ref = kv.get("ref")
+    sha256 = kv.get("sha256")
+    mt = kv.get("mt")
+    sz = kv.get("sz")
+    _require(
+        ref is not None and sha256 is not None and mt is not None and sz is not None,
+        "Missing required Verifiable Intent keys",
+    )
+    _require(_SHA256_HEX.match(sha256) is not None, "sha256 must use sha256:<hex> format")
+    _require(sz.isdigit(), "sz must be decimal size")
+    return {"ref": ref, "sha256": sha256, "mt": mt, "sz": sz}
 
 
 def parse_risk_ids(

@@ -1319,8 +1319,9 @@ async def proxy_settle(
     response: Response = None,
 ):
     req_id = uuid.uuid4().hex
-    settle_vi_decision_id = x_vi_decision_id
-    settle_vi_evidence_ref = x_vi_evidence_ref
+    settle_vi_decision_id: Optional[str] = None
+    settle_vi_evidence_ref: Optional[str] = None
+    settle_vi_decision_assessed = False
     if response is not None:
         response.headers["X-Request-ID"] = req_id
     try:
@@ -1470,21 +1471,16 @@ async def proxy_settle(
             vi_assessment = await assess_public_verifiable_intent(vi_payload)
             vi_decision = vi_assessment["decision"]
             settle_vi_decision_id = vi_assessment["decision_id"]
+            settle_vi_decision_assessed = True
             vi_details = vi_assessment.get("vi") or {}
-            settle_vi_evidence_ref = (
-                settle_vi_evidence_ref
-                or vi_details.get("evidence_ref")
-                or vi_details.get("evidenceRef")
-            )
+            settle_vi_evidence_ref = vi_details.get("evidence_ref") or vi_details.get("evidenceRef")
             if response is not None:
                 response.headers["X-VI-Decision"] = vi_decision
                 response.headers["X-Risk-Decision"] = vi_decision
                 response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
                 response.headers["X-Risk-Decision-ID"] = settle_vi_decision_id
                 if "verified" in vi_details:
-                    response.headers["X-VI-Verified"] = str(
-                        bool(vi_details["verified"])
-                    ).lower()
+                    response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
                 if settle_vi_evidence_ref:
                     response.headers["X-VI-Evidence-Ref"] = str(settle_vi_evidence_ref)
             if vi_decision == "deny":
@@ -1575,7 +1571,7 @@ async def proxy_settle(
             HTTPException(status_code=resp.status_code, detail=resp.text), req_id
         )
     data = resp_json or {}
-    if settle_vi_decision_id:
+    if settle_vi_decision_assessed and settle_vi_decision_id:
         receipt_payload = build_public_vi_receipt_payload(
             body,
             request,

@@ -6,7 +6,6 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
-
 from x402_proxy.headers import HeaderError, parse_x_verifiable_intent
 from x402_proxy.routes import (
     ProxyVerifyRequest,
@@ -208,8 +207,7 @@ def test_build_public_vi_assessment_payload_matches_trustline_shape() -> None:
         body,
         _request(),
         vi_header=(
-            f"vi.v1;ref=tl://evidence/header;sha256={_VI_HASH};"
-            "mt=application/json;sz=10"
+            f"vi.v1;ref=tl://evidence/header;sha256={_VI_HASH};" "mt=application/json;sz=10"
         ),
         trace_context={"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
         risk_session="risk_sess_1",
@@ -375,8 +373,7 @@ def test_proxy_verify_maps_ap2_evidence_header_into_trustline_payload(monkeypatc
             "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
             "X-RISK-SESSION": sid,
             "X-AP2-EVIDENCE": (
-                "evd.v1;mr=tl://mandate/payment_1;ms=b64urlhash;"
-                "mt=application/json;sz=10"
+                "evd.v1;mr=tl://mandate/payment_1;ms=b64urlhash;" "mt=application/json;sz=10"
             ),
             "Origin": "https://merchant.example",
         },
@@ -419,18 +416,11 @@ def test_proxy_verify_blocks_trustline_review_with_block_policy(monkeypatch) -> 
     assert response.json()["error"]["code"] == "VI_DENIED"
 
 
-def test_proxy_settle_records_vi_receipt_when_decision_header_present(monkeypatch) -> None:
+def test_proxy_settle_ignores_decision_header_without_vi_assessment(monkeypatch) -> None:
     client = _proxy_client(monkeypatch)
-    captured: Dict[str, Any] = {}
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        captured["path"] = path
-        captured["payload"] = payload
-        return {
-            "receipt_id": "vi_rcpt_1",
-            "decision_id": payload["decisionId"],
-            "status": "success",
-        }
+        raise AssertionError("client-supplied decision ids must not create VI receipts")
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
@@ -447,15 +437,7 @@ def test_proxy_settle_records_vi_receipt_when_decision_header_present(monkeypatc
     )
 
     assert response.status_code == 200
-    assert response.headers["x-vi-receipt-status"] == "recorded"
-    assert response.headers["x-vi-receipt-id"] == "vi_rcpt_1"
-    assert captured["path"] == "verifiable-intent-receipt"
-    assert captured["payload"]["decisionId"] == "vi_dec_1"
-    assert captured["payload"]["evidenceRef"] == "tl_evd_1"
-    assert captured["payload"]["settlementAttemptId"] == "settle_attempt_1"
-    assert captured["payload"]["idempotencyKey"] == "idem_1"
-    assert captured["payload"]["payment"]["settlementStatus"] == "success"
-    assert captured["payload"]["payment"]["transaction"] == "0x" + ("e" * 64)
+    assert "x-vi-receipt-status" not in response.headers
 
 
 def test_proxy_settle_without_vi_does_not_call_trustline(monkeypatch) -> None:
@@ -478,17 +460,33 @@ def test_proxy_settle_without_vi_does_not_call_trustline(monkeypatch) -> None:
 
 def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
     client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+    calls = []
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append(path)
+        if path == "assess-verifiable-intent":
+            return {
+                "decision": "allow",
+                "decision_id": "vi_dec_1",
+                "vi": {"verified": True, "evidence_ref": "tl_evd_1"},
+                "binding": payload["binding"],
+            }
         raise HTTPException(status_code=502, detail="Trustline unavailable")
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
     response = client.post(
         "/x402/settle",
-        json=_body_json(_body()),
+        json=_body_json(
+            _body(
+                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+                verifiableIntent={"presentationRef": "tl://evidence/body"},
+            )
+        ),
         headers={
-            "X-VI-DECISION-ID": "vi_dec_1",
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
             "Origin": "https://merchant.example",
         },
     )
@@ -496,6 +494,7 @@ def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["x-vi-receipt-status"] == "failed"
     assert response.json()["success"] is True
+    assert calls == ["assess-verifiable-intent", "verifiable-intent-receipt"]
 
 
 def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(

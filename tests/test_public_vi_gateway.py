@@ -173,6 +173,29 @@ def test_extract_vi_policy_reads_payment_requirements_and_overrides() -> None:
     assert policy.review_mode == "block"
 
 
+def test_extract_vi_policy_body_cannot_relax_merchant_policy() -> None:
+    policy = extract_vi_policy(
+        _body(
+            extra={
+                "vi": {
+                    "requireVerifiedIntent": True,
+                    "acceptedIssuers": ["did:web:issuer.example"],
+                    "reviewMode": "block",
+                }
+            }
+        ).paymentRequirements,
+        {
+            "requireVerifiedIntent": False,
+            "acceptedIssuers": ["did:web:other.example"],
+            "reviewMode": "allow",
+        },
+    )
+
+    assert policy.require_verified_intent is True
+    assert policy.accepted_issuers == ["did:web:issuer.example"]
+    assert policy.review_mode == "block"
+
+
 def test_extract_vi_policy_rejects_invalid_review_mode() -> None:
     with pytest.raises(HTTPException) as exc:
         extract_vi_policy(_body().paymentRequirements, {"reviewMode": "bad"})
@@ -346,6 +369,42 @@ def test_proxy_verify_fails_fast_when_verified_vi_missing(monkeypatch) -> None:
     assert response.json()["error"]["code"] == "VI_EVIDENCE_MISSING"
 
 
+def test_proxy_verify_denies_when_required_vi_is_not_verified_by_trustline(
+    monkeypatch,
+) -> None:
+    client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        assert payload["policy"]["requireVerifiedIntent"] is True
+        return {
+            "decision": "allow",
+            "decision_id": "vi_dec_unverified",
+            "vi": {"verified": False, "evidence_ref": "tl_evd_unverified"},
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/verify",
+        json=_body_json(
+            _body(
+                extra={"vi": {"requireVerifiedIntent": True, "reviewMode": "block"}},
+                verifiableIntent={"presentationRef": "tl://evidence/body"},
+            )
+        ),
+        headers={
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "VI_DENIED"
+
+
 def test_proxy_verify_maps_ap2_evidence_header_into_trustline_payload(monkeypatch) -> None:
     client = _proxy_client(monkeypatch)
     sid = _risk_session(client)
@@ -383,6 +442,42 @@ def test_proxy_verify_maps_ap2_evidence_header_into_trustline_payload(monkeypatc
     assert response.status_code == 200
     assert captured["payload"]["ap2Context"]["paymentMandateRef"] == "tl://mandate/payment_1"
     assert captured["payload"]["ap2Context"]["paymentMandateHash"] == "b64urlhash"
+
+
+def test_proxy_verify_accepts_normalized_ap2_payment_mandate(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    sid = _risk_session(client)
+    captured: Dict[str, Any] = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {"decision": "allow", "decision_id": "vi_dec_ap2", "binding": payload["binding"]}
+
+    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/x402/verify",
+        json=_body_json(
+            _body(
+                extra={
+                    "vi": {
+                        "requireVerifiableIntent": True,
+                        "requirePaymentMandate": True,
+                    }
+                },
+                verifiableIntent={"presentationRef": "tl://evidence/body"},
+                ap2Context={"normalized": {"payment_mandate_id": "pm_staging_1"}},
+            )
+        ),
+        headers={
+            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+            "X-RISK-SESSION": sid,
+            "Origin": "https://merchant.example",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["ap2Context"]["normalized"]["payment_mandate_id"] == "pm_staging_1"
 
 
 def test_proxy_verify_blocks_trustline_review_with_block_policy(monkeypatch) -> None:

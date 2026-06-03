@@ -344,6 +344,34 @@ def test_internal_evaluate_blocks_review_when_policy_says_block(monkeypatch) -> 
     assert "reviewMode=block" in data["warnings"][0]
 
 
+def test_internal_evaluate_denies_unverified_vi_when_required(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload()
+    body["extensions"]["x402Secure"]["policy"]["requireVerifiedIntent"] = True
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "decision": "allow",
+            "decision_id": "dec_unverified",
+            "risk_level": "low",
+            "vi": {"verified": False, "evidence_ref": "tl_evd_unverified"},
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["decision"] == "deny"
+    assert "Verified Verifiable Intent required" in data["reasons"]
+
+
 def test_internal_evaluate_maps_legacy_trustline_decision(monkeypatch) -> None:
     client = _client(monkeypatch)
 

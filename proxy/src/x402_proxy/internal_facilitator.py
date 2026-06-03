@@ -567,6 +567,22 @@ def _effective_decision(
     return "review"
 
 
+def _enforce_required_verified_vi_result(
+    decision: str,
+    policy: InternalPolicy,
+    vi_result: Dict[str, Any],
+    reasons: List[str],
+    warnings: List[str],
+) -> str:
+    if not policy.require_verified_intent or bool(vi_result.get("verified")):
+        return decision
+    reason = "Verified Verifiable Intent required"
+    if reason not in reasons:
+        reasons.append(reason)
+    warnings.append("Policy requireVerifiedIntent denied an unverified Trustline VI result.")
+    return "deny"
+
+
 @internal_router.post(
     "/evaluate",
     response_model=InternalFacilitatorDecisionResponse,
@@ -581,9 +597,18 @@ async def evaluate_facilitator_payment(
     trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
 
     warnings = list(trustline_response.get("warnings") or [])
+    reasons = list(trustline_response.get("reasons") or [])
+    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
     decision = _effective_decision(
         str(trustline_response.get("decision", "review")),
         extension.policy,
+        warnings,
+    )
+    decision = _enforce_required_verified_vi_result(
+        decision,
+        extension.policy,
+        vi_result,
+        reasons,
         warnings,
     )
     logger.info(
@@ -602,10 +627,10 @@ async def evaluate_facilitator_payment(
         "decision_id": decision_id,
         "risk_level": trustline_response.get("risk_level", "medium"),
         "ttl_seconds": trustline_response.get("ttl_seconds", 300),
-        "vi": trustline_response.get("vi") or {},
+        "vi": vi_result,
         "binding": trustline_response.get("binding")
         or binding.model_dump(by_alias=False, exclude_none=True),
-        "reasons": trustline_response.get("reasons") or [],
+        "reasons": reasons,
         "warnings": warnings,
         "trustline_assessment": trustline_response.get("trustline_assessment") or {},
     }

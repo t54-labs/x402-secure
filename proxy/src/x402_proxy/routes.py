@@ -600,13 +600,13 @@ def _error_code_from_message(msg: str) -> str:
         # Risk outcome gating
         "risk denied": "RISK_DENIED",
         "risk review": "RISK_REVIEW",
+        "vi denied": "VI_DENIED",
+        "vi review required": "VI_REVIEW_REQUIRED",
         "unsupported x-verifiable-intent version": "VI_HEADER_UNSUPPORTED",
         "x-verifiable-intent": "VI_HEADER_INVALID",
         "verifiable intent required": "VI_EVIDENCE_MISSING",
         "ap2 payment mandate required": "AP2_PAYMENT_MANDATE_MISSING",
         "trace context required": "TRACE_CONTEXT_MISSING",
-        "vi denied": "VI_DENIED",
-        "vi review required": "VI_REVIEW_REQUIRED",
     }
     for k, v in mapping.items():
         if k in m:
@@ -674,6 +674,110 @@ def _merchant_id_from_origin(origin: Optional[str], resource: Optional[str]) -> 
     return f"did:web:{host.split(':', 1)[0].lower()}"
 
 
+_VI_POLICY_ALIASES = {
+    "require_verifiable_intent": "requireVerifiableIntent",
+    "require_verified_intent": "requireVerifiedIntent",
+    "require_payment_mandate": "requirePaymentMandate",
+    "require_holder_binding": "requireHolderBinding",
+    "require_trace": "requireTrace",
+    "accepted_issuers": "acceptedIssuers",
+    "review_mode": "reviewMode",
+}
+_VI_POLICY_BOOL_KEYS = {
+    "requireVerifiableIntent",
+    "requireVerifiedIntent",
+    "requirePaymentMandate",
+    "requireHolderBinding",
+    "requireTrace",
+}
+_VI_POLICY_REVIEW_RANK = {"allow": 0, "review": 1, "block": 2}
+
+
+def _canonical_vi_policy_key(key: str) -> str:
+    return _VI_POLICY_ALIASES.get(key, key)
+
+
+def _coerce_policy_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _normalize_policy_issuers(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return []
+
+
+def _merge_vi_policy_source(
+    policy_data: Dict[str, Any],
+    candidate: Optional[Dict[str, Any]],
+    *,
+    tightening_only: bool,
+) -> None:
+    if not isinstance(candidate, dict):
+        return
+
+    for raw_key, value in candidate.items():
+        key = _canonical_vi_policy_key(str(raw_key))
+        if not tightening_only:
+            policy_data[key] = value
+            continue
+
+        if key in _VI_POLICY_BOOL_KEYS:
+            incoming = _coerce_policy_bool(value)
+            existing = _coerce_policy_bool(policy_data.get(key, False))
+            if incoming is None or existing is None:
+                policy_data[key] = value
+            else:
+                policy_data[key] = existing or incoming
+            continue
+
+        if key == "reviewMode":
+            current = policy_data.get(key)
+            incoming = str(value).strip().lower()
+            if incoming not in _VI_POLICY_REVIEW_RANK:
+                policy_data[key] = value
+            elif current is None:
+                policy_data[key] = incoming
+            else:
+                current_normalized = str(current).strip().lower()
+                if current_normalized not in _VI_POLICY_REVIEW_RANK:
+                    policy_data[key] = current
+                else:
+                    policy_data[key] = max(
+                        (current_normalized, incoming),
+                        key=lambda item: _VI_POLICY_REVIEW_RANK[item],
+                    )
+            continue
+
+        if key == "acceptedIssuers":
+            existing = _normalize_policy_issuers(policy_data.get(key))
+            incoming = _normalize_policy_issuers(value)
+            if not existing:
+                policy_data[key] = incoming
+            elif incoming and set(incoming).issubset(set(existing)):
+                policy_data[key] = [item for item in existing if item in set(incoming)]
+            else:
+                policy_data[key] = existing
+            continue
+
+        if key not in policy_data:
+            policy_data[key] = value
+
+
 def extract_vi_policy(
     payment_requirements: PaymentRequirements,
     *policy_sources: Optional[Dict[str, Any]],
@@ -687,12 +791,12 @@ def extract_vi_policy(
             if isinstance(extra, dict) and isinstance(extra.get("x402Secure"), dict)
             else None
         ),
-        *policy_sources,
     ]
     policy_data: Dict[str, Any] = {}
     for candidate in candidates:
-        if isinstance(candidate, dict):
-            policy_data.update(candidate)
+        _merge_vi_policy_source(policy_data, candidate, tightening_only=False)
+    for candidate in policy_sources:
+        _merge_vi_policy_source(policy_data, candidate, tightening_only=True)
     try:
         return InternalPolicy(**policy_data)
     except ValidationError as e:
@@ -857,17 +961,46 @@ def public_vi_assessment_requested(
 def _has_ap2_payment_mandate(ap2_context: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(ap2_context, dict):
         return False
-    return any(
-        ap2_context.get(key)
-        for key in (
+    return bool(
+        _nested_vi_value(
+            ap2_context,
             "paymentMandateRef",
+            "paymentMandateId",
             "payment_mandate_ref",
+            "payment_mandate_id",
             "paymentMandateHash",
             "payment_mandate_hash",
             "paymentUid",
             "payment_uid",
+            "payment.id",
+            "payment.ref",
+            "payment.hash",
+            "mandates.payment.id",
+            "mandates.payment.ref",
+            "mandates.payment.hash",
+            "normalized.payment_mandate_id",
+            "normalized.paymentMandateId",
+            "normalized.payment_mandate_ref",
+            "normalized.paymentMandateRef",
+            "normalized.payment_mandate_hash",
+            "normalized.paymentMandateHash",
         )
     )
+
+
+def _nested_vi_value(mapping: Dict[str, Any], *paths: str) -> Any:
+    for path in paths:
+        current: Any = mapping
+        ok = True
+        for part in path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                ok = False
+                break
+        if ok and current not in (None, ""):
+            return current
+    return None
 
 
 def _has_verifiable_intent_evidence(verifiable_intent: Any) -> bool:
@@ -950,6 +1083,22 @@ def effective_public_vi_decision(
     return "review"
 
 
+def enforce_required_verified_vi_result(
+    decision: str,
+    policy: InternalPolicy,
+    vi_result: Dict[str, Any],
+    reasons: List[str],
+    warnings: List[str],
+) -> str:
+    if not policy.require_verified_intent or bool(vi_result.get("verified")):
+        return decision
+    reason = "Verified Verifiable Intent required"
+    if reason not in reasons:
+        reasons.append(reason)
+    warnings.append("Policy requireVerifiedIntent denied an unverified Trustline VI result.")
+    return "deny"
+
+
 async def assess_public_verifiable_intent(
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -957,9 +1106,18 @@ async def assess_public_verifiable_intent(
     trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
     warnings = list(trustline_response.get("warnings") or [])
     policy = InternalPolicy(**(payload.get("policy") or {}))
+    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
+    reasons = list(trustline_response.get("reasons") or [])
     decision = effective_public_vi_decision(
         trustline_response.get("decision"),
         policy,
+        warnings,
+    )
+    decision = enforce_required_verified_vi_result(
+        decision,
+        policy,
+        vi_result,
+        reasons,
         warnings,
     )
     return {
@@ -969,9 +1127,9 @@ async def assess_public_verifiable_intent(
         or f"xs_vi_{uuid.uuid4().hex}",
         "risk_level": trustline_response.get("risk_level", "medium"),
         "ttl_seconds": trustline_response.get("ttl_seconds", 300),
-        "vi": trustline_response.get("vi") or {},
+        "vi": vi_result,
         "binding": trustline_response.get("binding") or payload.get("binding") or {},
-        "reasons": trustline_response.get("reasons") or [],
+        "reasons": reasons,
         "warnings": warnings,
         "trustline_assessment": trustline_response.get("trustline_assessment") or {},
     }

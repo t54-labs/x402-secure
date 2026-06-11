@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -17,6 +18,14 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
+
+TRUSTLINE_ASYNC_ASSESSMENT_PATHS = {
+    "assess-async",
+    "assess-verifiable-intent-async",
+    "assess-ap2-async",
+}
+TRUSTLINE_ASYNC_TERMINAL_STATUSES = {"completed", "failed", "expired", "canceled"}
+TRUSTLINE_ASYNC_REVIEW_STATUSES = {"requires_information"}
 
 internal_router = APIRouter(
     prefix="/internal/x402-secure/facilitator",
@@ -451,21 +460,42 @@ def _trustline_validation_path(path: str) -> str:
     return f"/{prefix}/{path.lstrip('/')}"
 
 
+def _trustline_underwriting_path(path: str) -> str:
+    prefix = os.getenv("TRUSTLINE_UNDERWRITING_PREFIX", "/api/v1/underwriting").strip("/")
+    return f"/{prefix}/{path.lstrip('/')}"
+
+
 def _trustline_auth_headers() -> Dict[str, str]:
     token = (
         os.getenv("TRUSTLINE_INTERNAL_TOKEN")
         or os.getenv("RISK_INTERNAL_TOKEN")
         or os.getenv("X402_SECURE_TRUSTLINE_TOKEN")
     )
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _trustline_url_for_path(path: str, *, kind: str = "validation") -> str:
+    base_url = _trustline_base_url()
+    normalized_path = path.lstrip("/")
+    if kind == "underwriting" and base_url.endswith("/validation"):
+        underwriting_base_url = base_url.rsplit("/", 1)[0] + "/underwriting"
+        return f"{underwriting_base_url}/{normalized_path}"
+    if base_url.endswith(f"/{kind}"):
+        return f"{base_url}/{normalized_path}"
+    if kind == "underwriting":
+        return f"{base_url}{_trustline_underwriting_path(normalized_path)}"
+    return f"{base_url}{_trustline_validation_path(normalized_path)}"
 
 
 async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    base_url = _trustline_base_url()
-    if base_url.endswith("/validation"):
-        url = f"{base_url}/{path.lstrip('/')}"
-    else:
-        url = f"{base_url}{_trustline_validation_path(path)}"
+    normalized_path = path.strip("/")
+    if normalized_path in TRUSTLINE_ASYNC_ASSESSMENT_PATHS:
+        return await _post_trustline_async_assessment_and_wait(normalized_path, payload)
+
+    url = _trustline_url_for_path(normalized_path)
     async with httpx.AsyncClient(timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))) as client:
         response = await client.post(url, json=payload, headers=_trustline_auth_headers())
     if response.status_code >= 400:
@@ -474,6 +504,181 @@ async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[
         return response.json()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Invalid Trustline response: {exc}") from exc
+
+
+def _trustline_async_idempotency_key(path: str, payload: Dict[str, Any]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {"path": path, "payload": payload},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"x402-secure:{path}:{digest}"
+
+
+def _trustline_async_correlation_id(payload: Dict[str, Any]) -> str:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    trace_context = payload.get("traceContext") if isinstance(payload.get("traceContext"), dict) else {}
+    for value in (
+        metadata.get("traceparent"),
+        metadata.get("riskTrace"),
+        trace_context.get("traceparent"),
+        trace_context.get("riskTrace"),
+        trace_context.get("riskSession"),
+    ):
+        if value:
+            return str(value)
+    return f"x402-secure-{uuid.uuid4().hex}"
+
+
+async def _post_trustline_async_assessment_and_wait(
+    path: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    timeout_s = float(os.getenv("TRUSTLINE_ASYNC_POLL_TIMEOUT_S", os.getenv("TRUSTLINE_TIMEOUT_S", "60")))
+    interval_s = float(os.getenv("TRUSTLINE_ASYNC_POLL_INTERVAL_S", "0.75"))
+    submit_timeout_s = float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))
+    idempotency_key = _trustline_async_idempotency_key(path, payload)
+    correlation_id = _trustline_async_correlation_id(payload)
+    headers = {
+        **_trustline_auth_headers(),
+        "Idempotency-Key": idempotency_key,
+        "X-Correlation-Id": correlation_id,
+        "User-Agent": "x402-secure-proxy/vi-async",
+    }
+
+    async with httpx.AsyncClient(timeout=submit_timeout_s) as client:
+        response = await client.post(
+            _trustline_url_for_path(path),
+            json=payload,
+            headers=headers,
+        )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Trustline error: {response.text}")
+        try:
+            submission = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Invalid Trustline async submission response: {exc}",
+            ) from exc
+
+        transaction_id = submission.get("trustline_transaction_id")
+        if not transaction_id:
+            raise HTTPException(
+                status_code=502,
+                detail="Trustline async submission response missing trustline_transaction_id",
+            )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        last_status: Dict[str, Any] = {}
+        while True:
+            status_response = await client.get(
+                _trustline_url_for_path(f"transactions/{transaction_id}", kind="underwriting"),
+                headers=_trustline_auth_headers(),
+            )
+            if status_response.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Trustline async poll error: {status_response.text}",
+                )
+            try:
+                last_status = status_response.json()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Invalid Trustline async poll response: {exc}",
+                ) from exc
+
+            status_value = str(last_status.get("status") or "").lower()
+            if status_value in TRUSTLINE_ASYNC_TERMINAL_STATUSES:
+                return _trustline_final_result_from_async(submission, last_status)
+            if status_value in TRUSTLINE_ASYNC_REVIEW_STATUSES:
+                return _trustline_review_result_from_async(submission, last_status)
+            if loop.time() >= deadline:
+                return _trustline_timeout_result_from_async(submission, last_status)
+            retry_after = last_status.get("retry_after_seconds")
+            try:
+                sleep_s = min(float(retry_after), interval_s) if retry_after is not None else interval_s
+            except (TypeError, ValueError):
+                sleep_s = interval_s
+            await asyncio.sleep(max(0.1, sleep_s))
+
+
+def _trustline_async_metadata(
+    submission: Dict[str, Any],
+    status_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": "x402_secure_trustline_async.v1",
+        "submission_status": submission.get("status"),
+        "transaction_status": status_body.get("status"),
+        "trustline_transaction_id": submission.get("trustline_transaction_id")
+        or status_body.get("trustline_transaction_id"),
+        "underwriting_request_id": submission.get("underwriting_request_id")
+        or status_body.get("underwriting_request_id"),
+        "job_id": submission.get("job_id") or status_body.get("job_id"),
+        "idempotency_key": submission.get("idempotency_key") or status_body.get("idempotency_key"),
+        "poll_url": submission.get("poll_url"),
+        "progress": status_body.get("progress") or submission.get("progress"),
+    }
+
+
+def _trustline_final_result_from_async(
+    submission: Dict[str, Any],
+    status_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    result = dict(status_body.get("final_result") or {})
+    for key in ("decision", "risk_level", "confidence", "reason_brief"):
+        if status_body.get(key) is not None and result.get(key) is None:
+            result[key] = status_body[key]
+    for key in ("reasons", "warnings"):
+        if status_body.get(key) and not result.get(key):
+            result[key] = status_body[key]
+    result.setdefault("decision", "review" if status_body.get("status") != "failed" else "deny")
+    result.setdefault("risk_level", "medium")
+    result.setdefault("reasons", [])
+    result.setdefault("warnings", [])
+    assessment = result.get("trustline_assessment")
+    if not isinstance(assessment, dict):
+        assessment = {}
+    assessment["async"] = _trustline_async_metadata(submission, status_body)
+    result["trustline_assessment"] = assessment
+    return result
+
+
+def _trustline_review_result_from_async(
+    submission: Dict[str, Any],
+    status_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    warnings = list(status_body.get("warnings") or [])
+    warnings.append("Trustline async assessment requires additional information.")
+    return {
+        "decision": "review",
+        "risk_level": status_body.get("risk_level") or "medium",
+        "reasons": list(status_body.get("reasons") or ["Trustline requires additional information"]),
+        "warnings": warnings,
+        "challenge": status_body.get("challenge"),
+        "trustline_assessment": {"async": _trustline_async_metadata(submission, status_body)},
+    }
+
+
+def _trustline_timeout_result_from_async(
+    submission: Dict[str, Any],
+    status_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    warnings = list(status_body.get("warnings") or [])
+    warnings.append("Trustline async assessment did not complete before the x402 Secure timeout.")
+    return {
+        "decision": "review",
+        "risk_level": status_body.get("risk_level") or "medium",
+        "reasons": list(status_body.get("reasons") or ["Trustline async assessment timed out"]),
+        "warnings": warnings,
+        "trustline_assessment": {"async": _trustline_async_metadata(submission, status_body)},
+    }
 
 
 def build_trustline_assessment_payload(
@@ -594,7 +799,7 @@ async def evaluate_facilitator_payment(
     extension = _extract_extension(body.extensions)
     binding = build_binding_profile(body.payment)
     payload = build_trustline_assessment_payload(body, extension, binding)
-    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    trustline_response = await post_trustline_validation("assess-verifiable-intent-async", payload)
 
     warnings = list(trustline_response.get("warnings") or [])
     reasons = list(trustline_response.get("reasons") or [])

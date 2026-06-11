@@ -1103,7 +1103,7 @@ async def assess_public_verifiable_intent(
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     enforce_public_vi_policy_inputs(payload)
-    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    trustline_response = await post_trustline_validation("assess-verifiable-intent-async", payload)
     warnings = list(trustline_response.get("warnings") or [])
     policy = InternalPolicy(**(payload.get("policy") or {}))
     vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}

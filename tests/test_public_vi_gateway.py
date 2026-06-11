@@ -288,7 +288,7 @@ def test_proxy_verify_calls_trustline_when_vi_policy_required(monkeypatch) -> No
     assert response.headers["x-risk-decision-id"] == "vi_dec_1"
     assert response.headers["x-vi-verified"] == "true"
     assert response.headers["x-vi-evidence-ref"] == "tl_evd_1"
-    assert captured["path"] == "assess-verifiable-intent"
+    assert captured["path"] == "assess-verifiable-intent-async"
     assert captured["payload"]["policy"]["requireVerifiableIntent"] is True
     assert captured["payload"]["paymentContext"]["paymentRequirementsHash"].startswith("sha256:")
 
@@ -561,7 +561,7 @@ def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         calls.append(path)
-        if path == "assess-verifiable-intent":
+        if path == "assess-verifiable-intent-async":
             return {
                 "decision": "allow",
                 "decision_id": "vi_dec_1",
@@ -590,7 +590,7 @@ def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["x-vi-receipt-status"] == "failed"
     assert response.json()["success"] is True
-    assert calls == ["assess-verifiable-intent", "verifiable-intent-receipt"]
+    assert calls == ["assess-verifiable-intent-async", "verifiable-intent-receipt"]
 
 
 def test_proxy_settle_receipt_network_failure_is_non_blocking(monkeypatch) -> None:
@@ -600,7 +600,7 @@ def test_proxy_settle_receipt_network_failure_is_non_blocking(monkeypatch) -> No
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         calls.append(path)
-        if path == "assess-verifiable-intent":
+        if path == "assess-verifiable-intent-async":
             return {
                 "decision": "allow",
                 "decision_id": "vi_dec_1",
@@ -629,7 +629,7 @@ def test_proxy_settle_receipt_network_failure_is_non_blocking(monkeypatch) -> No
     assert response.status_code == 200
     assert response.headers["x-vi-receipt-status"] == "failed"
     assert response.json()["success"] is True
-    assert calls == ["assess-verifiable-intent", "verifiable-intent-receipt"]
+    assert calls == ["assess-verifiable-intent-async", "verifiable-intent-receipt"]
 
 
 def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
@@ -641,7 +641,7 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         calls.append((path, payload))
-        if path == "assess-verifiable-intent":
+        if path == "assess-verifiable-intent-async":
             return {
                 "decision": "allow",
                 "decision_id": "vi_dec_settle",
@@ -679,7 +679,7 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
     assert response.headers["x-risk-decision-id"] == "vi_dec_settle"
     assert response.headers["x-vi-receipt-status"] == "recorded"
     assert [path for path, _payload in calls] == [
-        "assess-verifiable-intent",
+        "assess-verifiable-intent-async",
         "verifiable-intent-receipt",
     ]
     assert calls[1][1]["decisionId"] == "vi_dec_settle"
@@ -697,7 +697,7 @@ def test_proxy_settle_decision_header_does_not_bypass_required_vi_assessment(
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         calls.append((path, payload))
-        if path == "assess-verifiable-intent":
+        if path == "assess-verifiable-intent-async":
             return {
                 "decision": "deny",
                 "decision_id": "vi_dec_denied",
@@ -727,4 +727,4 @@ def test_proxy_settle_decision_header_does_not_bypass_required_vi_assessment(
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "VI_DENIED"
-    assert [path for path, _payload in calls] == ["assess-verifiable-intent"]
+    assert [path for path, _payload in calls] == ["assess-verifiable-intent-async"]

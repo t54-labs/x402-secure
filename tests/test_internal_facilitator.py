@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -19,6 +20,112 @@ def _client(monkeypatch) -> TestClient:
 
 def _auth_headers() -> Dict[str, str]:
     return {"Authorization": "Bearer test-internal-token"}
+
+
+class _FakeTrustlineResponse:
+    def __init__(self, status_code: int, payload: Dict[str, Any]) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self) -> Dict[str, Any]:
+        return self._payload
+
+
+@pytest.mark.asyncio
+async def test_post_trustline_validation_async_assessment_polls_to_completion(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_API_URL", "https://api.trustline.test")
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "tl_production_test.secret")
+    monkeypatch.setenv("TRUSTLINE_ASYNC_POLL_INTERVAL_S", "0.01")
+    monkeypatch.setenv("TRUSTLINE_ASYNC_POLL_TIMEOUT_S", "1")
+    calls: list[tuple[str, str, Dict[str, str]]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+            self.poll_count = 0
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: Dict[str, Any],
+            headers: Dict[str, str],
+        ) -> _FakeTrustlineResponse:
+            calls.append(("post", url, headers))
+            assert url == "https://api.trustline.test/api/v1/validation/assess-verifiable-intent-async"
+            assert headers["Authorization"] == "Bearer tl_production_test.secret"
+            assert headers["Idempotency-Key"].startswith(
+                "x402-secure:assess-verifiable-intent-async:"
+            )
+            assert headers["X-Correlation-Id"] == "risk_sess_1"
+            return _FakeTrustlineResponse(
+                200,
+                {
+                    "status": "pending",
+                    "trustline_transaction_id": "tl_tx_123",
+                    "underwriting_request_id": "uw_req_123",
+                    "job_id": "job_123",
+                    "idempotency_key": headers["Idempotency-Key"],
+                    "poll_url": "/api/v1/underwriting/transactions/tl_tx_123",
+                    "progress": {},
+                },
+            )
+
+        async def get(self, url: str, *, headers: Dict[str, str]) -> _FakeTrustlineResponse:
+            calls.append(("get", url, headers))
+            assert url == "https://api.trustline.test/api/v1/underwriting/transactions/tl_tx_123"
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return _FakeTrustlineResponse(
+                    200,
+                    {
+                        "trustline_transaction_id": "tl_tx_123",
+                        "status": "running",
+                        "retry_after_seconds": 0,
+                        "progress": {},
+                    },
+                )
+            return _FakeTrustlineResponse(
+                200,
+                {
+                    "trustline_transaction_id": "tl_tx_123",
+                    "status": "completed",
+                    "decision": "allow",
+                    "risk_level": "low",
+                    "reasons": [],
+                    "warnings": [],
+                    "final_result": {
+                        "decision": "allow",
+                        "risk_level": "low",
+                        "vi": {"verified": True},
+                    },
+                    "progress": {},
+                },
+            )
+
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.httpx.AsyncClient",
+        FakeAsyncClient,
+    )
+    from x402_proxy.internal_facilitator import post_trustline_validation
+
+    result = await post_trustline_validation(
+        "assess-verifiable-intent-async",
+        {"traceContext": {"riskSession": "risk_sess_1"}},
+    )
+
+    assert result["decision"] == "allow"
+    assert result["risk_level"] == "low"
+    assert result["vi"]["verified"] is True
+    assert result["trustline_assessment"]["async"]["trustline_transaction_id"] == "tl_tx_123"
+    assert [method for method, _url, _headers in calls] == ["post", "get", "get"]
 
 
 def _evaluate_payload(*, amount: Any = "10.00") -> Dict[str, Any]:
@@ -175,7 +282,7 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["decision"] == "allow"
-    assert captured["path"] == "assess-verifiable-intent"
+    assert captured["path"] == "assess-verifiable-intent-async"
     payload = captured["payload"]
     assert payload["agentId"] == "shopping-agent-1"
     assert payload["paymentContext"]["chain"] == "xrpl"
@@ -197,6 +304,60 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
     assert payload["traceContext"]["tool_calls"][0]["name"] == "build_verifiable_intent"
     assert payload["traceContext"]["finalDecision"].startswith("Proceed only")
     assert payload["traceContext"]["final_decision"].startswith("Proceed only")
+
+
+def test_internal_evaluate_preserves_normalized_ap2_context(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    captured: dict = {}
+    body = _evaluate_payload()
+    body["extensions"]["x402Secure"]["ap2"] = {
+        "paymentMandateRef": "urn:t54:ap2:xrpl:payment:inv_123",
+        "paymentMandateId": "pm_xrpl_inv_123",
+        "paymentMandateHash": "sha256:mandate_hash",
+        "paymentMandate": {"paymentMandateId": "pm_xrpl_inv_123"},
+        "paymentMessage": {
+            "reference": "pm_xrpl_inv_123",
+            "contents": {"amount": "10", "asset": "XRP"},
+        },
+        "normalized": {
+            "payment_mandate_id": "pm_xrpl_inv_123",
+            "payment_request_id": "inv_123",
+            "merchant_agent": "did:web:merchant.example",
+            "has_user_authorization": True,
+            "has_merchant_authorization": True,
+        },
+        "riskData": {"source": "xrpl-facilitator-e2e"},
+    }
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_ap2",
+            "risk_level": "low",
+            "binding": payload["binding"],
+            "reasons": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    ap2_context = captured["payload"]["ap2Context"]
+    assert ap2_context["paymentMandateRef"] == "urn:t54:ap2:xrpl:payment:inv_123"
+    assert ap2_context["paymentMandateId"] == "pm_xrpl_inv_123"
+    assert ap2_context["paymentMandateHash"] == "sha256:mandate_hash"
+    assert ap2_context["paymentMandate"]["paymentMandateId"] == "pm_xrpl_inv_123"
+    assert ap2_context["payment_message"]["reference"] == "pm_xrpl_inv_123"
+    assert ap2_context["normalized"]["payment_mandate_id"] == "pm_xrpl_inv_123"
+    assert ap2_context["normalized"]["has_user_authorization"] is True
+    assert ap2_context["risk_data"]["source"] == "xrpl-facilitator-e2e"
 
 
 def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:

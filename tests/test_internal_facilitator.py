@@ -306,6 +306,60 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
     assert payload["traceContext"]["final_decision"].startswith("Proceed only")
 
 
+def test_internal_evaluate_preserves_normalized_ap2_context(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    captured: dict = {}
+    body = _evaluate_payload()
+    body["extensions"]["x402Secure"]["ap2"] = {
+        "paymentMandateRef": "urn:t54:ap2:xrpl:payment:inv_123",
+        "paymentMandateId": "pm_xrpl_inv_123",
+        "paymentMandateHash": "sha256:mandate_hash",
+        "paymentMandate": {"paymentMandateId": "pm_xrpl_inv_123"},
+        "paymentMessage": {
+            "reference": "pm_xrpl_inv_123",
+            "contents": {"amount": "10", "asset": "XRP"},
+        },
+        "normalized": {
+            "payment_mandate_id": "pm_xrpl_inv_123",
+            "payment_request_id": "inv_123",
+            "merchant_agent": "did:web:merchant.example",
+            "has_user_authorization": True,
+            "has_merchant_authorization": True,
+        },
+        "riskData": {"source": "xrpl-facilitator-e2e"},
+    }
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_ap2",
+            "risk_level": "low",
+            "binding": payload["binding"],
+            "reasons": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    ap2_context = captured["payload"]["ap2Context"]
+    assert ap2_context["paymentMandateRef"] == "urn:t54:ap2:xrpl:payment:inv_123"
+    assert ap2_context["paymentMandateId"] == "pm_xrpl_inv_123"
+    assert ap2_context["paymentMandateHash"] == "sha256:mandate_hash"
+    assert ap2_context["paymentMandate"]["paymentMandateId"] == "pm_xrpl_inv_123"
+    assert ap2_context["payment_message"]["reference"] == "pm_xrpl_inv_123"
+    assert ap2_context["normalized"]["payment_mandate_id"] == "pm_xrpl_inv_123"
+    assert ap2_context["normalized"]["has_user_authorization"] is True
+    assert ap2_context["risk_data"]["source"] == "xrpl-facilitator-e2e"
+
+
 def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:
     client = _client(monkeypatch)
     body = _evaluate_payload(amount=None)

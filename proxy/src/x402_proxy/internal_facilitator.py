@@ -67,7 +67,7 @@ class VerifiableIntentReference(BaseModel):
 
 
 class AP2ReferenceSet(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     intent_mandate_ref: Optional[str] = Field(default=None, alias="intentMandateRef")
     cart_mandate_ref: Optional[str] = Field(default=None, alias="cartMandateRef")
@@ -75,6 +75,19 @@ class AP2ReferenceSet(BaseModel):
     intent_mandate_hash: Optional[str] = Field(default=None, alias="intentMandateHash")
     cart_mandate_hash: Optional[str] = Field(default=None, alias="cartMandateHash")
     payment_mandate_hash: Optional[str] = Field(default=None, alias="paymentMandateHash")
+    payment_mandate_id: Optional[str] = Field(default=None, alias="paymentMandateId")
+    payment_mandate: Optional[Dict[str, Any]] = Field(default=None, alias="paymentMandate")
+    payment_message: Optional[Dict[str, Any]] = Field(
+        default=None,
+        validation_alias=AliasChoices("paymentMessage", "payment_message"),
+        serialization_alias="payment_message",
+    )
+    normalized: Dict[str, Any] = Field(default_factory=dict)
+    risk_data: Dict[str, Any] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("riskData", "risk_data"),
+        serialization_alias="risk_data",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 

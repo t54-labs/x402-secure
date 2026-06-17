@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -175,7 +175,7 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["decision"] == "allow"
-    assert captured["path"] == "assess-verifiable-intent"
+    assert captured["path"] == "verifiable-intent/verify-chain"
     payload = captured["payload"]
     assert payload["agentId"] == "shopping-agent-1"
     assert payload["paymentContext"]["chain"] == "xrpl"
@@ -238,7 +238,7 @@ def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypat
     )
 
     assert response.status_code == 200
-    assert captured["path"] == "assess-verifiable-intent"
+    assert captured["path"] == "verifiable-intent/verify-chain"
     payload = captured["payload"]
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
     assert payload["verifiableIntentChain"] == chain
@@ -333,6 +333,114 @@ def test_internal_evaluate_accepts_camelcase_trustline_decision_id(monkeypatch) 
 
     assert response.status_code == 200
     assert response.json()["decision_id"] == "dec_camel"
+
+
+def test_internal_evaluate_maps_fast_chain_response(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        return {
+            "decision": "allow",
+            "decisionId": "dec_fast_chain",
+            "chain": {
+                "present": True,
+                "parsed": True,
+                "verified": True,
+                "constraint_satisfied": True,
+                "profile": "https://staging.t54.ai/credentials/agent-pay/vi",
+                "violations": [],
+                "not_evaluable": [],
+                "label": "verifiable_intent:chain_verified",
+                "binding": {"payment_bound": True, "chain": "xrpl"},
+            },
+            "binding": payload["binding"],
+            "verifierMode": "enabled",
+            "latencyMs": 17,
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert captured["path"] == "verifiable-intent/verify-chain"
+    assert body["decision"] == "allow"
+    assert body["decision_id"] == "dec_fast_chain"
+    assert body["vi"]["verified"] is True
+    assert body["vi"]["chain_verified"] is True
+    assert body["vi"]["constraint_satisfied"] is True
+    assert body["trustline_assessment"]["source"] == "verifiable-intent/verify-chain"
+    assert body["trustline_assessment"]["verifier_mode"] == "enabled"
+
+
+def test_internal_evaluate_denies_fast_chain_constraint_violation(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "decision": "deny",
+            "decisionId": "dec_fast_constraint",
+            "chain": {
+                "present": True,
+                "parsed": True,
+                "verified": True,
+                "constraint_satisfied": False,
+                "error_code": "VI_CONSTRAINT_EXCEEDED",
+                "violations": ["per_transaction_max exceeded"],
+                "not_evaluable": [],
+                "label": "verifiable_intent:chain_over_delegation",
+                "binding": {"payment_bound": True, "chain": "xrpl"},
+            },
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "deny"
+    assert body["risk_level"] == "high"
+    assert body["vi"]["chain_verified"] is True
+    assert body["vi"]["verified"] is False
+    assert body["vi"]["constraint_satisfied"] is False
+    assert "VI_CONSTRAINT_EXCEEDED" in body["reasons"]
+    assert "per_transaction_max exceeded" in body["reasons"]
+
+
+def test_internal_evaluate_fails_closed_when_trustline_unavailable(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(status_code=502, detail="Trustline error: unavailable")
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "deny"
+    assert body["risk_level"] == "high"
+    assert body["ttl_seconds"] == 60
+    assert body["reasons"] == ["Trustline verification unavailable"]
+    assert "failed closed" in body["warnings"][0]
 
 
 def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch) -> None:

@@ -18,6 +18,8 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH = "verifiable-intent/verify-chain"
+
 internal_router = APIRouter(
     prefix="/internal/x402-secure/facilitator",
     tags=["x402-secure-internal-facilitator"],
@@ -496,6 +498,14 @@ async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[
         raise HTTPException(status_code=502, detail=f"Invalid Trustline response: {exc}") from exc
 
 
+def _trustline_facilitator_verify_chain_path() -> str:
+    return (
+        os.getenv("TRUSTLINE_FACILITATOR_VERIFY_CHAIN_PATH")
+        or os.getenv("TRUSTLINE_VERIFY_CHAIN_PATH")
+        or DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH
+    ).strip("/")
+
+
 def build_trustline_assessment_payload(
     request: InternalFacilitatorEvaluateRequest,
     extension: X402SecureExtension,
@@ -609,6 +619,45 @@ def _enforce_required_verified_vi_result(
     return "deny"
 
 
+def _vi_result_from_trustline_response(trustline_response: Dict[str, Any]) -> Dict[str, Any]:
+    vi_result = trustline_response.get("vi")
+    if isinstance(vi_result, dict):
+        return vi_result
+    chain = trustline_response.get("chain")
+    if not isinstance(chain, dict):
+        return {}
+    chain_verified = bool(chain.get("verified"))
+    constraint_ok = chain.get("constraint_satisfied") is not False
+    error_code = chain.get("error_code")
+    verified_for_payment = chain_verified and constraint_ok and not error_code
+    return {
+        "present": bool(chain.get("present")),
+        "parsed": bool(chain.get("parsed")),
+        "verified": verified_for_payment,
+        "chain_verified": chain_verified,
+        "constraint_satisfied": chain.get("constraint_satisfied"),
+        "profile": chain.get("profile"),
+        "error_code": error_code,
+        "violations": list(chain.get("violations") or []),
+        "not_evaluable": list(chain.get("not_evaluable") or []),
+        "label": chain.get("label"),
+        "binding": chain.get("binding") or {},
+    }
+
+
+def _append_vi_reasons(
+    reasons: List[str],
+    vi_result: Dict[str, Any],
+) -> None:
+    error_code = vi_result.get("error_code")
+    if error_code and error_code not in reasons:
+        reasons.append(str(error_code))
+    for violation in vi_result.get("violations") or []:
+        text = violation if isinstance(violation, str) else json.dumps(violation, sort_keys=True)
+        if text not in reasons:
+            reasons.append(text)
+
+
 @internal_router.post(
     "/evaluate",
     response_model=InternalFacilitatorDecisionResponse,
@@ -620,11 +669,49 @@ async def evaluate_facilitator_payment(
     extension = _extract_extension(body.extensions)
     binding = build_binding_profile(body.payment)
     payload = build_trustline_assessment_payload(body, extension, binding)
-    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    trustline_path = _trustline_facilitator_verify_chain_path()
+    try:
+        trustline_response = await post_trustline_validation(trustline_path, payload)
+    except HTTPException as exc:
+        logger.warning(
+            "[INTERNAL] facilitator=%s trustline_verify_chain_failed status=%s detail=%s",
+            body.facilitator.id,
+            exc.status_code,
+            exc.detail,
+        )
+        return {
+            "decision": "deny",
+            "decision_id": f"xs_dec_{uuid.uuid4().hex}",
+            "risk_level": "high",
+            "ttl_seconds": 60,
+            "vi": {},
+            "binding": binding.model_dump(by_alias=False, exclude_none=True),
+            "reasons": ["Trustline verification unavailable"],
+            "warnings": [f"Trustline verification failed closed: {exc.detail}"],
+            "trustline_assessment": {"source": trustline_path, "error": str(exc.detail)},
+        }
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "[INTERNAL] facilitator=%s trustline_verify_chain_http_error error=%s",
+            body.facilitator.id,
+            exc,
+        )
+        return {
+            "decision": "deny",
+            "decision_id": f"xs_dec_{uuid.uuid4().hex}",
+            "risk_level": "high",
+            "ttl_seconds": 60,
+            "vi": {},
+            "binding": binding.model_dump(by_alias=False, exclude_none=True),
+            "reasons": ["Trustline verification unavailable"],
+            "warnings": [f"Trustline verification failed closed: {exc}"],
+            "trustline_assessment": {"source": trustline_path, "error": str(exc)},
+        }
 
     warnings = list(trustline_response.get("warnings") or [])
     reasons = list(trustline_response.get("reasons") or [])
-    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
+    vi_result = _vi_result_from_trustline_response(trustline_response)
+    _append_vi_reasons(reasons, vi_result)
     decision = _effective_decision(
         str(trustline_response.get("decision", "review")),
         extension.policy,
@@ -651,14 +738,19 @@ async def evaluate_facilitator_payment(
     return {
         "decision": decision,
         "decision_id": decision_id,
-        "risk_level": trustline_response.get("risk_level", "medium"),
+        "risk_level": trustline_response.get("risk_level") or ("high" if decision == "deny" else "low"),
         "ttl_seconds": trustline_response.get("ttl_seconds", 300),
         "vi": vi_result,
         "binding": trustline_response.get("binding")
         or binding.model_dump(by_alias=False, exclude_none=True),
         "reasons": reasons,
         "warnings": warnings,
-        "trustline_assessment": trustline_response.get("trustline_assessment") or {},
+        "trustline_assessment": trustline_response.get("trustline_assessment")
+        or {
+            "source": trustline_path,
+            "verifier_mode": trustline_response.get("verifierMode"),
+            "latency_ms": trustline_response.get("latencyMs"),
+        },
     }
 
 

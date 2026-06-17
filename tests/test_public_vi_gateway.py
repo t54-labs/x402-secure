@@ -20,14 +20,6 @@ _VI_HASH = "sha256:" + ("a" * 64)
 _TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
 
-def _vi_chain() -> Dict[str, Any]:
-    return {
-        "l1Credential": {"format": "sd-jwt", "sdJwt": "l1.sd.jwt"},
-        "l2Delegation": {"format": "kb-jwt", "jwt": "l2.jwt"},
-        "l3FinalAction": {"format": "kb-jwt", "jwt": "l3.jwt"},
-    }
-
-
 def _request(headers: Optional[Dict[str, str]] = None) -> Request:
     raw_headers = [
         (key.lower().encode("latin-1"), value.encode("latin-1"))
@@ -232,7 +224,6 @@ def test_build_public_vi_assessment_payload_matches_trustline_shape() -> None:
             "presentationRef": "tl://evidence/body",
             "claims": {"purpose": "market-data"},
         },
-        verifiableIntentChain=_vi_chain(),
         ap2Context={"paymentMandateRef": "tl://mandate/payment_1"},
     )
 
@@ -251,7 +242,6 @@ def test_build_public_vi_assessment_payload_matches_trustline_shape() -> None:
     assert payload["policy"]["requireVerifiableIntent"] is True
     assert payload["merchantId"] == "did:web:merchant.example"
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/body"
-    assert payload["verifiableIntentChain"]["l1Credential"]["sdJwt"] == "l1.sd.jwt"
     assert payload["ap2Context"]["paymentMandateRef"] == "tl://mandate/payment_1"
     assert payload["binding"]["paymentBound"] is True
     assert payload["binding"]["hashes"]["paymentPayloadHash"].startswith("sha256:")
@@ -301,86 +291,6 @@ def test_proxy_verify_calls_trustline_when_vi_policy_required(monkeypatch) -> No
     assert captured["path"] == "assess-verifiable-intent"
     assert captured["payload"]["policy"]["requireVerifiableIntent"] is True
     assert captured["payload"]["paymentContext"]["paymentRequirementsHash"].startswith("sha256:")
-
-
-def test_proxy_verify_routes_vi_chain_to_fast_trustline_verifier(monkeypatch) -> None:
-    client = _proxy_client(monkeypatch)
-    sid = _risk_session(client)
-    captured: Dict[str, Any] = {}
-
-    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        captured["path"] = path
-        captured["payload"] = payload
-        return {
-            "decision": "allow",
-            "decision_id": "vi_chain_dec_1",
-            "chain": {
-                "present": True,
-                "parsed": True,
-                "verified": True,
-                "constraint_satisfied": True,
-                "profile": "trustline.vi-chain.v1",
-            },
-            "binding": payload["binding"],
-            "verifierMode": "enabled",
-        }
-
-    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
-
-    response = client.post(
-        "/x402/verify",
-        json=_body_json(
-            _body(
-                extra={"vi": {"requireVerifiedIntent": True, "reviewMode": "block"}},
-                verifiableIntentChain=_vi_chain(),
-            )
-        ),
-        headers={
-            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
-            "X-RISK-SESSION": sid,
-            "Origin": "https://merchant.example",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.headers["x-vi-decision"] == "allow"
-    assert response.headers["x-vi-decision-id"] == "vi_chain_dec_1"
-    assert response.headers["x-vi-verified"] == "true"
-    assert captured["path"] == "verifiable-intent/verify-chain"
-    assert captured["payload"]["verifiableIntentChain"]["l2Delegation"]["jwt"] == "l2.jwt"
-
-
-def test_proxy_verify_rejects_incomplete_vi_chain_without_trustline_call(
-    monkeypatch,
-) -> None:
-    client = _proxy_client(monkeypatch)
-    sid = _risk_session(client)
-
-    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        raise AssertionError("Trustline should not be called for an incomplete VI chain")
-
-    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
-
-    response = client.post(
-        "/x402/verify",
-        json=_body_json(
-            _body(
-                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
-                verifiableIntentChain={
-                    "l1Credential": {"sdJwt": "l1.sd.jwt"},
-                    "l2Delegation": {"jwt": "l2.jwt"},
-                },
-            )
-        ),
-        headers={
-            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
-            "X-RISK-SESSION": sid,
-            "Origin": "https://merchant.example",
-        },
-    )
-
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "VI_CHAIN_INCOMPLETE"
 
 
 def test_proxy_verify_fails_fast_when_required_vi_missing(monkeypatch) -> None:

@@ -798,6 +798,39 @@ def _append_vi_reasons(
             reasons.append(text)
 
 
+def _trustline_assessment_summary(
+    trustline_response: Dict[str, Any],
+    trustline_path: str,
+) -> Dict[str, Any]:
+    summary = trustline_response.get("trustline_assessment")
+    if isinstance(summary, dict):
+        assessment = dict(summary)
+    else:
+        assessment = {}
+
+    assessment.setdefault("source", trustline_path)
+    if trustline_response.get("verifierMode") is not None:
+        assessment.setdefault("verifier_mode", trustline_response.get("verifierMode"))
+    if trustline_response.get("latencyMs") is not None:
+        assessment.setdefault("latency_ms", trustline_response.get("latencyMs"))
+
+    wallet_gate = trustline_response.get("walletGate") or trustline_response.get("wallet_gate")
+    if isinstance(wallet_gate, dict):
+        assessment.setdefault("wallet_gate", wallet_gate)
+
+    tier2_assessment = trustline_response.get("tier2Assessment") or trustline_response.get(
+        "tier2_assessment"
+    )
+    if isinstance(tier2_assessment, dict):
+        assessment.setdefault("tier2_assessment", tier2_assessment)
+
+    decision_id = trustline_response.get("decision_id") or trustline_response.get("decisionId")
+    if decision_id is not None:
+        assessment.setdefault("decision_id", decision_id)
+
+    return assessment
+
+
 @internal_router.post(
     "/evaluate",
     response_model=InternalFacilitatorDecisionResponse,
@@ -878,19 +911,18 @@ async def evaluate_facilitator_payment(
     return {
         "decision": decision,
         "decision_id": decision_id,
-        "risk_level": trustline_response.get("risk_level") or ("high" if decision == "deny" else "low"),
+        "risk_level": trustline_response.get("risk_level")
+        or ("high" if decision == "deny" else "low"),
         "ttl_seconds": trustline_response.get("ttl_seconds", 300),
         "vi": vi_result,
         "binding": trustline_response.get("binding")
         or binding.model_dump(by_alias=False, exclude_none=True),
         "reasons": reasons,
         "warnings": warnings,
-        "trustline_assessment": trustline_response.get("trustline_assessment")
-        or {
-            "source": trustline_path,
-            "verifier_mode": trustline_response.get("verifierMode"),
-            "latency_ms": trustline_response.get("latencyMs"),
-        },
+        "trustline_assessment": _trustline_assessment_summary(
+            trustline_response,
+            trustline_path,
+        ),
     }
 
 

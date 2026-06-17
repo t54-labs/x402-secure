@@ -246,7 +246,10 @@ def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypat
     payload = captured["payload"]
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
     assert payload["verifiableIntentChain"] == chain
-    assert payload["verifiableIntentChain"]["l1Credential"]["sdJwt"] == chain["l1Credential"]["sdJwt"]
+    assert (
+        payload["verifiableIntentChain"]["l1Credential"]["sdJwt"]
+        == chain["l1Credential"]["sdJwt"]
+    )
     assert payload["verifiableIntentChain"]["l2Delegation"]["sdJwt"].endswith("~l2-disclosure~")
     assert payload["verifiableIntentChain"]["l3FinalAction"]["sdJwt"].endswith(".sig~")
 
@@ -397,6 +400,15 @@ def test_internal_evaluate_maps_fast_chain_response(monkeypatch) -> None:
             "binding": payload["binding"],
             "verifierMode": "enabled",
             "latencyMs": 17,
+            "walletGate": {
+                "decision": "allow",
+                "reason": "insufficient_signal",
+                "walletAddress": "rBuyerWallet",
+            },
+            "tier2Assessment": {
+                "status": "queued",
+                "trustlineTransactionId": "tl_txn_tier2_123",
+            },
         }
 
     monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
@@ -417,6 +429,17 @@ def test_internal_evaluate_maps_fast_chain_response(monkeypatch) -> None:
     assert body["vi"]["constraint_satisfied"] is True
     assert body["trustline_assessment"]["source"] == "verifiable-intent/verify-chain"
     assert body["trustline_assessment"]["verifier_mode"] == "enabled"
+    assert body["trustline_assessment"]["latency_ms"] == 17
+    assert body["trustline_assessment"]["decision_id"] == "dec_fast_chain"
+    assert body["trustline_assessment"]["wallet_gate"] == {
+        "decision": "allow",
+        "reason": "insufficient_signal",
+        "walletAddress": "rBuyerWallet",
+    }
+    assert body["trustline_assessment"]["tier2_assessment"] == {
+        "status": "queued",
+        "trustlineTransactionId": "tl_txn_tier2_123",
+    }
 
 
 def test_internal_evaluate_denies_fast_chain_constraint_violation(monkeypatch) -> None:

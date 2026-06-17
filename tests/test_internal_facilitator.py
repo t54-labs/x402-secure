@@ -48,6 +48,8 @@ def _evaluate_payload(*, amount: Any = "10.00") -> Dict[str, Any]:
             "x402Secure": {
                 "version": "x402-secure.vi.v1",
                 "policy": {
+                    "policyId": "pol_xrpl_default",
+                    "policyVersion": "v1",
                     "requireVerifiableIntent": True,
                     "requireTrace": True,
                     "reviewMode": "block",
@@ -182,6 +184,8 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
     assert payload["paymentContext"]["amount"] == "10"
     assert payload["paymentContext"]["destination"] == "rMerchantDestination"
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
+    assert payload["policy"]["policyId"] == "pol_xrpl_default"
+    assert payload["policy"]["policyVersion"] == "v1"
     assert payload["binding"]["paymentBound"] is True
     assert payload["traceContext"]["traceRef"] == "tl://evidence/trace_123"
     assert payload["traceContext"]["traceHash"] == "sha256:trace_hash"
@@ -625,3 +629,68 @@ def test_internal_evidence_session_forwards_policy(monkeypatch) -> None:
     assert captured["path"] == "verifiable-intent/evidence-session"
     assert captured["payload"]["policy"]["requireVerifiableIntent"] is True
     assert response.json()["session_id"] == "vi_sess_123"
+
+
+def test_internal_trustline_auth_headers_prefer_org_token(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
+        '{"org_xrpl_dev":"org-token"}',
+    )
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_xrpl_default":"policy-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers(
+        {
+            "metadata": {"developerOrgId": "org_xrpl_dev"},
+            "policy": {"policyId": "pol_xrpl_default"},
+        }
+    )
+
+    assert headers == {"Authorization": "Bearer org-token"}
+
+
+def test_internal_trustline_auth_headers_use_policy_token(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_xrpl_default":"policy-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
+
+    assert headers == {"Authorization": "Bearer policy-token"}
+
+
+def test_internal_trustline_auth_headers_fallback_to_default_token(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_other":"other-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
+
+    assert headers == {"Authorization": "Bearer default-token"}
+
+
+def test_internal_trustline_auth_headers_reject_invalid_policy_map(monkeypatch) -> None:
+    monkeypatch.setenv("X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON", "not-json")
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    try:
+        _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
+    except HTTPException as exc:
+        assert exc.status_code == 500
+        assert "must be a JSON object" in str(exc.detail)
+    else:  # pragma: no cover
+        raise AssertionError("Expected invalid policy-token map to fail closed")

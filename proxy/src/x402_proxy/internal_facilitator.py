@@ -35,6 +35,8 @@ class FacilitatorInfo(BaseModel):
 class InternalPolicy(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
+    policy_id: Optional[str] = Field(default=None, alias="policyId")
+    policy_version: Optional[str] = Field(default=None, alias="policyVersion")
     require_verifiable_intent: bool = Field(default=False, alias="requireVerifiableIntent")
     require_verified_intent: bool = Field(default=False, alias="requireVerifiedIntent")
     require_payment_mandate: bool = Field(default=False, alias="requirePaymentMandate")
@@ -473,12 +475,106 @@ def _trustline_validation_path(path: str) -> str:
     return f"/{prefix}/{path.lstrip('/')}"
 
 
-def _trustline_auth_headers() -> Dict[str, str]:
-    token = (
+def _default_trustline_token() -> Optional[str]:
+    return (
         os.getenv("TRUSTLINE_INTERNAL_TOKEN")
         or os.getenv("RISK_INTERNAL_TOKEN")
+        or os.getenv("TRUSTLINE_API_KEY")
         or os.getenv("X402_SECURE_TRUSTLINE_TOKEN")
     )
+
+
+def _json_mapping_from_env(*names: str) -> Dict[str, str]:
+    raw = ""
+    source = ""
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            source = name
+            break
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"{source} must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail=f"{source} must be a JSON object")
+
+    mapping: Dict[str, str] = {}
+    for key, value in parsed.items():
+        if value is None:
+            continue
+        token = str(value).strip()
+        if token:
+            mapping[str(key)] = token
+    return mapping
+
+
+def _trustline_token_by_org() -> Dict[str, str]:
+    return _json_mapping_from_env(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
+        "TRUSTLINE_TOKENS_BY_ORG_JSON",
+    )
+
+
+def _trustline_token_by_policy() -> Dict[str, str]:
+    return _json_mapping_from_env(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        "TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        "TRUSTLINE_API_KEYS_BY_POLICY_JSON",
+    )
+
+
+def _extract_policy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    policy = payload.get("policy")
+    if isinstance(policy, dict):
+        return policy
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("policy"), dict):
+        return metadata["policy"]
+    return {}
+
+
+def _extract_developer_org_id(payload: Dict[str, Any]) -> Optional[str]:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("developerOrgId", "developer_org_id", "organizationId", "organization_id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_policy_id(payload: Dict[str, Any]) -> Optional[str]:
+    policy = _extract_policy(payload)
+    for key in ("policyId", "policy_id"):
+        value = policy.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _trustline_token_for_payload(payload: Dict[str, Any]) -> Optional[str]:
+    org_id = _extract_developer_org_id(payload)
+    if org_id:
+        token = _trustline_token_by_org().get(org_id)
+        if token:
+            return token
+
+    policy_id = _extract_policy_id(payload)
+    if policy_id:
+        token = _trustline_token_by_policy().get(policy_id)
+        if token:
+            return token
+
+    return _default_trustline_token()
+
+
+def _trustline_auth_headers(payload: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    token = _trustline_token_for_payload(payload or {})
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -489,7 +585,7 @@ async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[
     else:
         url = f"{base_url}{_trustline_validation_path(path)}"
     async with httpx.AsyncClient(timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))) as client:
-        response = await client.post(url, json=payload, headers=_trustline_auth_headers())
+        response = await client.post(url, json=payload, headers=_trustline_auth_headers(payload))
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Trustline error: {response.text}")
     try:

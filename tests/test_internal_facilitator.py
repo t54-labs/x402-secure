@@ -317,6 +317,36 @@ def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None
     assert captured["payload"]["binding"]["amount"] == "2.5"
 
 
+def test_internal_evaluate_converts_xrpl_drops_from_context_amount(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload(amount="1000")
+    body["payment"]["payload"] = {
+        "signedTxBlob": "120000228000000024000000016140000000000003E8",
+    }
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_context_drops",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["paymentContext"]["amount"] == "0.001"
+    assert captured["payload"]["binding"]["amount"] == "0.001"
+
+
 def test_internal_evaluate_extracts_xrpl_issued_currency_amount(monkeypatch) -> None:
     client = _client(monkeypatch)
     body = _evaluate_payload(amount=None)

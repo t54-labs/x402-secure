@@ -302,6 +302,17 @@ def _xrpl_amount_from_payload(payment: InternalPaymentContext) -> Optional[str]:
     return _decimal_string(text)
 
 
+def _xrpl_amount_from_context(payment: InternalPaymentContext) -> Optional[str]:
+    raw_amount = payment.amount
+    if raw_amount is None:
+        return None
+    asset = str(payment.asset or payment.currency or "XRP").upper()
+    text = str(raw_amount)
+    if asset == "XRP" and text.isdigit():
+        return _decimal_string(Decimal(text) / Decimal("1000000"))
+    return _decimal_string(text)
+
+
 def _add_violation(
     violations: List[Dict[str, Any]],
     code: str,
@@ -317,7 +328,7 @@ def _add_violation(
 def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult:
     payload = payment.payload or {}
     amount_object = payload.get("Amount") if isinstance(payload.get("Amount"), dict) else {}
-    amount = _decimal_string(payment.amount) or _xrpl_amount_from_payload(payment)
+    amount = _xrpl_amount_from_payload(payment) or _xrpl_amount_from_context(payment)
     asset = _first_present(
         payment.asset,
         payment.currency,

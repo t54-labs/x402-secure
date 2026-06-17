@@ -57,6 +57,22 @@ class VerifiableIntentReference(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class VerifiableIntentChainNode(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    format: Optional[str] = None
+    sd_jwt: Optional[str] = Field(default=None, alias="sdJwt", repr=False)
+    jwt: Optional[str] = Field(default=None, repr=False)
+
+
+class VerifiableIntentChainReference(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    l1_credential: VerifiableIntentChainNode = Field(alias="l1Credential")
+    l2_delegation: VerifiableIntentChainNode = Field(alias="l2Delegation")
+    l3_final_action: VerifiableIntentChainNode = Field(alias="l3FinalAction")
+
+
 class AP2ReferenceSet(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -95,6 +111,10 @@ class X402SecureExtension(BaseModel):
     verifiable_intent: Optional[VerifiableIntentReference] = Field(
         default=None,
         alias="verifiableIntent",
+    )
+    verifiable_intent_chain: Optional[VerifiableIntentChainReference] = Field(
+        default=None,
+        alias="verifiableIntentChain",
     )
     ap2: Optional[AP2ReferenceSet] = None
     trace: Optional[TraceReferenceSet] = None
@@ -516,6 +536,11 @@ def build_trustline_assessment_payload(
         if extension.verifiable_intent
         else None
     )
+    vi_chain = (
+        extension.verifiable_intent_chain.model_dump(by_alias=True, exclude_none=True)
+        if extension.verifiable_intent_chain
+        else None
+    )
     ap2_context = (
         extension.ap2.model_dump(by_alias=True, exclude_none=True) if extension.ap2 else None
     )
@@ -527,6 +552,7 @@ def build_trustline_assessment_payload(
         or f"{request.facilitator.id}:unknown-agent",
         "walletAddress": request.buyer.get("walletAddress") or request.buyer.get("wallet_address"),
         "verifiableIntent": vi,
+        "verifiableIntentChain": vi_chain,
         "paymentContext": payment_context,
         "binding": binding.model_dump(by_alias=True, exclude_none=True),
         "ap2Context": ap2_context,

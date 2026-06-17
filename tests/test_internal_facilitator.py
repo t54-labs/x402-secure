@@ -199,6 +199,54 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
     assert payload["traceContext"]["final_decision"].startswith("Proceed only")
 
 
+def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload()
+    chain = {
+        "l1Credential": {
+            "format": "sd+jwt",
+            "sdJwt": "eyJraWQiOiJpc3N1ZXIifQ.eyJ2Y3QiOiJjYXJkIn0.sig~l1-disclosure~",
+        },
+        "l2Delegation": {
+            "format": "kb-sd-jwt+kb",
+            "sdJwt": "eyJraWQiOiJvd25lciJ9.eyJ2Y3QiOiJtYW5kYXRlIn0.sig~l2-disclosure~",
+        },
+        "l3FinalAction": {
+            "format": "kb-sd-jwt",
+            "sdJwt": "eyJraWQiOiJhZ2VudCJ9.eyJ0cmFuc2FjdGlvbiI6e319.sig~",
+        },
+    }
+    body["extensions"]["x402Secure"]["verifiableIntentChain"] = chain
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_chain",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert captured["path"] == "assess-verifiable-intent"
+    payload = captured["payload"]
+    assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
+    assert payload["verifiableIntentChain"] == chain
+    assert payload["verifiableIntentChain"]["l1Credential"]["sdJwt"] == chain["l1Credential"]["sdJwt"]
+    assert payload["verifiableIntentChain"]["l2Delegation"]["sdJwt"].endswith("~l2-disclosure~")
+    assert payload["verifiableIntentChain"]["l3FinalAction"]["sdJwt"].endswith(".sig~")
+
+
 def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:
     client = _client(monkeypatch)
     body = _evaluate_payload(amount=None)

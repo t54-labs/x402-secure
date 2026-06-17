@@ -233,6 +233,10 @@ class InternalReceiptRequest(BaseModel):
 def _configured_internal_token() -> Optional[str]:
     return (
         os.getenv("X402_SECURE_INTERNAL_TOKEN")
+        # MF-2 (code review): the XRPL facilitator caller sends its token from
+        # X402_SECURE_INTERNAL_AUTH_TOKEN — accept that name too so the two services don't
+        # disagree (else an operator is tempted to flip X402_SECURE_INTERNAL_AUTH_DISABLED).
+        or os.getenv("X402_SECURE_INTERNAL_AUTH_TOKEN")
         or os.getenv("FACILITATOR_INTERNAL_TOKEN")
         or os.getenv("INTERNAL_FACILITATOR_TOKEN")
     )

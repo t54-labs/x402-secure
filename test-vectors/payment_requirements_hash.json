@@ -1,0 +1,134 @@
+{
+  "version": "payment-requirements-hash.v1",
+  "vectors": [
+    {
+      "name": "xrp_mainnet_basic",
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "xrpl:0",
+        "amount": "1000",
+        "asset": "XRP",
+        "payTo": "rEchoMerchant111111111111111111111111",
+        "maxTimeoutSeconds": 600,
+        "extra": {
+          "invoiceId": "INV-XRP-0001"
+        }
+      },
+      "expectedCanonicalJson": "{\"amount\":\"1000\",\"asset\":\"XRP\",\"extra\":{\"invoiceId\":\"INV-XRP-0001\"},\"maxTimeoutSeconds\":600,\"network\":\"xrpl:0\",\"payTo\":\"rEchoMerchant111111111111111111111111\",\"scheme\":\"exact\"}",
+      "expectedHash": "sha256:7af8dcd7b6acb20c4abce6590566501c46aeef1f4fb8207b2178592b35bf6d63"
+    },
+    {
+      "name": "rlusd_issued_currency",
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "xrpl:0",
+        "amount": "0.25",
+        "asset": "RLUSD",
+        "payTo": "rMerchantRLUSD22222222222222222222",
+        "maxTimeoutSeconds": 120,
+        "extra": {
+          "invoiceId": "INV-RLUSD-0002",
+          "issuer": "rIssuerRLUSD333333333333333333333",
+          "sourceTag": 804681468
+        }
+      },
+      "expectedCanonicalJson": "{\"amount\":\"0.25\",\"asset\":\"RLUSD\",\"extra\":{\"invoiceId\":\"INV-RLUSD-0002\",\"issuer\":\"rIssuerRLUSD333333333333333333333\",\"sourceTag\":804681468},\"maxTimeoutSeconds\":120,\"network\":\"xrpl:0\",\"payTo\":\"rMerchantRLUSD22222222222222222222\",\"scheme\":\"exact\"}",
+      "expectedHash": "sha256:e9e5054e6e716d5e7f5dbf5e65a9a140aa85aed4e49c8709952717bb47a80711"
+    },
+    {
+      "name": "unicode_resource_in_extra",
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "xrpl:0",
+        "amount": "2500",
+        "asset": "XRP",
+        "payTo": "rEchoMerchant444444444444444444444444",
+        "maxTimeoutSeconds": 45,
+        "extra": {
+          "invoiceId": "INV-UNICODE-0003",
+          "resource": "https://merchant.example/café",
+          "labels": [
+            "dataset",
+            "résumé"
+          ]
+        }
+      },
+      "expectedCanonicalJson": "{\"amount\":\"2500\",\"asset\":\"XRP\",\"extra\":{\"invoiceId\":\"INV-UNICODE-0003\",\"labels\":[\"dataset\",\"résumé\"],\"resource\":\"https://merchant.example/café\"},\"maxTimeoutSeconds\":45,\"network\":\"xrpl:0\",\"payTo\":\"rEchoMerchant444444444444444444444444\",\"scheme\":\"exact\"}",
+      "expectedHash": "sha256:36a1a7bf4a11156a9ec09c281e55487d06862466f0152901073c9dee8754e34e"
+    },
+    {
+      "name": "nested_extra_key_order",
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "xrpl:0",
+        "amount": "42",
+        "asset": "XRP",
+        "payTo": "rEchoMerchant555555555555555555555555",
+        "maxTimeoutSeconds": 300,
+        "extra": {
+          "invoiceId": "INV-NESTED-0004",
+          "constraints": {
+            "allowedMerchants": [
+              "https://b.example",
+              "https://a.example"
+            ],
+            "limits": {
+              "perTxMax": "42",
+              "dailyTotalMax": "100"
+            }
+          }
+        }
+      },
+      "expectedCanonicalJson": "{\"amount\":\"42\",\"asset\":\"XRP\",\"extra\":{\"constraints\":{\"allowedMerchants\":[\"https://b.example\",\"https://a.example\"],\"limits\":{\"dailyTotalMax\":\"100\",\"perTxMax\":\"42\"}},\"invoiceId\":\"INV-NESTED-0004\"},\"maxTimeoutSeconds\":300,\"network\":\"xrpl:0\",\"payTo\":\"rEchoMerchant555555555555555555555555\",\"scheme\":\"exact\"}",
+      "expectedHash": "sha256:348ddc4b24d1cade4616476da036278d4afd996243cc24fe2a03e173a82a30ea"
+    },
+    {
+      "name": "xrpl_tags_and_memo_metadata",
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "xrpl:0",
+        "amount": "123456",
+        "asset": "XRP",
+        "payTo": "rTaggedMerchant66666666666666666666",
+        "maxTimeoutSeconds": 900,
+        "extra": {
+          "invoiceId": "INV-TAGS-0005",
+          "destinationTag": 34567,
+          "sourceTag": 804681468,
+          "memo": {
+            "format": "text/plain",
+            "data": "hello-x402"
+          }
+        }
+      },
+      "expectedCanonicalJson": "{\"amount\":\"123456\",\"asset\":\"XRP\",\"extra\":{\"destinationTag\":34567,\"invoiceId\":\"INV-TAGS-0005\",\"memo\":{\"data\":\"hello-x402\",\"format\":\"text/plain\"},\"sourceTag\":804681468},\"maxTimeoutSeconds\":900,\"network\":\"xrpl:0\",\"payTo\":\"rTaggedMerchant66666666666666666666\",\"scheme\":\"exact\"}",
+      "expectedHash": "sha256:a2921be3e8437b60d35c8610aa80646c1700c91de5e7b95bf6cd4f3d0219c411"
+    },
+    {
+      "name": "boolean_null_and_nested_array",
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "xrpl:0",
+        "amount": "7.500000",
+        "asset": "RLUSD",
+        "payTo": "rComplexMerchant777777777777777777",
+        "maxTimeoutSeconds": 30,
+        "extra": {
+          "invoiceId": "INV-COMPLEX-0006",
+          "issuer": "rIssuerComplex8888888888888888888",
+          "requiresKyc": true,
+          "nullableNote": null,
+          "allowedPurposes": [
+            "compute",
+            {
+              "kind": "dataset",
+              "tier": 2
+            }
+          ]
+        }
+      },
+      "expectedCanonicalJson": "{\"amount\":\"7.500000\",\"asset\":\"RLUSD\",\"extra\":{\"allowedPurposes\":[\"compute\",{\"kind\":\"dataset\",\"tier\":2}],\"invoiceId\":\"INV-COMPLEX-0006\",\"issuer\":\"rIssuerComplex8888888888888888888\",\"nullableNote\":null,\"requiresKyc\":true},\"maxTimeoutSeconds\":30,\"network\":\"xrpl:0\",\"payTo\":\"rComplexMerchant777777777777777777\",\"scheme\":\"exact\"}",
+      "expectedHash": "sha256:07b18aa79e32cfd3cfe57623cb17d1cb3210ac196b389de2249b2412bc8deb94"
+    }
+  ]
+}

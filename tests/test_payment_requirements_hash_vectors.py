@@ -7,7 +7,6 @@ from x402_proxy.internal_facilitator import (
     _fingerprint,
 )
 
-
 FIXTURE_PATH = Path(__file__).parent.parent / "test-vectors" / "payment_requirements_hash.json"
 
 
@@ -39,7 +38,10 @@ def test_xrpl_binding_fallback_hash_matches_shared_vectors() -> None:
             amount=payment_requirements["amount"],
             destination=payment_requirements["payTo"],
             paymentRequirements=payment_requirements,
-            payload={"Destination": payment_requirements["payTo"], "Amount": payment_requirements["amount"]},
+            payload={
+                "Destination": payment_requirements["payTo"],
+                "Amount": payment_requirements["amount"],
+            },
         )
 
         binding = _build_xrpl_binding(payment)

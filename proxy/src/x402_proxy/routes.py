@@ -27,7 +27,10 @@ from .headers import (
     parse_x_payment_secure,
     parse_x_verifiable_intent,
 )
-from .internal_facilitator import InternalPolicy, post_trustline_validation
+from .internal_facilitator import (
+    InternalPolicy,
+    post_trustline_validation_default_auth as post_trustline_validation,
+)
 from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps

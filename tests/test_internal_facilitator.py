@@ -703,6 +703,30 @@ def test_internal_trustline_auth_headers_use_policy_token(monkeypatch) -> None:
     assert headers == {"Authorization": "Bearer policy-token"}
 
 
+def test_public_trustline_auth_headers_ignore_internal_route_maps(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
+        '{"org_xrpl_dev":"org-token"}',
+    )
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_xrpl_default":"policy-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers(
+        {
+            "metadata": {"developerOrgId": "org_xrpl_dev"},
+            "policy": {"policyId": "pol_xrpl_default"},
+        },
+        route_by_payload=False,
+    )
+
+    assert headers == {"Authorization": "Bearer default-token"}
+
+
 def test_internal_trustline_auth_headers_fallback_to_default_token(monkeypatch) -> None:
     monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
     monkeypatch.setenv(

@@ -576,25 +576,53 @@ def _trustline_token_for_payload(payload: Dict[str, Any]) -> Optional[str]:
     return _default_trustline_token()
 
 
-def _trustline_auth_headers(payload: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    token = _trustline_token_for_payload(payload or {})
+def _trustline_auth_headers(
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    route_by_payload: bool = True,
+) -> Dict[str, str]:
+    token = (
+        _trustline_token_for_payload(payload or {})
+        if route_by_payload
+        else _default_trustline_token()
+    )
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _post_trustline_validation(
+    path: str,
+    payload: Dict[str, Any],
+    *,
+    route_by_payload: bool,
+) -> Dict[str, Any]:
     base_url = _trustline_base_url()
     if base_url.endswith("/validation"):
         url = f"{base_url}/{path.lstrip('/')}"
     else:
         url = f"{base_url}{_trustline_validation_path(path)}"
     async with httpx.AsyncClient(timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))) as client:
-        response = await client.post(url, json=payload, headers=_trustline_auth_headers(payload))
+        response = await client.post(
+            url,
+            json=payload,
+            headers=_trustline_auth_headers(payload, route_by_payload=route_by_payload),
+        )
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Trustline error: {response.text}")
     try:
         return response.json()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Invalid Trustline response: {exc}") from exc
+
+
+async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await _post_trustline_validation(path, payload, route_by_payload=True)
+
+
+async def post_trustline_validation_default_auth(
+    path: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    return await _post_trustline_validation(path, payload, route_by_payload=False)
 
 
 def _trustline_facilitator_verify_chain_path() -> str:

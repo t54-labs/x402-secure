@@ -261,6 +261,118 @@ paths:
         '4XX': { $ref: '#/components/responses/Error' }
         '5XX': { $ref: '#/components/responses/Error' }
 
+  /internal/x402-secure/facilitator/evaluate:
+    post:
+      summary: Evaluate an XRPL Facilitator payment through Trustline fast VI-chain verification
+      operationId: evaluateInternalFacilitatorPayment
+      description: |
+        Internal endpoint used by the T54-hosted XRPL x402 Facilitator. The Facilitator
+        sends the normalized XRPL payment context plus `extensions.x402Secure`. This
+        endpoint preserves `verifiableIntentChain` bytes, computes XRPL binding context,
+        and calls Trustline's fast `verifiable-intent/verify-chain` path.
+
+        This endpoint is not used by the Base/Solana Paid API and is not a public
+        x402 seller integration surface. If no `x402Secure` extension is present, the
+        XRPL Facilitator should bypass this endpoint entirely.
+      tags:
+        - Internal
+      security:
+        - InternalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalFacilitatorEvaluateRequest'
+      responses:
+        '200':
+          description: Gating decision for the Facilitator settle path
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalFacilitatorDecisionResponse'
+        '401': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /internal/x402-secure/facilitator/evidence-session:
+    post:
+      summary: Create a Trustline evidence session for legacy VI references
+      operationId: createInternalFacilitatorEvidenceSession
+      description: |
+        Internal helper for the legacy evidence-session flow. Inline L1-L3
+        `verifiableIntentChain` payments do not need this handshake.
+      tags:
+        - Internal
+      security:
+        - InternalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalEvidenceSessionRequest'
+      responses:
+        '200':
+          description: Trustline evidence session response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /internal/x402-secure/facilitator/evidence:
+    post:
+      summary: Upload or record Facilitator evidence for a Trustline session
+      operationId: recordInternalFacilitatorEvidence
+      tags:
+        - Internal
+      security:
+        - InternalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalEvidenceUploadRequest'
+      responses:
+        '200':
+          description: Trustline evidence record response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /internal/x402-secure/facilitator/receipt:
+    post:
+      summary: Record Facilitator settlement receipt metadata in Trustline
+      operationId: recordInternalFacilitatorReceipt
+      tags:
+        - Internal
+      security:
+        - InternalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalReceiptRequest'
+      responses:
+        '200':
+          description: Trustline receipt response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
   /x402/verify:
     post:
       summary: Verify payment with risk gating then forward to upstream facilitator
@@ -374,7 +486,356 @@ paths:
         '5XX': { $ref: '#/components/responses/Error' }
 
 components:
+  securitySchemes:
+    InternalBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: internal-token
+      description: Internal token shared between the hosted XRPL Facilitator and x402-secure Proxy.
+
   schemas:
+    FacilitatorInfo:
+      type: object
+      required: [id, network]
+      properties:
+        id:
+          type: string
+          example: xrpl-x402-facilitator
+        network:
+          type: string
+          example: xrpl
+        environment:
+          type: string
+          nullable: true
+          enum: [production, staging, test, development]
+
+    InternalPolicy:
+      type: object
+      description: |
+        Server-selected X402 Secure policy. `policyId` and `policyVersion` are preserved
+        by x402-secure and may be used for Trustline credential routing. Client-supplied
+        policy data must be overwritten or tightened by the Facilitator before this call.
+      properties:
+        policyId:
+          type: string
+          nullable: true
+          example: pol_xrpl_default
+        policyVersion:
+          type: string
+          nullable: true
+          example: v1
+        requireVerifiableIntent: { type: boolean, default: false }
+        requireVerifiedIntent: { type: boolean, default: false }
+        requirePaymentMandate: { type: boolean, default: false }
+        requireHolderBinding: { type: boolean, default: false }
+        requireTrace: { type: boolean, default: false }
+        acceptedIssuers:
+          type: array
+          items: { type: string }
+        reviewMode:
+          type: string
+          enum: [allow, block, review]
+          default: block
+
+    InternalPaymentContext:
+      type: object
+      description: Normalized payment context sent by the XRPL Facilitator.
+      properties:
+        protocol:
+          type: string
+          default: x402
+        chain:
+          type: string
+          example: xrpl
+        network:
+          type: string
+          example: xrpl:0
+        asset:
+          type: string
+          example: XRP
+        issuer:
+          type: string
+          nullable: true
+        amount:
+          oneOf:
+            - type: string
+            - type: number
+          nullable: true
+          example: "0.001"
+        currency:
+          type: string
+          nullable: true
+        destination:
+          type: string
+          nullable: true
+          example: rMerchant
+        payTo:
+          type: string
+          nullable: true
+          example: rMerchant
+        resource:
+          type: string
+          nullable: true
+          example: https://merchant.example/resource
+        merchantOrigin:
+          type: string
+          nullable: true
+        paymentHash:
+          type: string
+          nullable: true
+        paymentRequirementsHash:
+          type: string
+          nullable: true
+          example: sha256:...
+        payloadHash:
+          type: string
+          nullable: true
+          example: sha256:...
+        payload:
+          type: object
+          additionalProperties: true
+          description: XRPL signed payment payload or decoded transaction context.
+        paymentRequirements:
+          type: object
+          additionalProperties: true
+          description: x402 PaymentRequirements selected by the merchant/facilitator.
+
+    VerifiableIntentReference:
+      type: object
+      properties:
+        format:
+          type: string
+          default: sd-jwt
+        profile:
+          type: string
+          default: mastercard-vi-v0.1
+        presentation:
+          type: string
+          nullable: true
+          description: Inline VI presentation; avoid logging this value.
+        presentationRef:
+          type: string
+          nullable: true
+        presentationHash:
+          type: string
+          nullable: true
+        claims:
+          type: object
+          additionalProperties: true
+        constraints:
+          type: object
+          additionalProperties: true
+        layers:
+          type: object
+          additionalProperties: true
+        keyBinding:
+          type: object
+          additionalProperties: true
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+
+    VerifiableIntentChainNode:
+      type: object
+      description: One opaque SD-JWT layer. Preserve the string bytes exactly.
+      properties:
+        format:
+          type: string
+          nullable: true
+          example: sd+jwt
+        sdJwt:
+          type: string
+          nullable: true
+          description: Full SD-JWT presentation including disclosures.
+        jwt:
+          type: string
+          nullable: true
+          description: Alternate compact JWT field accepted by Trustline's verifier.
+      additionalProperties: true
+
+    VerifiableIntentChain:
+      type: object
+      required: [l1Credential, l2Delegation, l3FinalAction]
+      properties:
+        l1Credential:
+          $ref: '#/components/schemas/VerifiableIntentChainNode'
+        l2Delegation:
+          $ref: '#/components/schemas/VerifiableIntentChainNode'
+        l3FinalAction:
+          $ref: '#/components/schemas/VerifiableIntentChainNode'
+      additionalProperties: true
+
+    X402SecureExtension:
+      type: object
+      properties:
+        version:
+          type: string
+          default: x402-secure.vi.v1
+        mode:
+          type: string
+          enum: [optional, enforce]
+          nullable: true
+        policy:
+          $ref: '#/components/schemas/InternalPolicy'
+        verifiableIntent:
+          $ref: '#/components/schemas/VerifiableIntentReference'
+        verifiableIntentChain:
+          $ref: '#/components/schemas/VerifiableIntentChain'
+        ap2:
+          type: object
+          additionalProperties: true
+          nullable: true
+        trace:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    InternalFacilitatorEvaluateRequest:
+      type: object
+      required: [facilitator, payment, extensions]
+      properties:
+        facilitator:
+          $ref: '#/components/schemas/FacilitatorInfo'
+        payment:
+          $ref: '#/components/schemas/InternalPaymentContext'
+        extensions:
+          type: object
+          required: [x402Secure]
+          properties:
+            x402Secure:
+              $ref: '#/components/schemas/X402SecureExtension'
+          additionalProperties: true
+        merchant:
+          type: object
+          additionalProperties: true
+        buyer:
+          type: object
+          additionalProperties: true
+          properties:
+            walletAddress:
+              type: string
+              nullable: true
+            agentId:
+              type: string
+              nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+          properties:
+            developerOrgId:
+              type: string
+              nullable: true
+              description: Server-resolved developer organization id. Used for Trustline credential routing.
+            x402SecureRouteId:
+              type: string
+              nullable: true
+
+    BindingProfileResult:
+      type: object
+      properties:
+        paymentBound: { type: boolean }
+        chain: { type: string, nullable: true }
+        asset: { type: string, nullable: true }
+        issuer: { type: string, nullable: true }
+        amount: { type: string, nullable: true }
+        destination: { type: string, nullable: true }
+        resource: { type: string, nullable: true }
+        violations:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        hashes:
+          type: object
+          additionalProperties:
+            type: string
+        canonical:
+          type: object
+          additionalProperties: true
+
+    InternalFacilitatorDecisionResponse:
+      type: object
+      required: [decision, decision_id]
+      properties:
+        decision:
+          type: string
+          enum: [allow, deny, review]
+        decision_id:
+          type: string
+        risk_level:
+          type: string
+          enum: [low, medium, high]
+        ttl_seconds:
+          type: integer
+          default: 300
+        vi:
+          type: object
+          additionalProperties: true
+          description: Fast Trustline VI-chain result mapped into x402-secure response shape.
+        binding:
+          $ref: '#/components/schemas/BindingProfileResult'
+        reasons:
+          type: array
+          items: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+        trustline_assessment:
+          type: object
+          additionalProperties: true
+
+    InternalEvidenceSessionRequest:
+      type: object
+      properties:
+        facilitator:
+          $ref: '#/components/schemas/FacilitatorInfo'
+        agentId: { type: string, nullable: true }
+        walletAddress: { type: string, nullable: true }
+        merchantId: { type: string, nullable: true }
+        policy:
+          $ref: '#/components/schemas/InternalPolicy'
+        requiredEvidence:
+          type: array
+          items: { type: string }
+        expiresInSeconds:
+          type: integer
+          default: 900
+        metadata:
+          type: object
+          additionalProperties: true
+
+    InternalEvidenceUploadRequest:
+      type: object
+      required: [sessionId, evidenceType, evidence]
+      properties:
+        sessionId: { type: string }
+        evidenceType: { type: string }
+        evidence:
+          type: object
+          additionalProperties: true
+        sha256:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+
+    InternalReceiptRequest:
+      type: object
+      required: [decisionId]
+      properties:
+        decisionId: { type: string }
+        evidenceRef: { type: string, nullable: true }
+        settlementAttemptId: { type: string, nullable: true }
+        idempotencyKey: { type: string, nullable: true }
+        payment:
+          type: object
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+
     PaymentContext:
       type: object
       description: Generic payment context supporting multiple protocols

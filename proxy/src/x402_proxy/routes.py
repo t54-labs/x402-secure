@@ -27,7 +27,13 @@ from .headers import (
     parse_x_payment_secure,
     parse_x_verifiable_intent,
 )
-from .internal_facilitator import InternalPolicy, post_trustline_validation
+from .internal_facilitator import (
+    DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH,
+    InternalPolicy,
+    _append_vi_reasons,
+    _vi_result_from_trustline_response,
+    post_trustline_validation,
+)
 from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps
@@ -160,6 +166,11 @@ class ProxyVerifyRequest(BaseModel):
         default=None,
         alias="verifiableIntent",
         description="Inline Verifiable Intent evidence or reference metadata.",
+    )
+    verifiable_intent_chain: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="verifiableIntentChain",
+        description="Inline Verifiable Intent L1-L3 credential chain.",
     )
     ap2_context: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -605,6 +616,7 @@ def _error_code_from_message(msg: str) -> str:
         "unsupported x-verifiable-intent version": "VI_HEADER_UNSUPPORTED",
         "x-verifiable-intent": "VI_HEADER_INVALID",
         "verifiable intent required": "VI_EVIDENCE_MISSING",
+        "verifiable intent chain incomplete": "VI_CHAIN_INCOMPLETE",
         "ap2 payment mandate required": "AP2_PAYMENT_MANDATE_MISSING",
         "trace context required": "TRACE_CONTEXT_MISSING",
     }
@@ -923,6 +935,7 @@ def build_public_vi_assessment_payload(
         "merchantId": merchant_id,
         "policy": policy.model_dump(by_alias=True),
         "verifiableIntent": verifiable_intent or {},
+        "verifiableIntentChain": body.verifiable_intent_chain or {},
         "ap2Context": merged_ap2_context,
         "traceContext": trace,
         "paymentContext": payment_context,
@@ -952,6 +965,7 @@ def public_vi_assessment_requested(
             bool(body.policy),
             bool(body.vi_policy),
             bool(body.verifiable_intent),
+            bool(body.verifiable_intent_chain),
             bool(body.ap2_context),
             bool(vi_header),
         ]
@@ -1022,11 +1036,33 @@ def _has_verifiable_intent_evidence(verifiable_intent: Any) -> bool:
     return False
 
 
+def _vi_chain_present(verifiable_intent_chain: Any) -> bool:
+    return isinstance(verifiable_intent_chain, dict) and bool(verifiable_intent_chain)
+
+
+def _chain_node_has_token(node: Any) -> bool:
+    return isinstance(node, dict) and bool(node.get("sdJwt") or node.get("jwt"))
+
+
+def _has_complete_verifiable_intent_chain(verifiable_intent_chain: Any) -> bool:
+    if not _vi_chain_present(verifiable_intent_chain):
+        return False
+    return all(
+        _chain_node_has_token(verifiable_intent_chain.get(key))
+        for key in ("l1Credential", "l2Delegation", "l3FinalAction")
+    )
+
+
 def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
     policy = InternalPolicy(**(payload.get("policy") or {}))
     verifiable_intent = payload.get("verifiableIntent")
+    verifiable_intent_chain = payload.get("verifiableIntentChain")
     ap2_context = payload.get("ap2Context")
     trace_context = payload.get("traceContext")
+    has_vi_chain = _has_complete_verifiable_intent_chain(verifiable_intent_chain)
+
+    if _vi_chain_present(verifiable_intent_chain) and not has_vi_chain:
+        raise HTTPException(status_code=422, detail="Verifiable Intent chain incomplete")
 
     vi_required = any(
         [
@@ -1036,12 +1072,22 @@ def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
             bool(policy.accepted_issuers),
         ]
     )
-    if vi_required and not _has_verifiable_intent_evidence(verifiable_intent):
+    if vi_required and not (_has_verifiable_intent_evidence(verifiable_intent) or has_vi_chain):
         raise HTTPException(status_code=422, detail="Verifiable Intent required")
     if policy.require_payment_mandate and not _has_ap2_payment_mandate(ap2_context):
         raise HTTPException(status_code=422, detail="AP2 payment mandate required")
     if policy.require_trace and not trace_context:
         raise HTTPException(status_code=422, detail="Trace context required")
+
+
+def _public_vi_trustline_assessment_path(payload: Dict[str, Any]) -> str:
+    if _vi_chain_present(payload.get("verifiableIntentChain")):
+        return (
+            os.getenv("TRUSTLINE_PUBLIC_VERIFY_CHAIN_PATH")
+            or os.getenv("TRUSTLINE_VERIFY_CHAIN_PATH")
+            or DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH
+        ).strip("/")
+    return "assess-verifiable-intent"
 
 
 def _normalize_vi_decision(value: Any) -> str:
@@ -1103,11 +1149,13 @@ async def assess_public_verifiable_intent(
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     enforce_public_vi_policy_inputs(payload)
-    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    trustline_path = _public_vi_trustline_assessment_path(payload)
+    trustline_response = await post_trustline_validation(trustline_path, payload)
     warnings = list(trustline_response.get("warnings") or [])
     policy = InternalPolicy(**(payload.get("policy") or {}))
-    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
     reasons = list(trustline_response.get("reasons") or [])
+    vi_result = _vi_result_from_trustline_response(trustline_response)
+    _append_vi_reasons(reasons, vi_result)
     decision = effective_public_vi_decision(
         trustline_response.get("decision"),
         policy,
@@ -1131,7 +1179,12 @@ async def assess_public_verifiable_intent(
         "binding": trustline_response.get("binding") or payload.get("binding") or {},
         "reasons": reasons,
         "warnings": warnings,
-        "trustline_assessment": trustline_response.get("trustline_assessment") or {},
+        "trustline_assessment": trustline_response.get("trustline_assessment")
+        or {
+            "source": trustline_path,
+            "verifier_mode": trustline_response.get("verifierMode"),
+            "latency_ms": trustline_response.get("latencyMs"),
+        },
     }
 
 

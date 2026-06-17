@@ -251,6 +251,41 @@ def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypat
     assert payload["verifiableIntentChain"]["l3FinalAction"]["sdJwt"].endswith(".sig~")
 
 
+def test_internal_evaluate_forwards_payment_payer_as_wallet_address(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload()
+    body["payment"]["payer"] = "rActualPayerWallet"
+    body["buyer"] = {}
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_payer",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = captured["payload"]
+    assert payload["walletAddress"] == "rActualPayerWallet"
+    assert payload["agentId"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["payer"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["payerWallet"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["walletAddress"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["destination"] == "rMerchantDestination"
+
+
 def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:
     client = _client(monkeypatch)
     body = _evaluate_payload(amount=None)

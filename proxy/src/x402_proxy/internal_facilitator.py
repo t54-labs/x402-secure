@@ -136,6 +136,9 @@ class InternalPaymentContext(BaseModel):
     currency: Optional[str] = None
     destination: Optional[str] = None
     pay_to: Optional[str] = Field(default=None, alias="payTo")
+    payer: Optional[str] = None
+    payer_wallet: Optional[str] = Field(default=None, alias="payerWallet")
+    wallet_address: Optional[str] = Field(default=None, alias="walletAddress")
     resource: Optional[str] = None
     merchant_origin: Optional[str] = Field(default=None, alias="merchantOrigin")
     payment_hash: Optional[str] = Field(default=None, alias="paymentHash")
@@ -608,6 +611,13 @@ def build_trustline_assessment_payload(
     binding: BindingProfileResult,
 ) -> Dict[str, Any]:
     payment = request.payment
+    payer_wallet = _first_present(
+        payment.payer_wallet,
+        payment.wallet_address,
+        payment.payer,
+        request.buyer.get("walletAddress"),
+        request.buyer.get("wallet_address"),
+    )
     merchant_origin = _first_present(
         payment.merchant_origin,
         request.merchant.get("origin"),
@@ -629,6 +639,9 @@ def build_trustline_assessment_payload(
         "merchantId": request.merchant.get("id"),
         "merchantOrigin": merchant_origin,
         "resource": binding.resource or payment.resource,
+        "payer": payer_wallet,
+        "payerWallet": payer_wallet,
+        "walletAddress": payer_wallet,
         "paymentHash": payment.payment_hash,
         "paymentRequirementsHash": binding.hashes.get("paymentRequirementsHash"),
         "payloadHash": binding.hashes.get("paymentPayloadHash"),
@@ -655,8 +668,11 @@ def build_trustline_assessment_payload(
         or request.buyer.get("agent_id")
         or request.buyer.get("walletAddress")
         or request.buyer.get("wallet_address")
+        or payer_wallet
         or f"{request.facilitator.id}:unknown-agent",
-        "walletAddress": request.buyer.get("walletAddress") or request.buyer.get("wallet_address"),
+        "walletAddress": request.buyer.get("walletAddress")
+        or request.buyer.get("wallet_address")
+        or payer_wallet,
         "verifiableIntent": vi,
         "verifiableIntentChain": vi_chain,
         "paymentContext": payment_context,

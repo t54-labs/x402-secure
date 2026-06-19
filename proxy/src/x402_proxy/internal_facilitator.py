@@ -18,6 +18,8 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH = "verifiable-intent/verify-chain"
+
 internal_router = APIRouter(
     prefix="/internal/x402-secure/facilitator",
     tags=["x402-secure-internal-facilitator"],
@@ -33,6 +35,8 @@ class FacilitatorInfo(BaseModel):
 class InternalPolicy(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
+    policy_id: Optional[str] = Field(default=None, alias="policyId")
+    policy_version: Optional[str] = Field(default=None, alias="policyVersion")
     require_verifiable_intent: bool = Field(default=False, alias="requireVerifiableIntent")
     require_verified_intent: bool = Field(default=False, alias="requireVerifiedIntent")
     require_payment_mandate: bool = Field(default=False, alias="requirePaymentMandate")
@@ -55,6 +59,22 @@ class VerifiableIntentReference(BaseModel):
     layers: Dict[str, Any] = Field(default_factory=dict)
     key_binding: Optional[Dict[str, Any]] = Field(default=None, alias="keyBinding")
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class VerifiableIntentChainNode(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    format: Optional[str] = None
+    sd_jwt: Optional[str] = Field(default=None, alias="sdJwt", repr=False)
+    jwt: Optional[str] = Field(default=None, repr=False)
+
+
+class VerifiableIntentChainReference(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    l1_credential: VerifiableIntentChainNode = Field(alias="l1Credential")
+    l2_delegation: VerifiableIntentChainNode = Field(alias="l2Delegation")
+    l3_final_action: VerifiableIntentChainNode = Field(alias="l3FinalAction")
 
 
 class AP2ReferenceSet(BaseModel):
@@ -96,6 +116,10 @@ class X402SecureExtension(BaseModel):
         default=None,
         alias="verifiableIntent",
     )
+    verifiable_intent_chain: Optional[VerifiableIntentChainReference] = Field(
+        default=None,
+        alias="verifiableIntentChain",
+    )
     ap2: Optional[AP2ReferenceSet] = None
     trace: Optional[TraceReferenceSet] = None
 
@@ -112,6 +136,9 @@ class InternalPaymentContext(BaseModel):
     currency: Optional[str] = None
     destination: Optional[str] = None
     pay_to: Optional[str] = Field(default=None, alias="payTo")
+    payer: Optional[str] = None
+    payer_wallet: Optional[str] = Field(default=None, alias="payerWallet")
+    wallet_address: Optional[str] = Field(default=None, alias="walletAddress")
     resource: Optional[str] = None
     merchant_origin: Optional[str] = Field(default=None, alias="merchantOrigin")
     payment_hash: Optional[str] = Field(default=None, alias="paymentHash")
@@ -206,6 +233,10 @@ class InternalReceiptRequest(BaseModel):
 def _configured_internal_token() -> Optional[str]:
     return (
         os.getenv("X402_SECURE_INTERNAL_TOKEN")
+        # MF-2 (code review): the XRPL facilitator caller sends its token from
+        # X402_SECURE_INTERNAL_AUTH_TOKEN — accept that name too so the two services don't
+        # disagree (else an operator is tempted to flip X402_SECURE_INTERNAL_AUTH_DISABLED).
+        or os.getenv("X402_SECURE_INTERNAL_AUTH_TOKEN")
         or os.getenv("FACILITATOR_INTERNAL_TOKEN")
         or os.getenv("INTERNAL_FACILITATOR_TOKEN")
     )
@@ -275,6 +306,17 @@ def _xrpl_amount_from_payload(payment: InternalPaymentContext) -> Optional[str]:
     return _decimal_string(text)
 
 
+def _xrpl_amount_from_context(payment: InternalPaymentContext) -> Optional[str]:
+    raw_amount = payment.amount
+    if raw_amount is None:
+        return None
+    asset = str(payment.asset or payment.currency or "XRP").upper()
+    text = str(raw_amount)
+    if asset == "XRP" and text.isdigit():
+        return _decimal_string(Decimal(text) / Decimal("1000000"))
+    return _decimal_string(text)
+
+
 def _add_violation(
     violations: List[Dict[str, Any]],
     code: str,
@@ -290,7 +332,7 @@ def _add_violation(
 def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult:
     payload = payment.payload or {}
     amount_object = payload.get("Amount") if isinstance(payload.get("Amount"), dict) else {}
-    amount = _decimal_string(payment.amount) or _xrpl_amount_from_payload(payment)
+    amount = _xrpl_amount_from_payload(payment) or _xrpl_amount_from_context(payment)
     asset = _first_present(
         payment.asset,
         payment.currency,
@@ -451,23 +493,134 @@ def _trustline_validation_path(path: str) -> str:
     return f"/{prefix}/{path.lstrip('/')}"
 
 
-def _trustline_auth_headers() -> Dict[str, str]:
-    token = (
+def _default_trustline_token() -> Optional[str]:
+    return (
         os.getenv("TRUSTLINE_INTERNAL_TOKEN")
         or os.getenv("RISK_INTERNAL_TOKEN")
+        or os.getenv("TRUSTLINE_API_KEY")
         or os.getenv("X402_SECURE_TRUSTLINE_TOKEN")
+    )
+
+
+def _json_mapping_from_env(*names: str) -> Dict[str, str]:
+    raw = ""
+    source = ""
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            source = name
+            break
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"{source} must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail=f"{source} must be a JSON object")
+
+    mapping: Dict[str, str] = {}
+    for key, value in parsed.items():
+        if value is None:
+            continue
+        token = str(value).strip()
+        if token:
+            mapping[str(key)] = token
+    return mapping
+
+
+def _trustline_token_by_org() -> Dict[str, str]:
+    return _json_mapping_from_env(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
+        "TRUSTLINE_TOKENS_BY_ORG_JSON",
+    )
+
+
+def _trustline_token_by_policy() -> Dict[str, str]:
+    return _json_mapping_from_env(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        "TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        "TRUSTLINE_API_KEYS_BY_POLICY_JSON",
+    )
+
+
+def _extract_policy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    policy = payload.get("policy")
+    if isinstance(policy, dict):
+        return policy
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("policy"), dict):
+        return metadata["policy"]
+    return {}
+
+
+def _extract_developer_org_id(payload: Dict[str, Any]) -> Optional[str]:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("developerOrgId", "developer_org_id", "organizationId", "organization_id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_policy_id(payload: Dict[str, Any]) -> Optional[str]:
+    policy = _extract_policy(payload)
+    for key in ("policyId", "policy_id"):
+        value = policy.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _trustline_token_for_payload(payload: Dict[str, Any]) -> Optional[str]:
+    org_id = _extract_developer_org_id(payload)
+    if org_id:
+        token = _trustline_token_by_org().get(org_id)
+        if token:
+            return token
+
+    policy_id = _extract_policy_id(payload)
+    if policy_id:
+        token = _trustline_token_by_policy().get(policy_id)
+        if token:
+            return token
+
+    return _default_trustline_token()
+
+
+def _trustline_auth_headers(
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    route_by_payload: bool = True,
+) -> Dict[str, str]:
+    token = (
+        _trustline_token_for_payload(payload or {})
+        if route_by_payload
+        else _default_trustline_token()
     )
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _post_trustline_validation(
+    path: str,
+    payload: Dict[str, Any],
+    *,
+    route_by_payload: bool,
+) -> Dict[str, Any]:
     base_url = _trustline_base_url()
     if base_url.endswith("/validation"):
         url = f"{base_url}/{path.lstrip('/')}"
     else:
         url = f"{base_url}{_trustline_validation_path(path)}"
     async with httpx.AsyncClient(timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))) as client:
-        response = await client.post(url, json=payload, headers=_trustline_auth_headers())
+        response = await client.post(
+            url,
+            json=payload,
+            headers=_trustline_auth_headers(payload, route_by_payload=route_by_payload),
+        )
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Trustline error: {response.text}")
     try:
@@ -476,12 +629,38 @@ async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[
         raise HTTPException(status_code=502, detail=f"Invalid Trustline response: {exc}") from exc
 
 
+async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await _post_trustline_validation(path, payload, route_by_payload=True)
+
+
+async def post_trustline_validation_default_auth(
+    path: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    return await _post_trustline_validation(path, payload, route_by_payload=False)
+
+
+def _trustline_facilitator_verify_chain_path() -> str:
+    return (
+        os.getenv("TRUSTLINE_FACILITATOR_VERIFY_CHAIN_PATH")
+        or os.getenv("TRUSTLINE_VERIFY_CHAIN_PATH")
+        or DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH
+    ).strip("/")
+
+
 def build_trustline_assessment_payload(
     request: InternalFacilitatorEvaluateRequest,
     extension: X402SecureExtension,
     binding: BindingProfileResult,
 ) -> Dict[str, Any]:
     payment = request.payment
+    payer_wallet = _first_present(
+        payment.payer_wallet,
+        payment.wallet_address,
+        payment.payer,
+        request.buyer.get("walletAddress"),
+        request.buyer.get("wallet_address"),
+    )
     merchant_origin = _first_present(
         payment.merchant_origin,
         request.merchant.get("origin"),
@@ -503,6 +682,9 @@ def build_trustline_assessment_payload(
         "merchantId": request.merchant.get("id"),
         "merchantOrigin": merchant_origin,
         "resource": binding.resource or payment.resource,
+        "payer": payer_wallet,
+        "payerWallet": payer_wallet,
+        "walletAddress": payer_wallet,
         "paymentHash": payment.payment_hash,
         "paymentRequirementsHash": binding.hashes.get("paymentRequirementsHash"),
         "payloadHash": binding.hashes.get("paymentPayloadHash"),
@@ -516,6 +698,11 @@ def build_trustline_assessment_payload(
         if extension.verifiable_intent
         else None
     )
+    vi_chain = (
+        extension.verifiable_intent_chain.model_dump(by_alias=True, exclude_none=True)
+        if extension.verifiable_intent_chain
+        else None
+    )
     ap2_context = (
         extension.ap2.model_dump(by_alias=True, exclude_none=True) if extension.ap2 else None
     )
@@ -524,9 +711,13 @@ def build_trustline_assessment_payload(
         or request.buyer.get("agent_id")
         or request.buyer.get("walletAddress")
         or request.buyer.get("wallet_address")
+        or payer_wallet
         or f"{request.facilitator.id}:unknown-agent",
-        "walletAddress": request.buyer.get("walletAddress") or request.buyer.get("wallet_address"),
+        "walletAddress": request.buyer.get("walletAddress")
+        or request.buyer.get("wallet_address")
+        or payer_wallet,
         "verifiableIntent": vi,
+        "verifiableIntentChain": vi_chain,
         "paymentContext": payment_context,
         "binding": binding.model_dump(by_alias=True, exclude_none=True),
         "ap2Context": ap2_context,
@@ -583,6 +774,78 @@ def _enforce_required_verified_vi_result(
     return "deny"
 
 
+def _vi_result_from_trustline_response(trustline_response: Dict[str, Any]) -> Dict[str, Any]:
+    vi_result = trustline_response.get("vi")
+    if isinstance(vi_result, dict):
+        return vi_result
+    chain = trustline_response.get("chain")
+    if not isinstance(chain, dict):
+        return {}
+    chain_verified = bool(chain.get("verified"))
+    constraint_ok = chain.get("constraint_satisfied") is not False
+    error_code = chain.get("error_code")
+    verified_for_payment = chain_verified and constraint_ok and not error_code
+    return {
+        "present": bool(chain.get("present")),
+        "parsed": bool(chain.get("parsed")),
+        "verified": verified_for_payment,
+        "chain_verified": chain_verified,
+        "constraint_satisfied": chain.get("constraint_satisfied"),
+        "profile": chain.get("profile"),
+        "error_code": error_code,
+        "violations": list(chain.get("violations") or []),
+        "not_evaluable": list(chain.get("not_evaluable") or []),
+        "label": chain.get("label"),
+        "binding": chain.get("binding") or {},
+    }
+
+
+def _append_vi_reasons(
+    reasons: List[str],
+    vi_result: Dict[str, Any],
+) -> None:
+    error_code = vi_result.get("error_code")
+    if error_code and error_code not in reasons:
+        reasons.append(str(error_code))
+    for violation in vi_result.get("violations") or []:
+        text = violation if isinstance(violation, str) else json.dumps(violation, sort_keys=True)
+        if text not in reasons:
+            reasons.append(text)
+
+
+def _trustline_assessment_summary(
+    trustline_response: Dict[str, Any],
+    trustline_path: str,
+) -> Dict[str, Any]:
+    summary = trustline_response.get("trustline_assessment")
+    if isinstance(summary, dict):
+        assessment = dict(summary)
+    else:
+        assessment = {}
+
+    assessment.setdefault("source", trustline_path)
+    if trustline_response.get("verifierMode") is not None:
+        assessment.setdefault("verifier_mode", trustline_response.get("verifierMode"))
+    if trustline_response.get("latencyMs") is not None:
+        assessment.setdefault("latency_ms", trustline_response.get("latencyMs"))
+
+    wallet_gate = trustline_response.get("walletGate") or trustline_response.get("wallet_gate")
+    if isinstance(wallet_gate, dict):
+        assessment.setdefault("wallet_gate", wallet_gate)
+
+    tier2_assessment = trustline_response.get("tier2Assessment") or trustline_response.get(
+        "tier2_assessment"
+    )
+    if isinstance(tier2_assessment, dict):
+        assessment.setdefault("tier2_assessment", tier2_assessment)
+
+    decision_id = trustline_response.get("decision_id") or trustline_response.get("decisionId")
+    if decision_id is not None:
+        assessment.setdefault("decision_id", decision_id)
+
+    return assessment
+
+
 @internal_router.post(
     "/evaluate",
     response_model=InternalFacilitatorDecisionResponse,
@@ -594,11 +857,49 @@ async def evaluate_facilitator_payment(
     extension = _extract_extension(body.extensions)
     binding = build_binding_profile(body.payment)
     payload = build_trustline_assessment_payload(body, extension, binding)
-    trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
+    trustline_path = _trustline_facilitator_verify_chain_path()
+    try:
+        trustline_response = await post_trustline_validation(trustline_path, payload)
+    except HTTPException as exc:
+        logger.warning(
+            "[INTERNAL] facilitator=%s trustline_verify_chain_failed status=%s detail=%s",
+            body.facilitator.id,
+            exc.status_code,
+            exc.detail,
+        )
+        return {
+            "decision": "deny",
+            "decision_id": f"xs_dec_{uuid.uuid4().hex}",
+            "risk_level": "high",
+            "ttl_seconds": 60,
+            "vi": {},
+            "binding": binding.model_dump(by_alias=False, exclude_none=True),
+            "reasons": ["Trustline verification unavailable"],
+            "warnings": [f"Trustline verification failed closed: {exc.detail}"],
+            "trustline_assessment": {"source": trustline_path, "error": str(exc.detail)},
+        }
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "[INTERNAL] facilitator=%s trustline_verify_chain_http_error error=%s",
+            body.facilitator.id,
+            exc,
+        )
+        return {
+            "decision": "deny",
+            "decision_id": f"xs_dec_{uuid.uuid4().hex}",
+            "risk_level": "high",
+            "ttl_seconds": 60,
+            "vi": {},
+            "binding": binding.model_dump(by_alias=False, exclude_none=True),
+            "reasons": ["Trustline verification unavailable"],
+            "warnings": [f"Trustline verification failed closed: {exc}"],
+            "trustline_assessment": {"source": trustline_path, "error": str(exc)},
+        }
 
     warnings = list(trustline_response.get("warnings") or [])
     reasons = list(trustline_response.get("reasons") or [])
-    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
+    vi_result = _vi_result_from_trustline_response(trustline_response)
+    _append_vi_reasons(reasons, vi_result)
     decision = _effective_decision(
         str(trustline_response.get("decision", "review")),
         extension.policy,
@@ -625,14 +926,18 @@ async def evaluate_facilitator_payment(
     return {
         "decision": decision,
         "decision_id": decision_id,
-        "risk_level": trustline_response.get("risk_level", "medium"),
+        "risk_level": trustline_response.get("risk_level")
+        or ("high" if decision == "deny" else "low"),
         "ttl_seconds": trustline_response.get("ttl_seconds", 300),
         "vi": vi_result,
         "binding": trustline_response.get("binding")
         or binding.model_dump(by_alias=False, exclude_none=True),
         "reasons": reasons,
         "warnings": warnings,
-        "trustline_assessment": trustline_response.get("trustline_assessment") or {},
+        "trustline_assessment": _trustline_assessment_summary(
+            trustline_response,
+            trustline_path,
+        ),
     }
 
 

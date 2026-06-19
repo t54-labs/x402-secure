@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from httpx import ASGITransport
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from . import internal_facilitator
 from .headers import (
     HeaderError,
     parse_risk_ids,
@@ -27,7 +28,6 @@ from .headers import (
     parse_x_payment_secure,
     parse_x_verifiable_intent,
 )
-from .internal_facilitator import InternalPolicy, post_trustline_validation
 from .risk_routes import Decision, EvaluateResponse
 
 # Optional deps
@@ -567,6 +567,8 @@ def get_proxy_cfg() -> ProxyRuntimeConfig:
     return ProxyRuntimeConfig()
 
 
+InternalPolicy = internal_facilitator.InternalPolicy
+post_trustline_validation = internal_facilitator.post_trustline_validation_default_auth
 router = APIRouter(prefix="/x402", tags=["x402-proxy"])
 
 
@@ -1106,7 +1108,8 @@ async def assess_public_verifiable_intent(
     trustline_response = await post_trustline_validation("assess-verifiable-intent", payload)
     warnings = list(trustline_response.get("warnings") or [])
     policy = InternalPolicy(**(payload.get("policy") or {}))
-    vi_result = trustline_response.get("vi") if isinstance(trustline_response.get("vi"), dict) else {}
+    raw_vi_result = trustline_response.get("vi")
+    vi_result = raw_vi_result if isinstance(raw_vi_result, dict) else {}
     reasons = list(trustline_response.get("reasons") or [])
     decision = effective_public_vi_decision(
         trustline_response.get("decision"),

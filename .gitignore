@@ -164,3 +164,10 @@ keys/
 
 # gke
 gke/
+
+# Local-only staging/deploy configs — this is a PUBLIC repo; keep these locally for
+# deploys but NEVER commit them (they disclose internal infra topology: GCP project,
+# namespaces, registry paths, staging hostnames). Real deploy manifests live in a
+# private infra repo.
+k8s/staging/
+scripts/build_and_push_facilitator_proxy.sh

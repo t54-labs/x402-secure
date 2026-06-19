@@ -593,6 +593,13 @@ def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
     assert calls == ["assess-verifiable-intent", "verifiable-intent-receipt"]
 
 
+def test_public_vi_gateway_uses_default_trustline_auth_wrapper() -> None:
+    from x402_proxy import routes
+    from x402_proxy.internal_facilitator import post_trustline_validation_default_auth
+
+    assert routes.post_trustline_validation is post_trustline_validation_default_auth
+
+
 def test_proxy_settle_receipt_network_failure_is_non_blocking(monkeypatch) -> None:
     client = _proxy_client(monkeypatch)
     sid = _risk_session(client)

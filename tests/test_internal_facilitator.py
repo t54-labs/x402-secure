@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -48,6 +48,8 @@ def _evaluate_payload(*, amount: Any = "10.00") -> Dict[str, Any]:
             "x402Secure": {
                 "version": "x402-secure.vi.v1",
                 "policy": {
+                    "policyId": "pol_xrpl_default",
+                    "policyVersion": "v1",
                     "requireVerifiableIntent": True,
                     "requireTrace": True,
                     "reviewMode": "block",
@@ -175,13 +177,15 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["decision"] == "allow"
-    assert captured["path"] == "assess-verifiable-intent"
+    assert captured["path"] == "verifiable-intent/verify-chain"
     payload = captured["payload"]
     assert payload["agentId"] == "shopping-agent-1"
     assert payload["paymentContext"]["chain"] == "xrpl"
     assert payload["paymentContext"]["amount"] == "10"
     assert payload["paymentContext"]["destination"] == "rMerchantDestination"
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
+    assert payload["policy"]["policyId"] == "pol_xrpl_default"
+    assert payload["policy"]["policyVersion"] == "v1"
     assert payload["binding"]["paymentBound"] is True
     assert payload["traceContext"]["traceRef"] == "tl://evidence/trace_123"
     assert payload["traceContext"]["traceHash"] == "sha256:trace_hash"
@@ -197,6 +201,92 @@ def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
     assert payload["traceContext"]["tool_calls"][0]["name"] == "build_verifiable_intent"
     assert payload["traceContext"]["finalDecision"].startswith("Proceed only")
     assert payload["traceContext"]["final_decision"].startswith("Proceed only")
+
+
+def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload()
+    chain = {
+        "l1Credential": {
+            "format": "sd+jwt",
+            "sdJwt": "eyJraWQiOiJpc3N1ZXIifQ.eyJ2Y3QiOiJjYXJkIn0.sig~l1-disclosure~",
+        },
+        "l2Delegation": {
+            "format": "kb-sd-jwt+kb",
+            "sdJwt": "eyJraWQiOiJvd25lciJ9.eyJ2Y3QiOiJtYW5kYXRlIn0.sig~l2-disclosure~",
+        },
+        "l3FinalAction": {
+            "format": "kb-sd-jwt",
+            "sdJwt": "eyJraWQiOiJhZ2VudCJ9.eyJ0cmFuc2FjdGlvbiI6e319.sig~",
+        },
+    }
+    body["extensions"]["x402Secure"]["verifiableIntentChain"] = chain
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_chain",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert captured["path"] == "verifiable-intent/verify-chain"
+    payload = captured["payload"]
+    assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
+    assert payload["verifiableIntentChain"] == chain
+    assert (
+        payload["verifiableIntentChain"]["l1Credential"]["sdJwt"]
+        == chain["l1Credential"]["sdJwt"]
+    )
+    assert payload["verifiableIntentChain"]["l2Delegation"]["sdJwt"].endswith("~l2-disclosure~")
+    assert payload["verifiableIntentChain"]["l3FinalAction"]["sdJwt"].endswith(".sig~")
+
+
+def test_internal_evaluate_forwards_payment_payer_as_wallet_address(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload()
+    body["payment"]["payer"] = "rActualPayerWallet"
+    body["buyer"] = {}
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_payer",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = captured["payload"]
+    assert payload["walletAddress"] == "rActualPayerWallet"
+    assert payload["agentId"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["payer"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["payerWallet"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["walletAddress"] == "rActualPayerWallet"
+    assert payload["paymentContext"]["destination"] == "rMerchantDestination"
 
 
 def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:
@@ -225,6 +315,36 @@ def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None
     assert response.status_code == 200
     assert captured["payload"]["paymentContext"]["amount"] == "2.5"
     assert captured["payload"]["binding"]["amount"] == "2.5"
+
+
+def test_internal_evaluate_converts_xrpl_drops_from_context_amount(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload(amount="1000")
+    body["payment"]["payload"] = {
+        "signedTxBlob": "120000228000000024000000016140000000000003E8",
+    }
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "decision": "allow",
+            "decision_id": "dec_context_drops",
+            "risk_level": "low",
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=body,
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["paymentContext"]["amount"] == "0.001"
+    assert captured["payload"]["binding"]["amount"] == "0.001"
 
 
 def test_internal_evaluate_extracts_xrpl_issued_currency_amount(monkeypatch) -> None:
@@ -285,6 +405,134 @@ def test_internal_evaluate_accepts_camelcase_trustline_decision_id(monkeypatch) 
 
     assert response.status_code == 200
     assert response.json()["decision_id"] == "dec_camel"
+
+
+def test_internal_evaluate_maps_fast_chain_response(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    captured: dict = {}
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured["path"] = path
+        return {
+            "decision": "allow",
+            "decisionId": "dec_fast_chain",
+            "chain": {
+                "present": True,
+                "parsed": True,
+                "verified": True,
+                "constraint_satisfied": True,
+                "profile": "https://staging.t54.ai/credentials/agent-pay/vi",
+                "violations": [],
+                "not_evaluable": [],
+                "label": "verifiable_intent:chain_verified",
+                "binding": {"payment_bound": True, "chain": "xrpl"},
+            },
+            "binding": payload["binding"],
+            "verifierMode": "enabled",
+            "latencyMs": 17,
+            "walletGate": {
+                "decision": "allow",
+                "reason": "insufficient_signal",
+                "walletAddress": "rBuyerWallet",
+            },
+            "tier2Assessment": {
+                "status": "queued",
+                "trustlineTransactionId": "tl_txn_tier2_123",
+            },
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert captured["path"] == "verifiable-intent/verify-chain"
+    assert body["decision"] == "allow"
+    assert body["decision_id"] == "dec_fast_chain"
+    assert body["vi"]["verified"] is True
+    assert body["vi"]["chain_verified"] is True
+    assert body["vi"]["constraint_satisfied"] is True
+    assert body["trustline_assessment"]["source"] == "verifiable-intent/verify-chain"
+    assert body["trustline_assessment"]["verifier_mode"] == "enabled"
+    assert body["trustline_assessment"]["latency_ms"] == 17
+    assert body["trustline_assessment"]["decision_id"] == "dec_fast_chain"
+    assert body["trustline_assessment"]["wallet_gate"] == {
+        "decision": "allow",
+        "reason": "insufficient_signal",
+        "walletAddress": "rBuyerWallet",
+    }
+    assert body["trustline_assessment"]["tier2_assessment"] == {
+        "status": "queued",
+        "trustlineTransactionId": "tl_txn_tier2_123",
+    }
+
+
+def test_internal_evaluate_denies_fast_chain_constraint_violation(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "decision": "deny",
+            "decisionId": "dec_fast_constraint",
+            "chain": {
+                "present": True,
+                "parsed": True,
+                "verified": True,
+                "constraint_satisfied": False,
+                "error_code": "VI_CONSTRAINT_EXCEEDED",
+                "violations": ["per_transaction_max exceeded"],
+                "not_evaluable": [],
+                "label": "verifiable_intent:chain_over_delegation",
+                "binding": {"payment_bound": True, "chain": "xrpl"},
+            },
+            "binding": payload["binding"],
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "deny"
+    assert body["risk_level"] == "high"
+    assert body["vi"]["chain_verified"] is True
+    assert body["vi"]["verified"] is False
+    assert body["vi"]["constraint_satisfied"] is False
+    assert "VI_CONSTRAINT_EXCEEDED" in body["reasons"]
+    assert "per_transaction_max exceeded" in body["reasons"]
+
+
+def test_internal_evaluate_fails_closed_when_trustline_unavailable(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(status_code=502, detail="Trustline error: unavailable")
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"] == "deny"
+    assert body["risk_level"] == "high"
+    assert body["ttl_seconds"] == 60
+    assert body["reasons"] == ["Trustline verification unavailable"]
+    assert "failed closed" in body["warnings"][0]
 
 
 def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch) -> None:
@@ -469,3 +717,92 @@ def test_internal_evidence_session_forwards_policy(monkeypatch) -> None:
     assert captured["path"] == "verifiable-intent/evidence-session"
     assert captured["payload"]["policy"]["requireVerifiableIntent"] is True
     assert response.json()["session_id"] == "vi_sess_123"
+
+
+def test_internal_trustline_auth_headers_prefer_org_token(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
+        '{"org_xrpl_dev":"org-token"}',
+    )
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_xrpl_default":"policy-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers(
+        {
+            "metadata": {"developerOrgId": "org_xrpl_dev"},
+            "policy": {"policyId": "pol_xrpl_default"},
+        }
+    )
+
+    assert headers == {"Authorization": "Bearer org-token"}
+
+
+def test_internal_trustline_auth_headers_use_policy_token(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_xrpl_default":"policy-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
+
+    assert headers == {"Authorization": "Bearer policy-token"}
+
+
+def test_public_trustline_auth_headers_ignore_internal_route_maps(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
+        '{"org_xrpl_dev":"org-token"}',
+    )
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_xrpl_default":"policy-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers(
+        {
+            "metadata": {"developerOrgId": "org_xrpl_dev"},
+            "policy": {"policyId": "pol_xrpl_default"},
+        },
+        route_by_payload=False,
+    )
+
+    assert headers == {"Authorization": "Bearer default-token"}
+
+
+def test_internal_trustline_auth_headers_fallback_to_default_token(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+    monkeypatch.setenv(
+        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
+        '{"pol_other":"other-token"}',
+    )
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    headers = _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
+
+    assert headers == {"Authorization": "Bearer default-token"}
+
+
+def test_internal_trustline_auth_headers_reject_invalid_policy_map(monkeypatch) -> None:
+    monkeypatch.setenv("X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON", "not-json")
+
+    from x402_proxy.internal_facilitator import _trustline_auth_headers
+
+    try:
+        _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
+    except HTTPException as exc:
+        assert exc.status_code == 500
+        assert "must be a JSON object" in str(exc.detail)
+    else:  # pragma: no cover
+        raise AssertionError("Expected invalid policy-token map to fail closed")

@@ -16,6 +16,12 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from .vi_receipt_store import (
+    lookup_vi_receipt_statuses,
+    record_vi_decision_snapshot,
+    record_vi_receipt_snapshot,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH = "verifiable-intent/verify-chain"
@@ -227,7 +233,23 @@ class InternalReceiptRequest(BaseModel):
     settlement_attempt_id: Optional[str] = Field(default=None, alias="settlementAttemptId")
     idempotency_key: Optional[str] = Field(default=None, alias="idempotencyKey")
     payment: Dict[str, Any] = Field(default_factory=dict)
+    correlation: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ViReceiptLookupTransaction(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    hash: Optional[str] = None
+    invoice_id: Optional[str] = Field(default=None, alias="invoiceId")
+    raw_memo: Optional[str] = Field(default=None, alias="rawMemo")
+    transaction_hash: Optional[str] = Field(default=None, alias="transactionHash")
+
+
+class ViReceiptLookupRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    transactions: List[ViReceiptLookupTransaction] = Field(default_factory=list)
 
 
 def _configured_internal_token() -> Optional[str]:
@@ -923,7 +945,7 @@ async def evaluate_facilitator_payment(
         or trustline_response.get("decisionId")
         or f"xs_dec_{uuid.uuid4().hex}"
     )
-    return {
+    response = {
         "decision": decision,
         "decision_id": decision_id,
         "risk_level": trustline_response.get("risk_level")
@@ -939,6 +961,8 @@ async def evaluate_facilitator_payment(
             trustline_path,
         ),
     }
+    record_vi_decision_snapshot(response)
+    return response
 
 
 @internal_router.post(
@@ -990,4 +1014,18 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
         "source": "x402_secure_internal_facilitator",
         "receivedAt": datetime.now(timezone.utc).isoformat(),
     }
-    return await post_trustline_validation("verifiable-intent-receipt", payload)
+    response = await post_trustline_validation("verifiable-intent-receipt", payload)
+    record_vi_receipt_snapshot(payload, response)
+    return response
+
+
+@internal_router.post(
+    "/vi-receipts/lookup",
+    dependencies=[Depends(require_internal_auth)],
+)
+async def lookup_facilitator_vi_receipts(body: ViReceiptLookupRequest) -> Dict[str, Any]:
+    transactions = [
+        item.model_dump(by_alias=True, exclude_none=True)
+        for item in body.transactions
+    ]
+    return {"items": lookup_vi_receipt_statuses(transactions)}

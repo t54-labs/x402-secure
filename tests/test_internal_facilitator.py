@@ -11,6 +11,9 @@ from fastapi.testclient import TestClient
 def _client(monkeypatch) -> TestClient:
     monkeypatch.setenv("X402_SECURE_INTERNAL_TOKEN", "test-internal-token")
     from x402_proxy import internal_router
+    from x402_proxy.vi_receipt_store import reset_vi_receipt_store_for_tests
+
+    reset_vi_receipt_store_for_tests()
 
     app = FastAPI(title="Internal Facilitator Test")
     app.include_router(internal_router)
@@ -678,6 +681,110 @@ def test_internal_receipt_forwards_to_trustline(monkeypatch) -> None:
     assert captured["path"] == "verifiable-intent-receipt"
     assert captured["payload"]["settlementAttemptId"] == "attempt_1"
     assert captured["payload"]["metadata"]["source"] == "x402_secure_internal_facilitator"
+
+
+def test_internal_vi_receipt_lookup_returns_verified_settlement(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if path == "verifiable-intent/verify-chain":
+            return {
+                "decision": "allow",
+                "decision_id": "dec_verified",
+                "risk_level": "low",
+                "vi": {
+                    "present": True,
+                    "parsed": True,
+                    "verified": True,
+                    "chain_verified": True,
+                },
+                "binding": payload["binding"],
+            }
+        return {
+            "receipt_id": "vi_rcpt_verified",
+            "decision_id": payload["decisionId"],
+            "status": "success",
+            "received_at": "2026-06-01T00:00:00Z",
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    evaluate = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+    assert evaluate.status_code == 200
+    assert evaluate.json()["decision_id"] == "dec_verified"
+
+    receipt = client.post(
+        "/internal/x402-secure/facilitator/receipt",
+        json={
+            "decisionId": "dec_verified",
+            "evidenceRef": "tl_evd_verified",
+            "payment": {
+                "chain": "xrpl",
+                "transaction_hash": "abc123",
+                "status": "success",
+            },
+            "correlation": {"invoiceId": "inv_verified"},
+        },
+        headers=_auth_headers(),
+    )
+    assert receipt.status_code == 200
+
+    lookup = client.post(
+        "/internal/x402-secure/facilitator/vi-receipts/lookup",
+        json={"transactions": [{"hash": "ABC123", "invoiceId": "inv_verified"}]},
+        headers=_auth_headers(),
+    )
+    assert lookup.status_code == 200
+    items = lookup.json()["items"]
+    assert len(items) == 1
+    assert items[0]["hash"] == "ABC123"
+    assert items[0]["invoiceId"] == "inv_verified"
+    assert items[0]["verifiableIntent"] is True
+    assert items[0]["riskChecked"] is True
+    assert items[0]["vi"]["chain_verified"] is True
+
+
+def test_internal_vi_receipt_lookup_does_not_infer_vi_from_success(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "receipt_id": "vi_rcpt_unverified",
+            "decision_id": payload["decisionId"],
+            "status": "success",
+            "received_at": "2026-06-01T00:00:00Z",
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    receipt = client.post(
+        "/internal/x402-secure/facilitator/receipt",
+        json={
+            "decisionId": "dec_missing",
+            "payment": {
+                "chain": "xrpl",
+                "transaction_hash": "def456",
+                "status": "success",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert receipt.status_code == 200
+
+    lookup = client.post(
+        "/internal/x402-secure/facilitator/vi-receipts/lookup",
+        json={"transactions": [{"hash": "DEF456"}]},
+        headers=_auth_headers(),
+    )
+    assert lookup.status_code == 200
+    items = lookup.json()["items"]
+    assert len(items) == 1
+    assert items[0]["verifiableIntent"] is False
+    assert items[0]["riskChecked"] is False
 
 
 def test_internal_evidence_session_forwards_policy(monkeypatch) -> None:

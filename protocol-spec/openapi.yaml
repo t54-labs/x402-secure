@@ -293,6 +293,17 @@ paths:
                 $ref: '#/components/schemas/InternalFacilitatorDecisionResponse'
         '401': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
+        '503':
+          description: Trustline verification is temporarily unavailable; no allow or settle occurred
+          headers:
+            Retry-After:
+              schema: { type: integer, default: 30 }
+            X-Correlation-ID:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustlineTransientResponse'
         '5XX': { $ref: '#/components/responses/Error' }
 
   /internal/x402-secure/facilitator/evidence-session:
@@ -784,6 +795,28 @@ components:
         trustline_assessment:
           type: object
           additionalProperties: true
+
+    TrustlineTransientResponse:
+      type: object
+      required: [reason, retryable, retryAfter, correlationId, phase, settlementAttempted]
+      properties:
+        reason:
+          type: string
+          enum: [trustline_unavailable]
+        retryable:
+          type: boolean
+          enum: [true]
+        retryAfter:
+          type: integer
+          default: 30
+        correlationId:
+          type: string
+        phase:
+          type: string
+          enum: [verify]
+        settlementAttempted:
+          type: boolean
+          enum: [false]
 
     InternalEvidenceSessionRequest:
       type: object

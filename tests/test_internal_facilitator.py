@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import httpx
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -250,8 +252,7 @@ def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypat
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
     assert payload["verifiableIntentChain"] == chain
     assert (
-        payload["verifiableIntentChain"]["l1Credential"]["sdJwt"]
-        == chain["l1Credential"]["sdJwt"]
+        payload["verifiableIntentChain"]["l1Credential"]["sdJwt"] == chain["l1Credential"]["sdJwt"]
     )
     assert payload["verifiableIntentChain"]["l2Delegation"]["sdJwt"].endswith("~l2-disclosure~")
     assert payload["verifiableIntentChain"]["l3FinalAction"]["sdJwt"].endswith(".sig~")
@@ -515,7 +516,10 @@ def test_internal_evaluate_denies_fast_chain_constraint_violation(monkeypatch) -
     assert "per_transaction_max exceeded" in body["reasons"]
 
 
-def test_internal_evaluate_fails_closed_when_trustline_unavailable(monkeypatch) -> None:
+def test_internal_evaluate_fails_closed_when_trustline_unavailable(
+    monkeypatch,
+    caplog,
+) -> None:
     client = _client(monkeypatch)
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -529,13 +533,130 @@ def test_internal_evaluate_fails_closed_when_trustline_unavailable(monkeypatch) 
         headers=_auth_headers(),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "30"
+    assert response.headers["X-Correlation-ID"]
     body = response.json()
-    assert body["decision"] == "deny"
-    assert body["risk_level"] == "high"
-    assert body["ttl_seconds"] == 60
-    assert body["reasons"] == ["Trustline verification unavailable"]
-    assert "failed closed" in body["warnings"][0]
+    assert body == {
+        "reason": "trustline_unavailable",
+        "retryable": True,
+        "retryAfter": 30,
+        "correlationId": response.headers["X-Correlation-ID"],
+        "phase": "verify",
+        "settlementAttempted": False,
+    }
+    assert "reason=trustline_unavailable" in caplog.text
+    assert "retryable=true" in caplog.text
+    assert f"correlation_id={body['correlationId']}" in caplog.text
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])
+def test_internal_evaluate_classifies_retryable_trustline_statuses_as_transient(
+    monkeypatch,
+    status_code: int,
+) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(
+            status_code=status_code,
+            detail="upstream unavailable",
+            headers={"Retry-After": "17"},
+        )
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers={**_auth_headers(), "X-Correlation-ID": "corr-transient"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "17"
+    assert response.headers["X-Correlation-ID"] == "corr-transient"
+    assert response.json()["reason"] == "trustline_unavailable"
+    assert response.json()["retryable"] is True
+
+
+def test_internal_evaluate_keeps_trustline_policy_4xx_permanent(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(status_code=422, detail="policy denied")
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["decision"] == "deny"
+    assert response.json()["reasons"] == ["Trustline policy denied"]
+
+
+def test_internal_evaluate_classifies_trustline_timeout_as_transient(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise httpx.ReadTimeout("Trustline timed out")
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "trustline_unavailable"
+    assert response.json()["settlementAttempted"] is False
+
+
+def test_internal_evaluate_propagates_correlation_to_transient_trustline_call(
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        status_code = 502
+        headers = {"Retry-After": "30"}
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {"error": "temporary"}
+
+    class FakeAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url: str, *, json: dict, headers: dict):
+            captured.update(url=url, json=json, headers=headers)
+            return FakeResponse()
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.httpx.AsyncClient", FakeAsyncClient)
+    client = _client(monkeypatch)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers={**_auth_headers(), "X-Correlation-ID": "corr-gclb-502"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["X-Correlation-ID"] == "corr-gclb-502"
+    assert captured["headers"]["X-Correlation-ID"] == "corr-gclb-502"
+    assert captured["url"].endswith("/api/v1/validation/verifiable-intent/verify-chain")
 
 
 def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch) -> None:

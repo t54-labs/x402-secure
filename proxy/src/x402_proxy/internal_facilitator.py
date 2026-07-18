@@ -8,12 +8,14 @@ import logging
 import os
 import secrets
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .vi_receipt_store import (
@@ -25,11 +27,43 @@ from .vi_receipt_store import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH = "verifiable-intent/verify-chain"
+DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS = 30
+
+_correlation_id_ctx: ContextVar[str] = ContextVar("trustline_correlation_id", default="")
 
 internal_router = APIRouter(
     prefix="/internal/x402-secure/facilitator",
     tags=["x402-secure-internal-facilitator"],
 )
+
+
+def _retry_after_seconds(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS
+
+
+def _trustline_transient_response(
+    *,
+    correlation_id: str,
+    retry_after: int,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "reason": "trustline_unavailable",
+            "retryable": True,
+            "retryAfter": retry_after,
+            "correlationId": correlation_id,
+            "phase": "verify",
+            "settlementAttempted": False,
+        },
+        status_code=503,
+        headers={
+            "Retry-After": str(retry_after),
+            "X-Correlation-ID": correlation_id,
+        },
+    )
 
 
 class FacilitatorInfo(BaseModel):
@@ -637,14 +671,38 @@ async def _post_trustline_validation(
         url = f"{base_url}/{path.lstrip('/')}"
     else:
         url = f"{base_url}{_trustline_validation_path(path)}"
-    async with httpx.AsyncClient(timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))) as client:
-        response = await client.post(
-            url,
-            json=payload,
-            headers=_trustline_auth_headers(payload, route_by_payload=route_by_payload),
-        )
+    headers = _trustline_auth_headers(payload, route_by_payload=route_by_payload)
+    correlation_id = _correlation_id_ctx.get()
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+    try:
+        async with httpx.AsyncClient(
+            timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))
+        ) as client:
+            response = await client.post(url, json=payload, headers=headers)
+    except httpx.HTTPError:
+        raise
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Trustline error: {response.text}")
+        retry_after = response.headers.get("Retry-After")
+        response_correlation_id = (
+            response.headers.get("X-Correlation-ID")
+            or response.headers.get("X-Request-ID")
+            or correlation_id
+        )
+        detail = {
+            "reason": "trustline_unavailable"
+            if response.status_code in {408, 429} or response.status_code >= 500
+            else "trustline_policy_denied",
+            "upstreamStatus": response.status_code,
+            "correlationId": response_correlation_id,
+        }
+        raise HTTPException(
+            status_code=503
+            if response.status_code in {408, 429} or response.status_code >= 500
+            else response.status_code,
+            detail=detail,
+            headers={"Retry-After": retry_after} if retry_after else None,
+        )
     try:
         return response.json()
     except Exception as exc:
@@ -875,7 +933,14 @@ def _trustline_assessment_summary(
 )
 async def evaluate_facilitator_payment(
     body: InternalFacilitatorEvaluateRequest,
-) -> Dict[str, Any]:
+    request: Request,
+) -> Dict[str, Any] | JSONResponse:
+    correlation_id = (
+        request.headers.get("X-Correlation-ID")
+        or request.headers.get("X-Request-ID")
+        or uuid.uuid4().hex
+    )[:128]
+    _correlation_id_ctx.set(correlation_id)
     extension = _extract_extension(body.extensions)
     binding = build_binding_profile(body.payment)
     payload = build_trustline_assessment_payload(body, extension, binding)
@@ -883,11 +948,34 @@ async def evaluate_facilitator_payment(
     try:
         trustline_response = await post_trustline_validation(trustline_path, payload)
     except HTTPException as exc:
+        if exc.status_code in {408, 429} or exc.status_code >= 500:
+            retry_after = _retry_after_seconds(
+                (exc.headers or {}).get(
+                    "Retry-After",
+                    os.getenv(
+                        "TRUSTLINE_RETRY_AFTER_SECONDS",
+                        str(DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS),
+                    ),
+                )
+            )
+            logger.warning(
+                "[INTERNAL] facilitator=%s trustline_verify_chain_transient "
+                "status=%s reason=trustline_unavailable retryable=true "
+                "retry_after=%s correlation_id=%s",
+                body.facilitator.id,
+                exc.status_code,
+                retry_after,
+                correlation_id,
+            )
+            return _trustline_transient_response(
+                correlation_id=correlation_id,
+                retry_after=retry_after,
+            )
         logger.warning(
-            "[INTERNAL] facilitator=%s trustline_verify_chain_failed status=%s detail=%s",
+            "[INTERNAL] facilitator=%s trustline_verify_chain_denied status=%s correlation_id=%s",
             body.facilitator.id,
             exc.status_code,
-            exc.detail,
+            correlation_id,
         )
         return {
             "decision": "deny",
@@ -896,27 +984,34 @@ async def evaluate_facilitator_payment(
             "ttl_seconds": 60,
             "vi": {},
             "binding": binding.model_dump(by_alias=False, exclude_none=True),
-            "reasons": ["Trustline verification unavailable"],
-            "warnings": [f"Trustline verification failed closed: {exc.detail}"],
-            "trustline_assessment": {"source": trustline_path, "error": str(exc.detail)},
+            "reasons": ["Trustline policy denied"],
+            "warnings": [f"Trustline verification denied with status {exc.status_code}"],
+            "trustline_assessment": {
+                "source": trustline_path,
+                "status": exc.status_code,
+                "correlation_id": correlation_id,
+            },
         }
     except httpx.HTTPError as exc:
         logger.warning(
-            "[INTERNAL] facilitator=%s trustline_verify_chain_http_error error=%s",
+            "[INTERNAL] facilitator=%s trustline_verify_chain_transient "
+            "error_type=%s reason=trustline_unavailable retryable=true "
+            "retry_after=%s correlation_id=%s",
             body.facilitator.id,
-            exc,
+            type(exc).__name__,
+            DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS,
+            correlation_id,
         )
-        return {
-            "decision": "deny",
-            "decision_id": f"xs_dec_{uuid.uuid4().hex}",
-            "risk_level": "high",
-            "ttl_seconds": 60,
-            "vi": {},
-            "binding": binding.model_dump(by_alias=False, exclude_none=True),
-            "reasons": ["Trustline verification unavailable"],
-            "warnings": [f"Trustline verification failed closed: {exc}"],
-            "trustline_assessment": {"source": trustline_path, "error": str(exc)},
-        }
+        retry_after = _retry_after_seconds(
+            os.getenv(
+                "TRUSTLINE_RETRY_AFTER_SECONDS",
+                str(DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS),
+            )
+        )
+        return _trustline_transient_response(
+            correlation_id=correlation_id,
+            retry_after=retry_after,
+        )
 
     warnings = list(trustline_response.get("warnings") or [])
     reasons = list(trustline_response.get("reasons") or [])
@@ -1024,8 +1119,5 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
     dependencies=[Depends(require_internal_auth)],
 )
 async def lookup_facilitator_vi_receipts(body: ViReceiptLookupRequest) -> Dict[str, Any]:
-    transactions = [
-        item.model_dump(by_alias=True, exclude_none=True)
-        for item in body.transactions
-    ]
+    transactions = [item.model_dump(by_alias=True, exclude_none=True) for item in body.transactions]
     return {"items": lookup_vi_receipt_statuses(transactions)}

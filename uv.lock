@@ -2057,6 +2057,7 @@ name = "x402-proxy"
 version = "1.0.0"
 source = { editable = "proxy" }
 dependencies = [
+    { name = "cachetools" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -2067,6 +2068,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cachetools", specifier = ">=5,<6" },
     { name = "eth-account", marker = "extra == 'eip712'", specifier = ">=0.10.0" },
     { name = "eth-utils", marker = "extra == 'eip712'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.104.0" },
@@ -2076,7 +2078,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "redis", specifier = ">=5,<6" },
-    { name = "x402", specifier = ">=0.1.0" },
+    { name = "x402", specifier = "==0.2.1" },
 ]
 provides-extras = ["eip712", "dev"]
 

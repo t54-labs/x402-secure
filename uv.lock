@@ -1962,7 +1962,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "redis", specifier = ">=5,<6" },
-    { name = "x402", specifier = ">=0.1.0" },
+    { name = "x402", specifier = "==0.2.1" },
 ]
 provides-extras = ["eip712", "dev"]
 

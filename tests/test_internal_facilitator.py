@@ -247,8 +247,7 @@ def test_internal_evaluate_forwards_verifiable_intent_chain_byte_exact(monkeypat
     assert payload["verifiableIntent"]["presentationRef"] == "tl://evidence/vi_123"
     assert payload["verifiableIntentChain"] == chain
     assert (
-        payload["verifiableIntentChain"]["l1Credential"]["sdJwt"]
-        == chain["l1Credential"]["sdJwt"]
+        payload["verifiableIntentChain"]["l1Credential"]["sdJwt"] == chain["l1Credential"]["sdJwt"]
     )
     assert payload["verifiableIntentChain"]["l2Delegation"]["sdJwt"].endswith("~l2-disclosure~")
     assert payload["verifiableIntentChain"]["l3FinalAction"]["sdJwt"].endswith(".sig~")

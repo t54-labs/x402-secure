@@ -9,42 +9,74 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: Test Suite
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Ruff lint
+        run: uvx ruff@0.8.4 check .
+
+      - name: Ruff format check
+        run: uvx ruff@0.8.4 format --check .
+
+  test:
+    name: Test Suite (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.11'
+          enable-cache: true
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio pytest-cov pytest-mock httpx
+      # Installs from the committed uv.lock so CI resolves the same
+      # dependency set as `uv sync` in the README quickstart, and installs
+      # x402_proxy / x402_secure_client so the tests can import them.
+      - name: Install dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }}
 
+      # Bare `pytest` picks up pytest.ini: the whole tests/ tree, correct
+      # coverage paths, and --cov-fail-under=30.
       - name: Run unit tests
-        run: |
-          pytest tests/test_core_flows.py tests/test_client_sdk.py -v --cov=proxy/src/x402_proxy --cov=packages/x402-secure/src/x402_client --cov-report=xml --cov-report=term || true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Run Docker integration tests
-        run: |
-          ./scripts/test_docker.sh
+        run: uv run --python ${{ matrix.python-version }} pytest
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results
+          name: test-results-py${{ matrix.python-version }}
           path: |
             test-results/
             coverage.xml
+
+  docker:
+    name: Docker Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run Docker integration tests
+        run: ./scripts/test_docker.sh

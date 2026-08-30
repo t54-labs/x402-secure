@@ -62,9 +62,12 @@ async def generate_text(request: Request, prompt: str):
         "network": "base-sepolia",
         "maxAmountRequired": "100000",  # 0.10 USDC
         "resource": str(request.url),
+        "description": "Text generation API",
+        "mimeType": "application/json",
         "payTo": "0xYourWalletAddress",
+        "maxTimeoutSeconds": 30,
         "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC on Base Sepolia
-        "description": "Text generation API"
+        "extra": {"name": "USDC", "version": "2"},
     }
 
     # Check payment headers
@@ -134,8 +137,12 @@ def analyze_data():
         "network": "base-sepolia",
         "maxAmountRequired": "1000000",  # 1.00 USDC
         "resource": request.url,
+        "description": "Data analysis API",
+        "mimeType": "application/json",
         "payTo": "0xYourWalletAddress",
-        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+        "maxTimeoutSeconds": 30,
+        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "extra": {"name": "USDC", "version": "2"},
     }
 
     # Check payment headers
@@ -239,8 +246,12 @@ async def premium_feature(request: Request):
         "network": "base-sepolia",
         "maxAmountRequired": "500000",  # 0.50 USDC
         "resource": str(request.url),
+        "description": "Premium feature",
+        "mimeType": "application/json",
         "payTo": "0xYourWalletAddress",
-        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+        "maxTimeoutSeconds": 30,
+        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "extra": {"name": "USDC", "version": "2"},
     }
 
     x_payment = request.headers.get("X-PAYMENT")
@@ -331,7 +342,10 @@ payment_requirements = {
     "network": "base-sepolia",
     "maxAmountRequired": "100000",
     "resource": str(request.url),
+    "description": "Premium API",
+    "mimeType": "application/json",
     "payTo": "0xYourWalletAddress",
+    "maxTimeoutSeconds": 30,
     "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
     "extra": {
         "name": "USDC",

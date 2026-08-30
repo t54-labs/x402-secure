@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build stage
-FROM python:3.11-slim AS builder
+FROM python:3.14-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -35,7 +35,7 @@ RUN uv pip install --no-cache -e ./proxy
 RUN uv pip install --no-cache -e ./packages/x402-secure
 
 # Runtime stage
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y \

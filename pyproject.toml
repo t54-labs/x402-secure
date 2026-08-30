@@ -14,7 +14,7 @@ authors = [{ name = "t54 labs", email = "dev@t54.ai" }]
 dependencies = [
   "x402==0.2.1",
   "fastapi==0.117.1",
-  "uvicorn==0.24.0",
+  "uvicorn==0.52.4",
   "python-dotenv==1.1.1",
   "httpx==0.28.1",
   "eth-account==0.13.7",

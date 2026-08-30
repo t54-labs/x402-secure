@@ -538,4 +538,4 @@ Before going live:
 - 📧 Email: support@t54.ai
 - 💬 Discord: [Join our community](https://discord.gg/t54labs)
 - 📖 Documentation: [docs.t54.ai](https://docs.t54.ai)
-- 🔗 GitHub: [github.com/t54labs/x402-secure](https://github.com/t54labs/x402-secure)
+- 🔗 GitHub: [github.com/t54-labs/x402-secure](https://github.com/t54-labs/x402-secure)

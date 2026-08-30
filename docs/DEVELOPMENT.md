@@ -83,7 +83,7 @@ sequenceDiagram
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/t54labs/x402-secure
+git clone https://github.com/t54-labs/x402-secure
 cd x402-secure
 ```
 
@@ -187,7 +187,7 @@ docker-compose logs -f facilitator-proxy
 
 ```bash
 # On your server
-git clone https://github.com/t54labs/x402-secure
+git clone https://github.com/t54-labs/x402-secure
 cd x402-secure
 
 # Install dependencies
@@ -624,5 +624,5 @@ class PooledHTTPClient:
 ## Support
 
 - 💬 Developer Discord: [Join #dev channel](https://discord.gg/x402secure)
-- 🐛 Issues: [GitHub Issues](https://github.com/t54labs/x402-secure/issues)
+- 🐛 Issues: [GitHub Issues](https://github.com/t54-labs/x402-secure/issues)
 - 📧 Technical Support: dev@x402-secure.com

@@ -38,7 +38,7 @@ Want to quickly test the proxy on your machine? Follow these steps:
 ### Setup
 ```bash
 # 1. Clone and navigate to the repo
-git clone https://github.com/t54labs/x402-secure
+git clone https://github.com/t54-labs/x402-secure
 cd x402-secure
 
 # 2. Create virtual environment and install dependencies

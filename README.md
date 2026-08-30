@@ -219,13 +219,21 @@ seller = SellerClient("https://x402-proxy.t54.ai/x402")
 @app.get("/api/your-service")
 async def your_api(request: Request, param: str):
     # Define payment requirements
+    # All fields below are REQUIRED by the x402 PaymentRequirements schema.
+    # Omitting description / mimeType / maxTimeoutSeconds makes the 402 body
+    # unparseable by x402 clients, including this SDK's BuyerClient.
     payment_requirements = {
         "scheme": "exact",
         "network": "base-sepolia",  # or "base" for mainnet
         "maxAmountRequired": "100000",  # 0.10 USDC in atomic units
         "resource": str(request.url),
+        "description": "Your service",
+        "mimeType": "application/json",
         "payTo": "0xYourWalletAddress",
+        "maxTimeoutSeconds": 30,
         "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC
+        # Required for EIP-3009 signing: the token's EIP-712 domain
+        "extra": {"name": "USDC", "version": "2"},
     }
 
     # Check for payment headers

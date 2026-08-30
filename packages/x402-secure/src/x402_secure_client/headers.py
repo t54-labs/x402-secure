@@ -72,8 +72,7 @@ def build_ap2_evidence_header(
     if not mandate_sha256_b64url:
         raise ValueError("mandate_sha256_b64url is required")
     value = (
-        f"evd.v1;mr={mandate_reference};ms={mandate_sha256_b64url};"
-        f"mt={media_type};sz={int(size)}"
+        f"evd.v1;mr={mandate_reference};ms={mandate_sha256_b64url};mt={media_type};sz={int(size)}"
     )
     if len(value) > 2048:
         raise ValueError("X-AP2-EVIDENCE exceeds 2048 bytes")

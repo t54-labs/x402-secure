@@ -230,9 +230,7 @@ def test_build_public_vi_assessment_payload_matches_trustline_shape() -> None:
     payload = build_public_vi_assessment_payload(
         body,
         _request(),
-        vi_header=(
-            f"vi.v1;ref=tl://evidence/header;sha256={_VI_HASH};" "mt=application/json;sz=10"
-        ),
+        vi_header=(f"vi.v1;ref=tl://evidence/header;sha256={_VI_HASH};mt=application/json;sz=10"),
         trace_context={"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
         risk_session="risk_sess_1",
         risk_trace="risk_trace_1",
@@ -433,7 +431,7 @@ def test_proxy_verify_maps_ap2_evidence_header_into_trustline_payload(monkeypatc
             "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
             "X-RISK-SESSION": sid,
             "X-AP2-EVIDENCE": (
-                "evd.v1;mr=tl://mandate/payment_1;ms=b64urlhash;" "mt=application/json;sz=10"
+                "evd.v1;mr=tl://mandate/payment_1;ms=b64urlhash;mt=application/json;sz=10"
             ),
             "Origin": "https://merchant.example",
         },

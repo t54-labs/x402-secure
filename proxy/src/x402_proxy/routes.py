@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from hashlib import sha256
 from typing import Any, Dict, List, NamedTuple, Optional
 from urllib.parse import urlparse
@@ -51,11 +51,6 @@ from x402.encoding import safe_base64_decode, safe_base64_encode
 from x402.types import PaymentPayload, PaymentRequirements
 
 logger = logging.getLogger(__name__)
-
-# Debug: store last upstream interactions
-LAST_VERIFY: Optional[Dict[str, Any]] = None
-LAST_SETTLE: Optional[Dict[str, Any]] = None
-
 
 # -------------------------------
 # Helpers
@@ -549,11 +544,6 @@ class ProxyRuntimeConfig(BaseModel):
         )
     )
     timeout_s: float = Field(default_factory=lambda: float(os.getenv("PROXY_TIMEOUT_S", "15")))
-    debug_enabled: bool = Field(
-        default_factory=lambda: (
-            os.getenv("PROXY_DEBUG_ENABLED", "1").lower() in {"1", "true", "yes"}
-        )
-    )
     # Feature flag: optionally enforce risk evaluate at settle (default OFF)
     # TODO(later): Consider enabling by default once prod readiness is confirmed.
     settle_risk_enabled: bool = Field(
@@ -1431,26 +1421,10 @@ async def proxy_verify(
             cfg.upstream_verify_url,
             json=req_json,
         )
-    # Record debug snapshot
-    global LAST_VERIFY
-    snapshot: Dict[str, Any] = {
-        "at": datetime.now(timezone.utc).isoformat(),
-        "upstream_url": cfg.upstream_verify_url,
-        "status_code": resp.status_code,
-        "origin": origin,
-        "request_id": req_id,
-        "sent_payment_requirements": payment_requirements_dict,  # Debug: what we sent
-    }
     try:
         resp_json = resp.json()
     except Exception:
         resp_json = None
-    snapshot["json"] = resp_json
-    snapshot["text"] = resp.text
-    if isinstance(resp_json, dict):
-        snapshot["payer"] = resp_json.get("payer")
-        snapshot["invalidReason"] = resp_json.get("invalidReason") or resp_json.get("error")
-    LAST_VERIFY = snapshot
 
     if resp.status_code != 200:
         return _error_response(
@@ -1709,25 +1683,10 @@ async def proxy_settle(
             cfg.upstream_settle_url,
             json=req_json,
         )
-    # Record debug snapshot
-    global LAST_SETTLE
-    snapshot: Dict[str, Any] = {
-        "at": datetime.now(timezone.utc).isoformat(),
-        "upstream_url": cfg.upstream_settle_url,
-        "status_code": resp.status_code,
-        "origin": origin,
-        "request_id": req_id,
-    }
     try:
         resp_json = resp.json()
     except Exception:
         resp_json = None
-    snapshot["json"] = resp_json
-    snapshot["text"] = resp.text
-    if isinstance(resp_json, dict):
-        snapshot["payer"] = resp_json.get("payer")
-        snapshot["errorReason"] = resp_json.get("errorReason") or resp_json.get("error")
-    LAST_SETTLE = snapshot
 
     if resp.status_code != 200:
         return _error_response(
@@ -1772,20 +1731,6 @@ async def proxy_settle(
         network=data.get("network"),
         errorReason=data.get("errorReason") or data.get("error") or None,
     )
-
-
-@router.get("/debug")
-async def proxy_debug(cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg)) -> Dict[str, Any]:
-    if getattr(cfg, "debug_enabled", True) is False:
-        raise HTTPException(status_code=404, detail="Not Found")
-    return {
-        "upstream": {
-            "verify_url": cfg.upstream_verify_url,
-            "settle_url": cfg.upstream_settle_url,
-        },
-        "last_verify": LAST_VERIFY,
-        "last_settle": LAST_SETTLE,
-    }
 
 
 # Optional utility for seller-side middleware that may be added in a later step.

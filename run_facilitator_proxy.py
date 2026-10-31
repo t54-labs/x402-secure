@@ -13,10 +13,9 @@ Environment Variables:
 
 import logging
 import os
-from datetime import datetime, timezone
 
 from dotenv import load_dotenv  # type: ignore
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from x402_proxy import ProxyRuntimeConfig, get_proxy_cfg, internal_router, risk_router, router
 
 logging.basicConfig(
@@ -43,15 +42,11 @@ def build_app() -> FastAPI:
 
     app.dependency_overrides[get_proxy_cfg] = cfg_factory  # type: ignore[arg-type]
 
-    # Health
+    # Health: liveness/readiness only. Do not expose configuration (upstream
+    # URLs, versions, timestamps) on this unauthenticated endpoint.
     @app.get("/health")
-    async def health(cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg)) -> dict:
-        return {
-            "status": "ok",
-            "time": datetime.now(timezone.utc).isoformat(),
-            "upstream_verify": cfg.upstream_verify_url,
-            "upstream_settle": cfg.upstream_settle_url,
-        }
+    async def health() -> dict:
+        return {"status": "ok"}
 
     # Mount proxy router (/x402/*)
     app.include_router(router)

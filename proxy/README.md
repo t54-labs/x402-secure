@@ -37,7 +37,6 @@ app.include_router(router)
 # Now your app exposes:
 # - POST /x402/verify
 # - POST /x402/settle
-# - GET /x402/debug
 ```
 
 ### Configuration
@@ -54,8 +53,6 @@ export RISK_ENGINE_URL=http://localhost:8001
 
 # Timeout for upstream requests
 export PROXY_TIMEOUT_S=15
-# Disable debug endpoint in production (recommended)
-export PROXY_DEBUG_ENABLED=false
 # Optional: extend network→chainId mapping used for EIP-712 verification
 # Either JSON or comma-separated pairs
 export PROXY_NETWORK_CHAIN_MAP='base:8453,base-sepolia:84532,optimism:10'
@@ -138,7 +135,6 @@ Required APIs (read by the proxy):
 - `PROXY_UPSTREAM_VERIFY_URL` / `PROXY_UPSTREAM_SETTLE_URL`: Upstream x402 facilitator URLs.
 - `RISK_ENGINE_URL`: Base URL of your Risk Engine for trace/mandate lookups (default: `http://localhost:8001`).
 - `PROXY_TIMEOUT_S`: Timeout for upstream calls.
-- `PROXY_DEBUG_ENABLED`: `true`/`false` toggle for `/x402/debug` endpoint (default: `true`).
 - `PROXY_NETWORK_CHAIN_MAP`: JSON or `k:v` pairs extending network→chainId mapping for EIP-712 verification.
 - `PROXY_SETTLE_RISK_ENABLED`: When `true`, the proxy calls `/risk/evaluate` during `POST /x402/settle`. Default is `false` to avoid double evaluation; can be enabled later.
 

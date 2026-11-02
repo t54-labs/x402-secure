@@ -5,25 +5,80 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
+
+from .vi_receipt_store import (
+    VIReceiptStoreUnavailable,
+    lookup_vi_receipt_statuses,
+    record_vi_decision_snapshot,
+    record_vi_receipt_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TRUSTLINE_VERIFY_CHAIN_PATH = "verifiable-intent/verify-chain"
+DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS = 30
+
+_correlation_id_ctx: ContextVar[str] = ContextVar("trustline_correlation_id", default="")
 
 internal_router = APIRouter(
     prefix="/internal/x402-secure/facilitator",
     tags=["x402-secure-internal-facilitator"],
 )
+
+
+def _retry_after_seconds(value: Any) -> int:
+    """Seconds to wait from a Retry-After value: delta-seconds or an HTTP-date (RFC 9110)."""
+    if value is None:
+        return DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS
+    text = str(value).strip()
+    try:
+        return max(0, int(text))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0, math.ceil((retry_at - datetime.now(timezone.utc)).total_seconds()))
+
+
+def _trustline_transient_response(
+    *,
+    correlation_id: str,
+    retry_after: int,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "reason": "trustline_unavailable",
+            "retryable": True,
+            "retryAfter": retry_after,
+            "correlationId": correlation_id,
+            "phase": "verify",
+            "settlementAttempted": False,
+        },
+        status_code=503,
+        headers={
+            "Retry-After": str(retry_after),
+            "X-Correlation-ID": correlation_id,
+        },
+    )
 
 
 class FacilitatorInfo(BaseModel):
@@ -156,6 +211,7 @@ class InternalPaymentContext(BaseModel):
         default_factory=dict,
         alias="paymentRequirements",
     )
+    invoice_id: Optional[str] = Field(default=None, alias="invoiceId")
 
 
 class InternalFacilitatorEvaluateRequest(BaseModel):
@@ -227,7 +283,23 @@ class InternalReceiptRequest(BaseModel):
     settlement_attempt_id: Optional[str] = Field(default=None, alias="settlementAttemptId")
     idempotency_key: Optional[str] = Field(default=None, alias="idempotencyKey")
     payment: Dict[str, Any] = Field(default_factory=dict)
+    correlation: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ViReceiptLookupTransaction(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    hash: Optional[str] = None
+    invoice_id: Optional[str] = Field(default=None, alias="invoiceId")
+    raw_memo: Optional[str] = Field(default=None, alias="rawMemo")
+    transaction_hash: Optional[str] = Field(default=None, alias="transactionHash")
+
+
+class ViReceiptLookupRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    transactions: List[ViReceiptLookupTransaction] = Field(default_factory=list)
 
 
 def _configured_internal_token() -> Optional[str]:
@@ -450,6 +522,24 @@ def build_binding_profile(payment: InternalPaymentContext) -> BindingProfileResu
     return _build_generic_binding(payment)
 
 
+def _evaluated_payment_binding(
+    payment: InternalPaymentContext,
+    binding: BindingProfileResult,
+) -> Dict[str, Any]:
+    """Describe the payment a decision evaluated, for checking the receipt that settles it."""
+    return {
+        "paymentPayloadHash": binding.hashes.get("paymentPayloadHash"),
+        "paymentRequirementsHash": binding.hashes.get("paymentRequirementsHash"),
+        "invoiceId": payment.invoice_id,
+        "chain": binding.chain,
+        "payer": _first_present(payment.payer, payment.payer_wallet, payment.wallet_address),
+        "destination": binding.destination,
+        "amount": binding.amount,
+        "asset": binding.asset,
+        "issuer": binding.issuer,
+    }
+
+
 def _extract_extension(extensions: Dict[str, Any]) -> X402SecureExtension:
     raw = extensions.get("x402Secure") or extensions.get("x402_secure") or extensions
     if not isinstance(raw, dict):
@@ -615,14 +705,38 @@ async def _post_trustline_validation(
         url = f"{base_url}/{path.lstrip('/')}"
     else:
         url = f"{base_url}{_trustline_validation_path(path)}"
-    async with httpx.AsyncClient(timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))) as client:
-        response = await client.post(
-            url,
-            json=payload,
-            headers=_trustline_auth_headers(payload, route_by_payload=route_by_payload),
-        )
+    headers = _trustline_auth_headers(payload, route_by_payload=route_by_payload)
+    correlation_id = _correlation_id_ctx.get()
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+    try:
+        async with httpx.AsyncClient(
+            timeout=float(os.getenv("TRUSTLINE_TIMEOUT_S", "15"))
+        ) as client:
+            response = await client.post(url, json=payload, headers=headers)
+    except httpx.HTTPError:
+        raise
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Trustline error: {response.text}")
+        retry_after = response.headers.get("Retry-After")
+        response_correlation_id = (
+            response.headers.get("X-Correlation-ID")
+            or response.headers.get("X-Request-ID")
+            or correlation_id
+        )
+        detail = {
+            "reason": "trustline_unavailable"
+            if response.status_code in {408, 429} or response.status_code >= 500
+            else "trustline_policy_denied",
+            "upstreamStatus": response.status_code,
+            "correlationId": response_correlation_id,
+        }
+        raise HTTPException(
+            status_code=503
+            if response.status_code in {408, 429} or response.status_code >= 500
+            else response.status_code,
+            detail=detail,
+            headers={"Retry-After": retry_after} if retry_after else None,
+        )
     try:
         return response.json()
     except Exception as exc:
@@ -853,7 +967,14 @@ def _trustline_assessment_summary(
 )
 async def evaluate_facilitator_payment(
     body: InternalFacilitatorEvaluateRequest,
-) -> Dict[str, Any]:
+    request: Request,
+) -> Dict[str, Any] | JSONResponse:
+    correlation_id = (
+        request.headers.get("X-Correlation-ID")
+        or request.headers.get("X-Request-ID")
+        or uuid.uuid4().hex
+    )[:128]
+    _correlation_id_ctx.set(correlation_id)
     extension = _extract_extension(body.extensions)
     binding = build_binding_profile(body.payment)
     payload = build_trustline_assessment_payload(body, extension, binding)
@@ -861,11 +982,34 @@ async def evaluate_facilitator_payment(
     try:
         trustline_response = await post_trustline_validation(trustline_path, payload)
     except HTTPException as exc:
+        if exc.status_code in {408, 429} or exc.status_code >= 500:
+            retry_after = _retry_after_seconds(
+                (exc.headers or {}).get(
+                    "Retry-After",
+                    os.getenv(
+                        "TRUSTLINE_RETRY_AFTER_SECONDS",
+                        str(DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS),
+                    ),
+                )
+            )
+            logger.warning(
+                "[INTERNAL] facilitator=%s trustline_verify_chain_transient "
+                "status=%s reason=trustline_unavailable retryable=true "
+                "retry_after=%s correlation_id=%s",
+                body.facilitator.id,
+                exc.status_code,
+                retry_after,
+                correlation_id,
+            )
+            return _trustline_transient_response(
+                correlation_id=correlation_id,
+                retry_after=retry_after,
+            )
         logger.warning(
-            "[INTERNAL] facilitator=%s trustline_verify_chain_failed status=%s detail=%s",
+            "[INTERNAL] facilitator=%s trustline_verify_chain_denied status=%s correlation_id=%s",
             body.facilitator.id,
             exc.status_code,
-            exc.detail,
+            correlation_id,
         )
         return {
             "decision": "deny",
@@ -874,27 +1018,34 @@ async def evaluate_facilitator_payment(
             "ttl_seconds": 60,
             "vi": {},
             "binding": binding.model_dump(by_alias=False, exclude_none=True),
-            "reasons": ["Trustline verification unavailable"],
-            "warnings": [f"Trustline verification failed closed: {exc.detail}"],
-            "trustline_assessment": {"source": trustline_path, "error": str(exc.detail)},
+            "reasons": ["Trustline policy denied"],
+            "warnings": [f"Trustline verification denied with status {exc.status_code}"],
+            "trustline_assessment": {
+                "source": trustline_path,
+                "status": exc.status_code,
+                "correlation_id": correlation_id,
+            },
         }
     except httpx.HTTPError as exc:
         logger.warning(
-            "[INTERNAL] facilitator=%s trustline_verify_chain_http_error error=%s",
+            "[INTERNAL] facilitator=%s trustline_verify_chain_transient "
+            "error_type=%s reason=trustline_unavailable retryable=true "
+            "retry_after=%s correlation_id=%s",
             body.facilitator.id,
-            exc,
+            type(exc).__name__,
+            DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS,
+            correlation_id,
         )
-        return {
-            "decision": "deny",
-            "decision_id": f"xs_dec_{uuid.uuid4().hex}",
-            "risk_level": "high",
-            "ttl_seconds": 60,
-            "vi": {},
-            "binding": binding.model_dump(by_alias=False, exclude_none=True),
-            "reasons": ["Trustline verification unavailable"],
-            "warnings": [f"Trustline verification failed closed: {exc}"],
-            "trustline_assessment": {"source": trustline_path, "error": str(exc)},
-        }
+        retry_after = _retry_after_seconds(
+            os.getenv(
+                "TRUSTLINE_RETRY_AFTER_SECONDS",
+                str(DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS),
+            )
+        )
+        return _trustline_transient_response(
+            correlation_id=correlation_id,
+            retry_after=retry_after,
+        )
 
     warnings = list(trustline_response.get("warnings") or [])
     reasons = list(trustline_response.get("reasons") or [])
@@ -923,7 +1074,7 @@ async def evaluate_facilitator_payment(
         or trustline_response.get("decisionId")
         or f"xs_dec_{uuid.uuid4().hex}"
     )
-    return {
+    response = {
         "decision": decision,
         "decision_id": decision_id,
         "risk_level": trustline_response.get("risk_level")
@@ -939,6 +1090,13 @@ async def evaluate_facilitator_payment(
             trustline_path,
         ),
     }
+    # The receipt store does blocking I/O; keep it off the event loop.
+    await run_in_threadpool(
+        record_vi_decision_snapshot,
+        response,
+        payment_binding=_evaluated_payment_binding(body.payment, binding),
+    )
+    return response
 
 
 @internal_router.post(
@@ -990,4 +1148,27 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
         "source": "x402_secure_internal_facilitator",
         "receivedAt": datetime.now(timezone.utc).isoformat(),
     }
-    return await post_trustline_validation("verifiable-intent-receipt", payload)
+    response = await post_trustline_validation("verifiable-intent-receipt", payload)
+    await run_in_threadpool(record_vi_receipt_snapshot, payload, response)
+    return response
+
+
+@internal_router.post(
+    "/vi-receipts/lookup",
+    dependencies=[Depends(require_internal_auth)],
+    response_model=None,
+)
+async def lookup_facilitator_vi_receipts(
+    body: ViReceiptLookupRequest,
+) -> Dict[str, Any] | JSONResponse:
+    transactions = [item.model_dump(by_alias=True, exclude_none=True) for item in body.transactions]
+    try:
+        items = await run_in_threadpool(lookup_vi_receipt_statuses, transactions)
+    except VIReceiptStoreUnavailable as exc:
+        logger.warning("[INTERNAL] vi_receipt_lookup_unavailable reason=%s", exc)
+        return JSONResponse(
+            {"reason": "vi_receipt_store_unavailable", "retryable": True},
+            status_code=503,
+            headers={"Retry-After": str(DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS)},
+        )
+    return {"items": items}

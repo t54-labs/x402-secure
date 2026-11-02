@@ -2,8 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
+import socket
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any, Dict
 
+import httpx
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -11,6 +19,9 @@ from fastapi.testclient import TestClient
 def _client(monkeypatch) -> TestClient:
     monkeypatch.setenv("X402_SECURE_INTERNAL_TOKEN", "test-internal-token")
     from x402_proxy import internal_router
+    from x402_proxy.vi_receipt_store import reset_vi_receipt_store_for_tests
+
+    reset_vi_receipt_store_for_tests()
 
     app = FastAPI(title="Internal Facilitator Test")
     app.include_router(internal_router)
@@ -511,7 +522,10 @@ def test_internal_evaluate_denies_fast_chain_constraint_violation(monkeypatch) -
     assert "per_transaction_max exceeded" in body["reasons"]
 
 
-def test_internal_evaluate_fails_closed_when_trustline_unavailable(monkeypatch) -> None:
+def test_internal_evaluate_fails_closed_when_trustline_unavailable(
+    monkeypatch,
+    caplog,
+) -> None:
     client = _client(monkeypatch)
 
     async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -525,13 +539,174 @@ def test_internal_evaluate_fails_closed_when_trustline_unavailable(monkeypatch) 
         headers=_auth_headers(),
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "30"
+    assert response.headers["X-Correlation-ID"]
     body = response.json()
-    assert body["decision"] == "deny"
-    assert body["risk_level"] == "high"
-    assert body["ttl_seconds"] == 60
-    assert body["reasons"] == ["Trustline verification unavailable"]
-    assert "failed closed" in body["warnings"][0]
+    assert body == {
+        "reason": "trustline_unavailable",
+        "retryable": True,
+        "retryAfter": 30,
+        "correlationId": response.headers["X-Correlation-ID"],
+        "phase": "verify",
+        "settlementAttempted": False,
+    }
+    assert "reason=trustline_unavailable" in caplog.text
+    assert "retryable=true" in caplog.text
+    assert f"correlation_id={body['correlationId']}" in caplog.text
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])
+def test_internal_evaluate_classifies_retryable_trustline_statuses_as_transient(
+    monkeypatch,
+    status_code: int,
+) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(
+            status_code=status_code,
+            detail="upstream unavailable",
+            headers={"Retry-After": "17"},
+        )
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers={**_auth_headers(), "X-Correlation-ID": "corr-transient"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "17"
+    assert response.headers["X-Correlation-ID"] == "corr-transient"
+    assert response.json()["reason"] == "trustline_unavailable"
+    assert response.json()["retryable"] is True
+
+
+def test_internal_evaluate_keeps_an_http_date_retry_after_from_trustline(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    retry_at = format_datetime(datetime.now(timezone.utc) + timedelta(minutes=10), usegmt=True)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(
+            status_code=503,
+            detail="upstream unavailable",
+            headers={"Retry-After": retry_at},
+        )
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 503
+    assert 590 <= int(response.headers["Retry-After"]) <= 600
+    assert response.json()["retryAfter"] == int(response.headers["Retry-After"])
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("17", 17), (17, 17), ("0", 0), ("-5", 0), (None, 30), ("soon", 30), ("", 30)],
+)
+def test_retry_after_seconds_reads_delta_seconds(value: Any, expected: int) -> None:
+    from x402_proxy.internal_facilitator import _retry_after_seconds
+
+    assert _retry_after_seconds(value) == expected
+
+
+def test_retry_after_seconds_reads_http_dates() -> None:
+    from x402_proxy.internal_facilitator import _retry_after_seconds
+
+    now = datetime.now(timezone.utc)
+    assert 590 <= _retry_after_seconds(format_datetime(now + timedelta(minutes=10), usegmt=True))
+    assert _retry_after_seconds(format_datetime(now + timedelta(minutes=10), usegmt=True)) <= 600
+    assert _retry_after_seconds(format_datetime(now - timedelta(minutes=10), usegmt=True)) == 0
+    assert _retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT") == 0
+
+
+def test_internal_evaluate_keeps_trustline_policy_4xx_permanent(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(status_code=422, detail="policy denied")
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["decision"] == "deny"
+    assert response.json()["reasons"] == ["Trustline policy denied"]
+
+
+def test_internal_evaluate_classifies_trustline_timeout_as_transient(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise httpx.ReadTimeout("Trustline timed out")
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "trustline_unavailable"
+    assert response.json()["settlementAttempted"] is False
+
+
+def test_internal_evaluate_propagates_correlation_to_transient_trustline_call(
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        status_code = 502
+        headers = {"Retry-After": "30"}
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {"error": "temporary"}
+
+    class FakeAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url: str, *, json: dict, headers: dict):
+            captured.update(url=url, json=json, headers=headers)
+            return FakeResponse()
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.httpx.AsyncClient", FakeAsyncClient)
+    client = _client(monkeypatch)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers={**_auth_headers(), "X-Correlation-ID": "corr-gclb-502"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["X-Correlation-ID"] == "corr-gclb-502"
+    assert captured["headers"]["X-Correlation-ID"] == "corr-gclb-502"
+    assert captured["url"].endswith("/api/v1/validation/verifiable-intent/verify-chain")
 
 
 def test_internal_evaluate_accepts_facilitator_payment_payload_hash(monkeypatch) -> None:
@@ -677,6 +852,462 @@ def test_internal_receipt_forwards_to_trustline(monkeypatch) -> None:
     assert captured["path"] == "verifiable-intent-receipt"
     assert captured["payload"]["settlementAttemptId"] == "attempt_1"
     assert captured["payload"]["metadata"]["source"] == "x402_secure_internal_facilitator"
+
+
+PAYLOAD_HASH = "sha256:facilitator_payload_hash"
+REQUIREMENTS_HASH = "sha256:facilitator_requirements_hash"
+INVOICE_ID = "inv_verified"
+
+
+def _bound_evaluate_payload() -> Dict[str, Any]:
+    """An evaluate request carrying the hashes, invoice and payer the XRPL facilitator sends."""
+    body = _evaluate_payload()
+    body["payment"].update(
+        {
+            "paymentPayloadHash": PAYLOAD_HASH,
+            "paymentRequirementsHash": REQUIREMENTS_HASH,
+            "invoiceId": INVOICE_ID,
+            "payer": "rBuyerWallet",
+        }
+    )
+    return body
+
+
+def _facilitator_receipt(
+    *,
+    transaction_hash: Any = "abc123",
+    payment: Dict[str, Any] | None = None,
+    correlation: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """A receipt shaped like the one the XRPL facilitator sends after it settles."""
+    return {
+        "decision_id": "dec_verified",
+        "evidence_ref": "tl_evd_verified",
+        "payment": {
+            "chain": "xrpl",
+            "network": "xrpl:testnet",
+            "transaction_hash": transaction_hash,
+            "status": "success",
+            **(payment or {}),
+        },
+        "correlation": {
+            "paymentPayloadHash": PAYLOAD_HASH,
+            "paymentRequirementsHash": REQUIREMENTS_HASH,
+            "invoiceId": INVOICE_ID,
+            **(correlation or {}),
+        },
+    }
+
+
+async def _verified_trustline(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if path == "verifiable-intent/verify-chain":
+        return {
+            "decision": "allow",
+            "decision_id": "dec_verified",
+            "risk_level": "low",
+            "vi": {
+                "present": True,
+                "parsed": True,
+                "verified": True,
+                "chain_verified": True,
+            },
+            "binding": payload["binding"],
+        }
+    return {
+        "receipt_id": "vi_rcpt_verified",
+        "decision_id": payload["decisionId"],
+        "status": "success",
+        "received_at": "2026-06-01T00:00:00Z",
+    }
+
+
+def _lookup(client: TestClient, *transactions: Dict[str, Any]) -> Any:
+    return client.post(
+        "/internal/x402-secure/facilitator/vi-receipts/lookup",
+        json={"transactions": list(transactions)},
+        headers=_auth_headers(),
+    )
+
+
+def _evaluate_then_receipt(client: TestClient, receipt: Dict[str, Any]) -> None:
+    evaluate = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_bound_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+    assert evaluate.status_code == 200
+    assert evaluate.json()["decision_id"] == "dec_verified"
+    response = client.post(
+        "/internal/x402-secure/facilitator/receipt",
+        json=receipt,
+        headers=_auth_headers(),
+    )
+    assert response.status_code == 200
+
+
+def test_internal_vi_receipt_lookup_returns_verified_settlement(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    lookup = _lookup(client, {"hash": "ABC123", "invoiceId": "inv_verified"})
+    assert lookup.status_code == 200
+    items = lookup.json()["items"]
+    assert len(items) == 1
+    assert items[0]["hash"] == "ABC123"
+    assert items[0]["invoiceId"] == "inv_verified"
+    assert items[0]["verifiableIntent"] is True
+    assert items[0]["riskChecked"] is True
+    assert items[0]["vi"]["chain_verified"] is True
+    assert items[0]["bindingStatus"] == "bound"
+
+
+def test_internal_vi_receipt_binding_uses_the_evaluated_payment(monkeypatch) -> None:
+    # Trustline's own "binding" in the verify-chain response may not carry the hashes;
+    # the receipt is checked against the payment this proxy evaluated.
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = await _verified_trustline(path, payload)
+        if path == "verifiable-intent/verify-chain":
+            response["binding"] = {"paymentBound": True}
+        return response
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    items = _lookup(client, {"hash": "ABC123"}).json()["items"]
+    assert len(items) == 1
+    assert items[0]["bindingStatus"] == "bound"
+    assert items[0]["verifiableIntent"] is True
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"correlation": {"paymentPayloadHash": "sha256:another_payload"}},
+        {"correlation": {"paymentRequirementsHash": "sha256:another_requirements"}},
+        {"correlation": {"invoiceId": "inv_another"}},
+        {"payment": {"chain": "base"}},
+        {"payment": {"destination": "rSomeoneElse"}},
+        {"payment": {"payer": "rAnotherPayer"}},
+        {"payment": {"amount": "999"}},
+    ],
+)
+def test_internal_vi_receipt_for_another_payment_is_rejected(
+    monkeypatch,
+    caplog,
+    mismatch: Dict[str, Any],
+) -> None:
+    # The evaluated decision's id on a receipt for a different payment must not lend that
+    # payment the decision's verification.
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt(transaction_hash="other1", **mismatch))
+
+    lookup = _lookup(
+        client,
+        {"hash": "OTHER1"},
+        {"invoiceId": INVOICE_ID},
+        {"invoiceId": "inv_another"},
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["items"] == []
+    assert "VI receipt rejected" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        {"correlation": {"chain": "xrpl"}, "payment": {"chain": "base"}},
+        {"correlation": {"payer": "rBuyerWallet"}, "payment": {"payer": "rAnotherPayer"}},
+        {
+            "correlation": {"destination": "rMerchantDestination"},
+            "payment": {"destination": "rSomeoneElse"},
+        },
+        {"correlation": {"amount": "10"}, "payment": {"amount": "999"}},
+        {"payment": {"paymentPayloadHash": "sha256:another_payload"}},
+        {"payment": {"destination": "rMerchantDestination", "payTo": "rSomeoneElse"}},
+        {"payment": {"hash": "OTHER2"}},
+    ],
+)
+def test_internal_vi_receipt_with_contradicting_values_is_rejected(
+    monkeypatch,
+    caplog,
+    contradiction: Dict[str, Any],
+) -> None:
+    # A value that matches in one place (or alias) must not hide one that contradicts the
+    # evaluated payment, or another supplied value, somewhere else in the receipt.
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt(transaction_hash="other1", **contradiction))
+
+    lookup = _lookup(client, {"hash": "OTHER1"}, {"hash": "OTHER2"}, {"invoiceId": INVOICE_ID})
+    assert lookup.status_code == 200
+    assert lookup.json()["items"] == []
+    assert "VI receipt rejected" in caplog.text
+
+
+def test_internal_vi_receipt_without_the_payload_hash_is_not_verified(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+    receipt = _facilitator_receipt()
+    del receipt["correlation"]["paymentPayloadHash"]
+
+    _evaluate_then_receipt(client, receipt)
+
+    items = _lookup(client, {"hash": "ABC123"}).json()["items"]
+    assert len(items) == 1
+    assert items[0]["bindingStatus"] == "insufficient"
+    assert items[0]["verifiableIntent"] is False
+    assert items[0]["riskChecked"] is False
+    assert items[0]["decision"] is None
+    assert items[0]["vi"] == {}
+
+
+def test_internal_vi_receipt_lookup_does_not_vouch_for_a_hash_it_never_stored(monkeypatch) -> None:
+    # A receipt with an invoice id but no transaction hash says nothing about any hash.
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt(transaction_hash=None))
+
+    lookup = _lookup(
+        client,
+        {"hash": "UNRELATED-1", "invoiceId": INVOICE_ID},
+        {"hash": "UNRELATED-2", "invoiceId": INVOICE_ID},
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["items"] == []
+
+    by_invoice = _lookup(client, {"invoiceId": INVOICE_ID}).json()["items"]
+    assert len(by_invoice) == 1
+    assert by_invoice[0]["hash"] is None
+    assert by_invoice[0]["invoiceId"] == INVOICE_ID
+
+
+def _store_from_env(monkeypatch, **env: str) -> None:
+    for name in ("X402_SECURE_VI_RECEIPT_STORE", "X402_SECURE_VI_RECEIPT_REDIS_URL"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    from x402_proxy.vi_receipt_store import reload_vi_receipt_store_from_env_for_tests
+
+    reload_vi_receipt_store_from_env_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("env", "log_text"),
+    [
+        ({}, "X402_SECURE_VI_RECEIPT_REDIS_URL is not set"),
+        ({"X402_SECURE_VI_RECEIPT_STORE": "memcache"}, "Unknown X402_SECURE_VI_RECEIPT_STORE"),
+        ({"X402_SECURE_VI_RECEIPT_REDIS_URL": "redis://127.0.0.1:1/0"}, "unreachable"),
+    ],
+)
+def test_internal_vi_receipt_lookup_answers_503_without_a_shared_store(
+    monkeypatch,
+    caplog,
+    env: Dict[str, str],
+    log_text: str,
+) -> None:
+    # Several workers serve these routes, and a per-process fallback would answer each one
+    # differently. Without a usable shared store, the lookup says so instead.
+    client = _client(monkeypatch)
+    _store_from_env(monkeypatch, **env)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    # Evaluate and the receipt forward still answer; there is just nowhere to store them.
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    lookup = _lookup(client, {"hash": "ABC123"})
+    assert lookup.status_code == 503
+    assert lookup.headers["Retry-After"] == "30"
+    assert lookup.json() == {"reason": "vi_receipt_store_unavailable", "retryable": True}
+    assert log_text in caplog.text
+
+
+def test_internal_vi_receipt_in_memory_store_is_opt_in(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _store_from_env(monkeypatch, X402_SECURE_VI_RECEIPT_STORE="memory")
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    items = _lookup(client, {"hash": "ABC123"}).json()["items"]
+    assert [item["riskChecked"] for item in items] == [True]
+
+
+class _SilentServer:
+    """A TCP server that accepts connections and never answers, like a hung Redis."""
+
+    def __init__(self) -> None:
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(16)
+        self._listener.settimeout(0.05)
+        self.port = self._listener.getsockname()[1]
+        self._connections: list[socket.socket] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+        self._thread.start()
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                continue
+            self._connections.append(connection)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        for connection in self._connections:
+            connection.close()
+        self._listener.close()
+
+
+def _within(seconds: float, action: Any) -> Any:
+    """Run ``action`` in a thread and fail, instead of hanging, if it outlasts ``seconds``."""
+    outcome: Dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = action()
+        except BaseException as exc:  # re-raised in the test thread below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), f"still blocked after {seconds}s"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def test_internal_vi_receipt_store_times_out_on_a_stalled_redis(monkeypatch) -> None:
+    # A Redis that accepts the connection but never replies must not hang startup or the
+    # routes: each operation times out, and the lookup answers 503.
+    server = _SilentServer()
+    try:
+        client = _client(monkeypatch)
+        monkeypatch.setenv("X402_SECURE_VI_RECEIPT_REDIS_TIMEOUT_SECONDS", "0.2")
+        url = f"redis://127.0.0.1:{server.port}/0"
+        _within(5, lambda: _store_from_env(monkeypatch, X402_SECURE_VI_RECEIPT_REDIS_URL=url))
+        monkeypatch.setattr(
+            "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+        )
+
+        def evaluate_receipt_and_lookup() -> Any:
+            _evaluate_then_receipt(client, _facilitator_receipt())
+            return _lookup(client, {"hash": "ABC123"})
+
+        lookup = _within(10, evaluate_receipt_and_lookup)
+        assert lookup.status_code == 503
+        assert lookup.json()["reason"] == "vi_receipt_store_unavailable"
+    finally:
+        server.close()
+
+
+def test_internal_vi_receipt_lookup_keeps_the_event_loop_free(monkeypatch) -> None:
+    # Store calls block (Redis is synchronous), so they run in a worker thread: other
+    # requests on the same event loop keep being served meanwhile.
+    _client(monkeypatch)
+    from x402_proxy import internal_router
+    from x402_proxy.vi_receipt_store import _InMemoryTTLStore
+
+    class SlowStore(_InMemoryTTLStore):
+        def get(self, key: str) -> Any:
+            time.sleep(0.3)
+            return super().get(key)
+
+    monkeypatch.setattr("x402_proxy.vi_receipt_store._store", SlowStore())
+    app = FastAPI()
+    app.include_router(internal_router)
+
+    async def lookup_with_heartbeat() -> tuple[int, int]:
+        ticks = 0
+        done = asyncio.Event()
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while not done.is_set():
+                ticks += 1
+                await asyncio.sleep(0.02)
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as http:
+            beat = asyncio.create_task(heartbeat())
+            response = await http.post(
+                "/internal/x402-secure/facilitator/vi-receipts/lookup",
+                json={"transactions": [{"hash": "ABC123"}]},
+                headers=_auth_headers(),
+            )
+            done.set()
+            await beat
+        return response.status_code, ticks
+
+    status, ticks = asyncio.run(lookup_with_heartbeat())
+    assert status == 200
+    assert ticks >= 5
+
+
+def test_internal_vi_receipt_lookup_does_not_infer_vi_from_success(monkeypatch) -> None:
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "receipt_id": "vi_rcpt_unverified",
+            "decision_id": payload["decisionId"],
+            "status": "success",
+            "received_at": "2026-06-01T00:00:00Z",
+        }
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    receipt = client.post(
+        "/internal/x402-secure/facilitator/receipt",
+        json={
+            "decisionId": "dec_missing",
+            "payment": {
+                "chain": "xrpl",
+                "transaction_hash": "def456",
+                "status": "success",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert receipt.status_code == 200
+
+    lookup = client.post(
+        "/internal/x402-secure/facilitator/vi-receipts/lookup",
+        json={"transactions": [{"hash": "DEF456"}]},
+        headers=_auth_headers(),
+    )
+    assert lookup.status_code == 200
+    items = lookup.json()["items"]
+    assert len(items) == 1
+    assert items[0]["verifiableIntent"] is False
+    assert items[0]["riskChecked"] is False
 
 
 def test_internal_evidence_session_forwards_policy(monkeypatch) -> None:

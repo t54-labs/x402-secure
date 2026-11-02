@@ -1015,6 +1015,61 @@ def test_internal_vi_receipt_lookup_does_not_vouch_for_a_hash_it_never_stored(mo
     assert by_invoice[0]["invoiceId"] == INVOICE_ID
 
 
+def _store_from_env(monkeypatch, **env: str) -> None:
+    for name in ("X402_SECURE_VI_RECEIPT_STORE", "X402_SECURE_VI_RECEIPT_REDIS_URL"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    from x402_proxy.vi_receipt_store import reload_vi_receipt_store_from_env_for_tests
+
+    reload_vi_receipt_store_from_env_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("env", "log_text"),
+    [
+        ({}, "X402_SECURE_VI_RECEIPT_REDIS_URL is not set"),
+        ({"X402_SECURE_VI_RECEIPT_STORE": "memcache"}, "Unknown X402_SECURE_VI_RECEIPT_STORE"),
+        ({"X402_SECURE_VI_RECEIPT_REDIS_URL": "redis://127.0.0.1:1/0"}, "unreachable"),
+    ],
+)
+def test_internal_vi_receipt_lookup_answers_503_without_a_shared_store(
+    monkeypatch,
+    caplog,
+    env: Dict[str, str],
+    log_text: str,
+) -> None:
+    # Several workers serve these routes, and a per-process fallback would answer each one
+    # differently. Without a usable shared store, the lookup says so instead.
+    client = _client(monkeypatch)
+    _store_from_env(monkeypatch, **env)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    # Evaluate and the receipt forward still answer; there is just nowhere to store them.
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    lookup = _lookup(client, {"hash": "ABC123"})
+    assert lookup.status_code == 503
+    assert lookup.headers["Retry-After"] == "30"
+    assert lookup.json() == {"reason": "vi_receipt_store_unavailable", "retryable": True}
+    assert log_text in caplog.text
+
+
+def test_internal_vi_receipt_in_memory_store_is_opt_in(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _store_from_env(monkeypatch, X402_SECURE_VI_RECEIPT_STORE="memory")
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    items = _lookup(client, {"hash": "ABC123"}).json()["items"]
+    assert [item["riskChecked"] for item in items] == [True]
+
+
 def test_internal_vi_receipt_lookup_does_not_infer_vi_from_success(monkeypatch) -> None:
     client = _client(monkeypatch)
 

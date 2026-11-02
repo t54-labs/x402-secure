@@ -79,6 +79,8 @@ class _RedisTTLStore(_TTLStore):
         if redis is None:  # pragma: no cover
             raise RuntimeError("redis_library_missing")
         self._client = redis.Redis.from_url(url, decode_responses=True)
+
+    def ping(self) -> None:
         self._client.ping()
 
     def get(self, key: str) -> Optional[str]:
@@ -106,33 +108,60 @@ def _ttl_seconds() -> int:
     return max(60, value)
 
 
-def _require_redis() -> bool:
-    return os.getenv("X402_SECURE_VI_RECEIPT_REQUIRE_REDIS", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+class VIReceiptStoreUnavailable(RuntimeError):
+    """No shared VI receipt store is configured, or the configured one is unreachable."""
 
 
-def _build_store() -> _TTLStore:
+def _build_store() -> Optional[_TTLStore]:
+    """Return the configured receipt store, or None when none is usable.
+
+    Receipts must live in a store every worker shares. Dockerfile.production runs four
+    uvicorn workers, and a per-process store gives each worker different answers. So Redis
+    is the default, and the in-memory store is used only when X402_SECURE_VI_RECEIPT_STORE=
+    memory asks for it, for a single process. Nothing falls back silently: without a
+    reachable Redis, receipts are not stored and lookups answer 503.
+    """
+    mode = os.getenv("X402_SECURE_VI_RECEIPT_STORE", "redis").strip().lower() or "redis"
+    if mode == "memory":
+        logger.warning(
+            "Using the in-memory VI receipt store; it is per process, so run a single worker."
+        )
+        return _InMemoryTTLStore()
+    if mode != "redis":
+        logger.error(
+            "Unknown X402_SECURE_VI_RECEIPT_STORE=%s; VI receipt lookups answer 503.", mode
+        )
+        return None
     redis_url = os.getenv("X402_SECURE_VI_RECEIPT_REDIS_URL", "").strip()
-    if redis_url:
-        try:
-            store = _RedisTTLStore(redis_url)
-            logger.info("Using Redis VI receipt store.")
-            return store
-        except Exception as exc:  # pragma: no cover
-            if _require_redis():
-                raise RuntimeError("vi_receipt_redis_required") from exc
-            logger.warning("Redis VI receipt store init failed; using memory store: %s", exc)
-    elif _require_redis():
-        raise RuntimeError("vi_receipt_redis_url_required")
+    if not redis_url:
+        logger.error("X402_SECURE_VI_RECEIPT_REDIS_URL is not set; VI receipt lookups answer 503.")
+        return None
+    try:
+        store = _RedisTTLStore(redis_url)
+    except Exception as exc:
+        logger.error(
+            "VI receipt Redis store could not be created (%s); lookups answer 503.",
+            type(exc).__name__,
+        )
+        return None
+    try:
+        store.ping()
+        logger.info("Using Redis VI receipt store.")
+    except Exception as exc:
+        logger.error(
+            "VI receipt Redis store is unreachable (%s); lookups answer 503 until it is.",
+            type(exc).__name__,
+        )
+    return store
 
-    logger.info("Using in-memory VI receipt store.")
-    return _InMemoryTTLStore()
+
+_store: Optional[_TTLStore] = _build_store()
 
 
-_store: _TTLStore = _build_store()
+def _usable_store() -> _TTLStore:
+    if _store is None:
+        raise VIReceiptStoreUnavailable("vi_receipt_store_not_configured")
+    return _store
 
 
 def _now() -> str:
@@ -279,7 +308,11 @@ def _check_receipt_binding(
 
 
 def _load_json(key: str) -> Optional[dict[str, Any]]:
-    raw = _store.get(key)
+    store = _usable_store()
+    try:
+        raw = store.get(key)
+    except Exception as exc:
+        raise VIReceiptStoreUnavailable(type(exc).__name__) from exc
     if not raw:
         return None
     try:
@@ -291,7 +324,11 @@ def _load_json(key: str) -> Optional[dict[str, Any]]:
 
 
 def _save_json(key: str, value: Mapping[str, Any]) -> None:
-    _store.set(key, _json_dumps(value), _ttl_seconds())
+    store = _usable_store()
+    try:
+        store.set(key, _json_dumps(value), _ttl_seconds())
+    except Exception as exc:
+        raise VIReceiptStoreUnavailable(type(exc).__name__) from exc
 
 
 def record_vi_decision_snapshot(
@@ -302,7 +339,22 @@ def record_vi_decision_snapshot(
 
     ``payment_binding`` describes the payment the decision evaluated, keyed like
     ``_BINDING_FIELDS``. A receipt inherits the decision's verification only if it matches.
+    A store outage is logged and never fails the evaluation.
     """
+    try:
+        _record_vi_decision_snapshot(response, payment_binding)
+    except VIReceiptStoreUnavailable as exc:
+        logger.warning(
+            "VI decision snapshot not stored (receipt store unavailable: %s) decision_id=%s",
+            exc,
+            _pick(response, "decision_id", "decisionId"),
+        )
+
+
+def _record_vi_decision_snapshot(
+    response: Mapping[str, Any],
+    payment_binding: Optional[Mapping[str, Any]],
+) -> None:
     decision_id = _pick(response, "decision_id", "decisionId")
     if not decision_id:
         return
@@ -337,8 +389,23 @@ def record_vi_receipt_snapshot(
 
     The status carries the decision's verification only when the receipt is bound to the
     payment that decision evaluated (``_check_receipt_binding``). A receipt that contradicts
-    the evaluated payment is not stored at all.
+    the evaluated payment is not stored at all. A store outage is logged and never fails
+    the receipt.
     """
+    try:
+        _record_vi_receipt_snapshot(payload, trustline_response)
+    except VIReceiptStoreUnavailable as exc:
+        logger.warning(
+            "VI receipt not stored (receipt store unavailable: %s) decision_id=%s",
+            exc,
+            _pick(payload, "decisionId", "decision_id"),
+        )
+
+
+def _record_vi_receipt_snapshot(
+    payload: Mapping[str, Any],
+    trustline_response: Optional[Mapping[str, Any]],
+) -> None:
     decision_id = _pick(payload, "decisionId", "decision_id")
     payment = _as_dict(payload.get("payment"))
     correlation = _as_dict(payload.get("correlation"))
@@ -442,7 +509,11 @@ def _lookup_one(query: Mapping[str, Any]) -> Optional[dict[str, Any]]:
 def lookup_vi_receipt_statuses(
     transactions: list[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return the stored status for each transaction hash or invoice id that has one."""
+    """Return the stored status for each transaction hash or invoice id that has one.
+
+    Raises VIReceiptStoreUnavailable when there is no usable shared store, so the caller
+    can answer 503 instead of an empty, misleading result.
+    """
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for transaction in transactions:
@@ -459,5 +530,12 @@ def lookup_vi_receipt_statuses(
 
 
 def reset_vi_receipt_store_for_tests() -> None:
-    """Empty the store between tests."""
-    _store.clear()
+    """Give a test a fresh in-memory store, whatever the environment configures."""
+    global _store
+    _store = _InMemoryTTLStore()
+
+
+def reload_vi_receipt_store_from_env_for_tests() -> None:
+    """Rebuild the store from the environment as at import, to test the defaults."""
+    global _store
+    _store = _build_store()

@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .vi_receipt_store import (
+    VIReceiptStoreUnavailable,
     lookup_vi_receipt_statuses,
     record_vi_decision_snapshot,
     record_vi_receipt_snapshot,
@@ -1139,7 +1140,19 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
 @internal_router.post(
     "/vi-receipts/lookup",
     dependencies=[Depends(require_internal_auth)],
+    response_model=None,
 )
-async def lookup_facilitator_vi_receipts(body: ViReceiptLookupRequest) -> Dict[str, Any]:
+async def lookup_facilitator_vi_receipts(
+    body: ViReceiptLookupRequest,
+) -> Dict[str, Any] | JSONResponse:
     transactions = [item.model_dump(by_alias=True, exclude_none=True) for item in body.transactions]
-    return {"items": lookup_vi_receipt_statuses(transactions)}
+    try:
+        items = lookup_vi_receipt_statuses(transactions)
+    except VIReceiptStoreUnavailable as exc:
+        logger.warning("[INTERNAL] vi_receipt_lookup_unavailable reason=%s", exc)
+        return JSONResponse(
+            {"reason": "vi_receipt_store_unavailable", "retryable": True},
+            status_code=503,
+            headers={"Retry-After": str(DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS)},
+        )
+    return {"items": items}

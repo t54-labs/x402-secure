@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
@@ -39,10 +41,21 @@ internal_router = APIRouter(
 
 
 def _retry_after_seconds(value: Any) -> int:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
+    """Seconds to wait from a Retry-After value: delta-seconds or an HTTP-date (RFC 9110)."""
+    if value is None:
         return DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS
+    text = str(value).strip()
+    try:
+        return max(0, int(text))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return DEFAULT_TRUSTLINE_RETRY_AFTER_SECONDS
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0, math.ceil((retry_at - datetime.now(timezone.utc)).total_seconds()))
 
 
 def _trustline_transient_response(

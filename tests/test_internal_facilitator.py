@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any, Dict
 
 import httpx
@@ -577,6 +579,50 @@ def test_internal_evaluate_classifies_retryable_trustline_statuses_as_transient(
     assert response.headers["X-Correlation-ID"] == "corr-transient"
     assert response.json()["reason"] == "trustline_unavailable"
     assert response.json()["retryable"] is True
+
+
+def test_internal_evaluate_keeps_an_http_date_retry_after_from_trustline(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    retry_at = format_datetime(datetime.now(timezone.utc) + timedelta(minutes=10), usegmt=True)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise HTTPException(
+            status_code=503,
+            detail="upstream unavailable",
+            headers={"Retry-After": retry_at},
+        )
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 503
+    assert 590 <= int(response.headers["Retry-After"]) <= 600
+    assert response.json()["retryAfter"] == int(response.headers["Retry-After"])
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("17", 17), (17, 17), ("0", 0), ("-5", 0), (None, 30), ("soon", 30), ("", 30)],
+)
+def test_retry_after_seconds_reads_delta_seconds(value: Any, expected: int) -> None:
+    from x402_proxy.internal_facilitator import _retry_after_seconds
+
+    assert _retry_after_seconds(value) == expected
+
+
+def test_retry_after_seconds_reads_http_dates() -> None:
+    from x402_proxy.internal_facilitator import _retry_after_seconds
+
+    now = datetime.now(timezone.utc)
+    assert 590 <= _retry_after_seconds(format_datetime(now + timedelta(minutes=10), usegmt=True))
+    assert _retry_after_seconds(format_datetime(now + timedelta(minutes=10), usegmt=True)) <= 600
+    assert _retry_after_seconds(format_datetime(now - timedelta(minutes=10), usegmt=True)) == 0
+    assert _retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT") == 0
 
 
 def test_internal_evaluate_keeps_trustline_policy_4xx_permanent(monkeypatch) -> None:

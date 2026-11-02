@@ -804,61 +804,106 @@ def test_internal_receipt_forwards_to_trustline(monkeypatch) -> None:
     assert captured["payload"]["metadata"]["source"] == "x402_secure_internal_facilitator"
 
 
-def test_internal_vi_receipt_lookup_returns_verified_settlement(monkeypatch) -> None:
-    client = _client(monkeypatch)
+PAYLOAD_HASH = "sha256:facilitator_payload_hash"
+REQUIREMENTS_HASH = "sha256:facilitator_requirements_hash"
+INVOICE_ID = "inv_verified"
 
-    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if path == "verifiable-intent/verify-chain":
-            return {
-                "decision": "allow",
-                "decision_id": "dec_verified",
-                "risk_level": "low",
-                "vi": {
-                    "present": True,
-                    "parsed": True,
-                    "verified": True,
-                    "chain_verified": True,
-                },
-                "binding": payload["binding"],
-            }
-        return {
-            "receipt_id": "vi_rcpt_verified",
-            "decision_id": payload["decisionId"],
-            "status": "success",
-            "received_at": "2026-06-01T00:00:00Z",
+
+def _bound_evaluate_payload() -> Dict[str, Any]:
+    """An evaluate request carrying the hashes, invoice and payer the XRPL facilitator sends."""
+    body = _evaluate_payload()
+    body["payment"].update(
+        {
+            "paymentPayloadHash": PAYLOAD_HASH,
+            "paymentRequirementsHash": REQUIREMENTS_HASH,
+            "invoiceId": INVOICE_ID,
+            "payer": "rBuyerWallet",
         }
+    )
+    return body
 
-    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
 
+def _facilitator_receipt(
+    *,
+    transaction_hash: Any = "abc123",
+    payment: Dict[str, Any] | None = None,
+    correlation: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """A receipt shaped like the one the XRPL facilitator sends after it settles."""
+    return {
+        "decision_id": "dec_verified",
+        "evidence_ref": "tl_evd_verified",
+        "payment": {
+            "chain": "xrpl",
+            "network": "xrpl:testnet",
+            "transaction_hash": transaction_hash,
+            "status": "success",
+            **(payment or {}),
+        },
+        "correlation": {
+            "paymentPayloadHash": PAYLOAD_HASH,
+            "paymentRequirementsHash": REQUIREMENTS_HASH,
+            "invoiceId": INVOICE_ID,
+            **(correlation or {}),
+        },
+    }
+
+
+async def _verified_trustline(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if path == "verifiable-intent/verify-chain":
+        return {
+            "decision": "allow",
+            "decision_id": "dec_verified",
+            "risk_level": "low",
+            "vi": {
+                "present": True,
+                "parsed": True,
+                "verified": True,
+                "chain_verified": True,
+            },
+            "binding": payload["binding"],
+        }
+    return {
+        "receipt_id": "vi_rcpt_verified",
+        "decision_id": payload["decisionId"],
+        "status": "success",
+        "received_at": "2026-06-01T00:00:00Z",
+    }
+
+
+def _lookup(client: TestClient, *transactions: Dict[str, Any]) -> Any:
+    return client.post(
+        "/internal/x402-secure/facilitator/vi-receipts/lookup",
+        json={"transactions": list(transactions)},
+        headers=_auth_headers(),
+    )
+
+
+def _evaluate_then_receipt(client: TestClient, receipt: Dict[str, Any]) -> None:
     evaluate = client.post(
         "/internal/x402-secure/facilitator/evaluate",
-        json=_evaluate_payload(),
+        json=_bound_evaluate_payload(),
         headers=_auth_headers(),
     )
     assert evaluate.status_code == 200
     assert evaluate.json()["decision_id"] == "dec_verified"
-
-    receipt = client.post(
+    response = client.post(
         "/internal/x402-secure/facilitator/receipt",
-        json={
-            "decisionId": "dec_verified",
-            "evidenceRef": "tl_evd_verified",
-            "payment": {
-                "chain": "xrpl",
-                "transaction_hash": "abc123",
-                "status": "success",
-            },
-            "correlation": {"invoiceId": "inv_verified"},
-        },
+        json=receipt,
         headers=_auth_headers(),
     )
-    assert receipt.status_code == 200
+    assert response.status_code == 200
 
-    lookup = client.post(
-        "/internal/x402-secure/facilitator/vi-receipts/lookup",
-        json={"transactions": [{"hash": "ABC123", "invoiceId": "inv_verified"}]},
-        headers=_auth_headers(),
+
+def test_internal_vi_receipt_lookup_returns_verified_settlement(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
     )
+
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    lookup = _lookup(client, {"hash": "ABC123", "invoiceId": "inv_verified"})
     assert lookup.status_code == 200
     items = lookup.json()["items"]
     assert len(items) == 1
@@ -867,6 +912,107 @@ def test_internal_vi_receipt_lookup_returns_verified_settlement(monkeypatch) -> 
     assert items[0]["verifiableIntent"] is True
     assert items[0]["riskChecked"] is True
     assert items[0]["vi"]["chain_verified"] is True
+    assert items[0]["bindingStatus"] == "bound"
+
+
+def test_internal_vi_receipt_binding_uses_the_evaluated_payment(monkeypatch) -> None:
+    # Trustline's own "binding" in the verify-chain response may not carry the hashes;
+    # the receipt is checked against the payment this proxy evaluated.
+    client = _client(monkeypatch)
+
+    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = await _verified_trustline(path, payload)
+        if path == "verifiable-intent/verify-chain":
+            response["binding"] = {"paymentBound": True}
+        return response
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+
+    _evaluate_then_receipt(client, _facilitator_receipt())
+
+    items = _lookup(client, {"hash": "ABC123"}).json()["items"]
+    assert len(items) == 1
+    assert items[0]["bindingStatus"] == "bound"
+    assert items[0]["verifiableIntent"] is True
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"correlation": {"paymentPayloadHash": "sha256:another_payload"}},
+        {"correlation": {"paymentRequirementsHash": "sha256:another_requirements"}},
+        {"correlation": {"invoiceId": "inv_another"}},
+        {"payment": {"chain": "base"}},
+        {"payment": {"destination": "rSomeoneElse"}},
+        {"payment": {"payer": "rAnotherPayer"}},
+        {"payment": {"amount": "999"}},
+    ],
+)
+def test_internal_vi_receipt_for_another_payment_is_rejected(
+    monkeypatch,
+    caplog,
+    mismatch: Dict[str, Any],
+) -> None:
+    # The evaluated decision's id on a receipt for a different payment must not lend that
+    # payment the decision's verification.
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt(transaction_hash="other1", **mismatch))
+
+    lookup = _lookup(
+        client,
+        {"hash": "OTHER1"},
+        {"invoiceId": INVOICE_ID},
+        {"invoiceId": "inv_another"},
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["items"] == []
+    assert "VI receipt rejected" in caplog.text
+
+
+def test_internal_vi_receipt_without_the_payload_hash_is_not_verified(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+    receipt = _facilitator_receipt()
+    del receipt["correlation"]["paymentPayloadHash"]
+
+    _evaluate_then_receipt(client, receipt)
+
+    items = _lookup(client, {"hash": "ABC123"}).json()["items"]
+    assert len(items) == 1
+    assert items[0]["bindingStatus"] == "insufficient"
+    assert items[0]["verifiableIntent"] is False
+    assert items[0]["riskChecked"] is False
+    assert items[0]["decision"] is None
+    assert items[0]["vi"] == {}
+
+
+def test_internal_vi_receipt_lookup_does_not_vouch_for_a_hash_it_never_stored(monkeypatch) -> None:
+    # A receipt with an invoice id but no transaction hash says nothing about any hash.
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt(transaction_hash=None))
+
+    lookup = _lookup(
+        client,
+        {"hash": "UNRELATED-1", "invoiceId": INVOICE_ID},
+        {"hash": "UNRELATED-2", "invoiceId": INVOICE_ID},
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["items"] == []
+
+    by_invoice = _lookup(client, {"invoiceId": INVOICE_ID}).json()["items"]
+    assert len(by_invoice) == 1
+    assert by_invoice[0]["hash"] is None
+    assert by_invoice[0]["invoiceId"] == INVOICE_ID
 
 
 def test_internal_vi_receipt_lookup_does_not_infer_vi_from_success(monkeypatch) -> None:

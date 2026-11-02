@@ -1,5 +1,12 @@
 # Copyright 2025 t54 labs
 # SPDX-License-Identifier: Apache-2.0
+"""VI receipt statuses behind ``/internal/x402-secure/facilitator/vi-receipts/lookup``.
+
+Evaluate stores a decision snapshot, including the payment it evaluated. A settled
+receipt inherits that decision's verification only when it carries the same payment
+binding. Lookups then report the stored status for a transaction hash or invoice id.
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +15,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
 try:  # pragma: no cover - exercised in production builds when redis is installed.
@@ -198,6 +206,78 @@ def _verified_vi(vi: Mapping[str, Any]) -> bool:
     return False
 
 
+# Fields that tie a receipt to the payment its decision evaluated, with the names a
+# receipt may use for each. The XRPL facilitator sends paymentPayloadHash,
+# paymentRequirementsHash and invoiceId under "correlation", and the chain under "payment".
+_BINDING_FIELDS: dict[str, tuple[str, ...]] = {
+    "paymentPayloadHash": (
+        "paymentPayloadHash",
+        "payment_payload_hash",
+        "payloadHash",
+        "payload_hash",
+    ),
+    "paymentRequirementsHash": ("paymentRequirementsHash", "payment_requirements_hash"),
+    "invoiceId": ("invoiceId", "invoice_id"),
+    "chain": ("chain",),
+    "payer": ("payer", "payerWallet", "payer_wallet", "walletAddress", "wallet_address"),
+    "destination": ("destination", "payTo", "pay_to"),
+    "amount": ("amount",),
+    "asset": ("asset", "currency"),
+    "issuer": ("issuer",),
+}
+_CASE_INSENSITIVE_BINDING_FIELDS = {
+    "paymentPayloadHash",
+    "paymentRequirementsHash",
+    "chain",
+    "asset",
+}
+
+
+def _binding_from_receipt(payload: Mapping[str, Any]) -> dict[str, str]:
+    payment = _as_dict(payload.get("payment"))
+    correlation = _as_dict(payload.get("correlation"))
+    evidence: dict[str, str] = {}
+    for field, names in _BINDING_FIELDS.items():
+        value = _pick(correlation, *names) or _pick(payment, *names) or _pick(payload, *names)
+        if value:
+            evidence[field] = value
+    return evidence
+
+
+def _same_binding_value(field: str, left: str, right: str) -> bool:
+    if field == "amount":
+        try:
+            return Decimal(left) == Decimal(right)
+        except InvalidOperation:
+            return left == right
+    if field in _CASE_INSENSITIVE_BINDING_FIELDS:
+        return left.lower() == right.lower()
+    return left == right
+
+
+def _check_receipt_binding(
+    evaluated: Mapping[str, Any],
+    receipt: Mapping[str, str],
+) -> tuple[str, list[str]]:
+    """Compare a receipt's binding fields with the payment its decision evaluated.
+
+    Returns ``("mismatch", fields)`` when a field both sides carry differs,
+    ``("insufficient", [])`` when either side lacks the paymentPayloadHash, and
+    ``("bound", [])`` otherwise.
+    """
+    mismatched = sorted(
+        field
+        for field, value in receipt.items()
+        if (expected := _string(evaluated.get(field))) is not None
+        and not _same_binding_value(field, value, expected)
+    )
+    if mismatched:
+        return "mismatch", mismatched
+    if not _string(evaluated.get("paymentPayloadHash")) or "paymentPayloadHash" not in receipt:
+        return "insufficient", []
+    return "bound", []
+
+
 def _load_json(key: str) -> Optional[dict[str, Any]]:
     raw = _store.get(key)
     if not raw:
@@ -214,18 +294,32 @@ def _save_json(key: str, value: Mapping[str, Any]) -> None:
     _store.set(key, _json_dumps(value), _ttl_seconds())
 
 
-def record_vi_decision_snapshot(response: Mapping[str, Any]) -> None:
+def record_vi_decision_snapshot(
+    response: Mapping[str, Any],
+    payment_binding: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Remember an evaluate decision so the receipt that settles it can be checked.
+
+    ``payment_binding`` describes the payment the decision evaluated, keyed like
+    ``_BINDING_FIELDS``. A receipt inherits the decision's verification only if it matches.
+    """
     decision_id = _pick(response, "decision_id", "decisionId")
     if not decision_id:
         return
 
     vi = _as_dict(response.get("vi"))
+    evaluated = _as_dict(payment_binding)
     snapshot = {
         "decisionId": decision_id,
         "decision": response.get("decision"),
         "riskLevel": response.get("risk_level") or response.get("riskLevel"),
         "vi": vi,
         "binding": _as_dict(response.get("binding")),
+        "paymentBinding": {
+            field: value
+            for field in _BINDING_FIELDS
+            if (value := _string(evaluated.get(field))) is not None
+        },
         "trustlineAssessment": _as_dict(
             response.get("trustline_assessment") or response.get("trustlineAssessment")
         ),
@@ -239,6 +333,12 @@ def record_vi_receipt_snapshot(
     payload: Mapping[str, Any],
     trustline_response: Optional[Mapping[str, Any]] = None,
 ) -> None:
+    """Store the lookup status for a settled payment's receipt.
+
+    The status carries the decision's verification only when the receipt is bound to the
+    payment that decision evaluated (``_check_receipt_binding``). A receipt that contradicts
+    the evaluated payment is not stored at all.
+    """
     decision_id = _pick(payload, "decisionId", "decision_id")
     payment = _as_dict(payload.get("payment"))
     correlation = _as_dict(payload.get("correlation"))
@@ -264,8 +364,24 @@ def record_vi_receipt_snapshot(
     )
 
     decision = _load_json(_key("decision", decision_id)) if decision_id else None
-    vi = _as_dict((decision or {}).get("vi"))
-    verifiable_intent = bool((decision or {}).get("verifiableIntent")) and _verified_vi(vi)
+    binding_status = "decision_not_found"
+    if decision is not None:
+        binding_status, mismatched = _check_receipt_binding(
+            _as_dict(decision.get("paymentBinding")),
+            _binding_from_receipt(payload),
+        )
+        if binding_status == "mismatch":
+            logger.warning(
+                "VI receipt rejected: it does not match the payment decision_id=%s "
+                "evaluated (fields=%s)",
+                decision_id,
+                ",".join(mismatched),
+            )
+            return
+    # Only a receipt bound to the evaluated payment may carry that decision's outcome.
+    bound = decision if binding_status == "bound" else {}
+    vi = _as_dict(bound.get("vi"))
+    verifiable_intent = bool(bound.get("verifiableIntent")) and _verified_vi(vi)
     receipt_status = (
         _pick(payment, "status")
         or _pick(trustline, "status")
@@ -273,7 +389,7 @@ def record_vi_receipt_snapshot(
     )
     risk_checked = (
         verifiable_intent
-        and _positive_decision((decision or {}).get("decision"))
+        and _positive_decision(bound.get("decision"))
         and _successful_receipt(receipt_status)
     )
 
@@ -282,7 +398,8 @@ def record_vi_receipt_snapshot(
         "transactionHash": tx_hash,
         "invoiceId": invoice_id,
         "decisionId": decision_id,
-        "decision": (decision or {}).get("decision"),
+        "decision": bound.get("decision"),
+        "bindingStatus": binding_status,
         "status": receipt_status,
         "receiptStatus": trustline.get("status") or receipt_status,
         "receiptId": trustline.get("receipt_id") or trustline.get("receiptId"),
@@ -315,17 +432,17 @@ def _lookup_one(query: Mapping[str, Any]) -> Optional[dict[str, Any]]:
         return None
 
     stored_hash = _hash(status.get("hash") or status.get("transactionHash"))
-    if requested_hash and stored_hash and requested_hash != stored_hash:
+    # A receipt stored without a transaction hash, or for another one, cannot vouch for
+    # the hash the reader supplied: an invoice match alone is not transaction evidence.
+    if requested_hash and requested_hash != stored_hash:
         return None
-    if requested_hash and not stored_hash:
-        status["hash"] = requested_hash
-        status["transactionHash"] = requested_hash
     return status
 
 
 def lookup_vi_receipt_statuses(
     transactions: list[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Return the stored status for each transaction hash or invoice id that has one."""
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for transaction in transactions:
@@ -342,4 +459,5 @@ def lookup_vi_receipt_statuses(
 
 
 def reset_vi_receipt_store_for_tests() -> None:
+    """Empty the store between tests."""
     _store.clear()

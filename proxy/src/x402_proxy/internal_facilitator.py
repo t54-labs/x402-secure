@@ -196,6 +196,7 @@ class InternalPaymentContext(BaseModel):
         default_factory=dict,
         alias="paymentRequirements",
     )
+    invoice_id: Optional[str] = Field(default=None, alias="invoiceId")
 
 
 class InternalFacilitatorEvaluateRequest(BaseModel):
@@ -504,6 +505,24 @@ def build_binding_profile(payment: InternalPaymentContext) -> BindingProfileResu
     if chain == "xrpl":
         return _build_xrpl_binding(payment)
     return _build_generic_binding(payment)
+
+
+def _evaluated_payment_binding(
+    payment: InternalPaymentContext,
+    binding: BindingProfileResult,
+) -> Dict[str, Any]:
+    """Describe the payment a decision evaluated, for checking the receipt that settles it."""
+    return {
+        "paymentPayloadHash": binding.hashes.get("paymentPayloadHash"),
+        "paymentRequirementsHash": binding.hashes.get("paymentRequirementsHash"),
+        "invoiceId": payment.invoice_id,
+        "chain": binding.chain,
+        "payer": _first_present(payment.payer, payment.payer_wallet, payment.wallet_address),
+        "destination": binding.destination,
+        "amount": binding.amount,
+        "asset": binding.asset,
+        "issuer": binding.issuer,
+    }
 
 
 def _extract_extension(extensions: Dict[str, Any]) -> X402SecureExtension:
@@ -1056,7 +1075,10 @@ async def evaluate_facilitator_payment(
             trustline_path,
         ),
     }
-    record_vi_decision_snapshot(response)
+    record_vi_decision_snapshot(
+        response,
+        payment_binding=_evaluated_payment_binding(body.payment, binding),
+    )
     return response
 
 

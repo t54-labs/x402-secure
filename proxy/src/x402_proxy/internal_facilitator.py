@@ -19,6 +19,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from .vi_receipt_store import (
     VIReceiptStoreUnavailable,
@@ -1089,7 +1090,9 @@ async def evaluate_facilitator_payment(
             trustline_path,
         ),
     }
-    record_vi_decision_snapshot(
+    # The receipt store does blocking I/O; keep it off the event loop.
+    await run_in_threadpool(
+        record_vi_decision_snapshot,
         response,
         payment_binding=_evaluated_payment_binding(body.payment, binding),
     )
@@ -1146,7 +1149,7 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
         "receivedAt": datetime.now(timezone.utc).isoformat(),
     }
     response = await post_trustline_validation("verifiable-intent-receipt", payload)
-    record_vi_receipt_snapshot(payload, response)
+    await run_in_threadpool(record_vi_receipt_snapshot, payload, response)
     return response
 
 
@@ -1160,7 +1163,7 @@ async def lookup_facilitator_vi_receipts(
 ) -> Dict[str, Any] | JSONResponse:
     transactions = [item.model_dump(by_alias=True, exclude_none=True) for item in body.transactions]
     try:
-        items = lookup_vi_receipt_statuses(transactions)
+        items = await run_in_threadpool(lookup_vi_receipt_statuses, transactions)
     except VIReceiptStoreUnavailable as exc:
         logger.warning("[INTERNAL] vi_receipt_lookup_unavailable reason=%s", exc)
         return JSONResponse(

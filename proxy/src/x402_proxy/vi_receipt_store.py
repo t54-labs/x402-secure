@@ -74,11 +74,41 @@ class _InMemoryTTLStore(_TTLStore):
             self._values.clear()
 
 
+DEFAULT_REDIS_TIMEOUT_SECONDS = 1.0
+
+
+def _redis_timeout_seconds() -> float:
+    raw = os.getenv("X402_SECURE_VI_RECEIPT_REDIS_TIMEOUT_SECONDS")
+    if not raw:
+        return DEFAULT_REDIS_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid X402_SECURE_VI_RECEIPT_REDIS_TIMEOUT_SECONDS=%s; using default.", raw
+        )
+        return DEFAULT_REDIS_TIMEOUT_SECONDS
+    return min(max(0.05, value), 30.0)
+
+
 class _RedisTTLStore(_TTLStore):
     def __init__(self, url: str) -> None:
         if redis is None:  # pragma: no cover
             raise RuntimeError("redis_library_missing")
-        self._client = redis.Redis.from_url(url, decode_responses=True)
+        from redis.backoff import NoBackoff
+        from redis.retry import Retry
+
+        # A Redis that accepts the connection but stops answering must fail fast, not hang:
+        # bounded connect and read timeouts, and a single attempt per operation.
+        timeout = _redis_timeout_seconds()
+        self._client = redis.Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+            retry_on_timeout=False,
+            retry=Retry(NoBackoff(), 0),
+        )
 
     def ping(self) -> None:
         self._client.ping()
@@ -262,14 +292,25 @@ _CASE_INSENSITIVE_BINDING_FIELDS = {
 }
 
 
-def _binding_from_receipt(payload: Mapping[str, Any]) -> dict[str, str]:
-    payment = _as_dict(payload.get("payment"))
-    correlation = _as_dict(payload.get("correlation"))
-    evidence: dict[str, str] = {}
+def _all_values(sources: tuple[Mapping[str, Any], ...], names: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for source in sources:
+        for name in names:
+            value = _string(source.get(name))
+            if value is not None:
+                values.append(value)
+    return values
+
+
+def _binding_from_receipt(payload: Mapping[str, Any]) -> dict[str, list[str]]:
+    # Every value supplied for each field, from every source and alias. A matching value in
+    # one place must not hide a contradicting one in another.
+    sources = (_as_dict(payload.get("correlation")), _as_dict(payload.get("payment")), payload)
+    evidence: dict[str, list[str]] = {}
     for field, names in _BINDING_FIELDS.items():
-        value = _pick(correlation, *names) or _pick(payment, *names) or _pick(payload, *names)
-        if value:
-            evidence[field] = value
+        values = _all_values(sources, names)
+        if values:
+            evidence[field] = values
     return evidence
 
 
@@ -286,22 +327,22 @@ def _same_binding_value(field: str, left: str, right: str) -> bool:
 
 def _check_receipt_binding(
     evaluated: Mapping[str, Any],
-    receipt: Mapping[str, str],
+    receipt: Mapping[str, list[str]],
 ) -> tuple[str, list[str]]:
     """Compare a receipt's binding fields with the payment its decision evaluated.
 
-    Returns ``("mismatch", fields)`` when a field both sides carry differs,
+    Returns ``("mismatch", fields)`` when any supplied value of a field differs from the
+    evaluated one (or, where nothing was evaluated, from the other supplied values),
     ``("insufficient", [])`` when either side lacks the paymentPayloadHash, and
     ``("bound", [])`` otherwise.
     """
-    mismatched = sorted(
-        field
-        for field, value in receipt.items()
-        if (expected := _string(evaluated.get(field))) is not None
-        and not _same_binding_value(field, value, expected)
-    )
+    mismatched = []
+    for field, values in receipt.items():
+        reference = _string(evaluated.get(field)) or values[0]
+        if any(not _same_binding_value(field, value, reference) for value in values):
+            mismatched.append(field)
     if mismatched:
-        return "mismatch", mismatched
+        return "mismatch", sorted(mismatched)
     if not _string(evaluated.get("paymentPayloadHash")) or "paymentPayloadHash" not in receipt:
         return "insufficient", []
     return "bound", []
@@ -412,18 +453,21 @@ def _record_vi_receipt_snapshot(
     metadata = _as_dict(payload.get("metadata"))
     trustline = _as_dict(trustline_response)
 
-    tx_hash = _hash(
-        _pick(
-            payment,
-            "transaction_hash",
-            "transactionHash",
-            "tx_hash",
-            "txHash",
-            "hash",
-            "transaction",
+    tx_hashes = {
+        _hash(value)
+        for value in _all_values(
+            (payment,),
+            ("transaction_hash", "transactionHash", "tx_hash", "txHash", "hash", "transaction"),
         )
-        or _pick(payload, "transaction_hash", "transactionHash", "txHash", "hash")
-    )
+        + _all_values((payload,), ("transaction_hash", "transactionHash", "txHash", "hash"))
+    }
+    if len(tx_hashes) > 1:
+        logger.warning(
+            "VI receipt rejected: it names more than one transaction hash decision_id=%s",
+            decision_id,
+        )
+        return
+    tx_hash = next(iter(tx_hashes), None)
     invoice_id = _pick(correlation, "invoiceId", "invoice_id") or _pick(
         payload,
         "invoiceId",

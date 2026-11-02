@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
+import socket
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from typing import Any, Dict
@@ -1019,6 +1023,41 @@ def test_internal_vi_receipt_for_another_payment_is_rejected(
     assert "VI receipt rejected" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        {"correlation": {"chain": "xrpl"}, "payment": {"chain": "base"}},
+        {"correlation": {"payer": "rBuyerWallet"}, "payment": {"payer": "rAnotherPayer"}},
+        {
+            "correlation": {"destination": "rMerchantDestination"},
+            "payment": {"destination": "rSomeoneElse"},
+        },
+        {"correlation": {"amount": "10"}, "payment": {"amount": "999"}},
+        {"payment": {"paymentPayloadHash": "sha256:another_payload"}},
+        {"payment": {"destination": "rMerchantDestination", "payTo": "rSomeoneElse"}},
+        {"payment": {"hash": "OTHER2"}},
+    ],
+)
+def test_internal_vi_receipt_with_contradicting_values_is_rejected(
+    monkeypatch,
+    caplog,
+    contradiction: Dict[str, Any],
+) -> None:
+    # A value that matches in one place (or alias) must not hide one that contradicts the
+    # evaluated payment, or another supplied value, somewhere else in the receipt.
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+    )
+
+    _evaluate_then_receipt(client, _facilitator_receipt(transaction_hash="other1", **contradiction))
+
+    lookup = _lookup(client, {"hash": "OTHER1"}, {"hash": "OTHER2"}, {"invoiceId": INVOICE_ID})
+    assert lookup.status_code == 200
+    assert lookup.json()["items"] == []
+    assert "VI receipt rejected" in caplog.text
+
+
 def test_internal_vi_receipt_without_the_payload_hash_is_not_verified(monkeypatch) -> None:
     client = _client(monkeypatch)
     monkeypatch.setattr(
@@ -1114,6 +1153,122 @@ def test_internal_vi_receipt_in_memory_store_is_opt_in(monkeypatch) -> None:
 
     items = _lookup(client, {"hash": "ABC123"}).json()["items"]
     assert [item["riskChecked"] for item in items] == [True]
+
+
+class _SilentServer:
+    """A TCP server that accepts connections and never answers, like a hung Redis."""
+
+    def __init__(self) -> None:
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(16)
+        self._listener.settimeout(0.05)
+        self.port = self._listener.getsockname()[1]
+        self._connections: list[socket.socket] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+        self._thread.start()
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                continue
+            self._connections.append(connection)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        for connection in self._connections:
+            connection.close()
+        self._listener.close()
+
+
+def _within(seconds: float, action: Any) -> Any:
+    """Run ``action`` in a thread and fail, instead of hanging, if it outlasts ``seconds``."""
+    outcome: Dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = action()
+        except BaseException as exc:  # re-raised in the test thread below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), f"still blocked after {seconds}s"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def test_internal_vi_receipt_store_times_out_on_a_stalled_redis(monkeypatch) -> None:
+    # A Redis that accepts the connection but never replies must not hang startup or the
+    # routes: each operation times out, and the lookup answers 503.
+    server = _SilentServer()
+    try:
+        client = _client(monkeypatch)
+        monkeypatch.setenv("X402_SECURE_VI_RECEIPT_REDIS_TIMEOUT_SECONDS", "0.2")
+        url = f"redis://127.0.0.1:{server.port}/0"
+        _within(5, lambda: _store_from_env(monkeypatch, X402_SECURE_VI_RECEIPT_REDIS_URL=url))
+        monkeypatch.setattr(
+            "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
+        )
+
+        def evaluate_receipt_and_lookup() -> Any:
+            _evaluate_then_receipt(client, _facilitator_receipt())
+            return _lookup(client, {"hash": "ABC123"})
+
+        lookup = _within(10, evaluate_receipt_and_lookup)
+        assert lookup.status_code == 503
+        assert lookup.json()["reason"] == "vi_receipt_store_unavailable"
+    finally:
+        server.close()
+
+
+def test_internal_vi_receipt_lookup_keeps_the_event_loop_free(monkeypatch) -> None:
+    # Store calls block (Redis is synchronous), so they run in a worker thread: other
+    # requests on the same event loop keep being served meanwhile.
+    _client(monkeypatch)
+    from x402_proxy import internal_router
+    from x402_proxy.vi_receipt_store import _InMemoryTTLStore
+
+    class SlowStore(_InMemoryTTLStore):
+        def get(self, key: str) -> Any:
+            time.sleep(0.3)
+            return super().get(key)
+
+    monkeypatch.setattr("x402_proxy.vi_receipt_store._store", SlowStore())
+    app = FastAPI()
+    app.include_router(internal_router)
+
+    async def lookup_with_heartbeat() -> tuple[int, int]:
+        ticks = 0
+        done = asyncio.Event()
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while not done.is_set():
+                ticks += 1
+                await asyncio.sleep(0.02)
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as http:
+            beat = asyncio.create_task(heartbeat())
+            response = await http.post(
+                "/internal/x402-secure/facilitator/vi-receipts/lookup",
+                json={"transactions": [{"hash": "ABC123"}]},
+                headers=_auth_headers(),
+            )
+            done.set()
+            await beat
+        return response.status_code, ticks
+
+    status, ticks = asyncio.run(lookup_with_heartbeat())
+    assert status == 200
+    assert ticks >= 5
 
 
 def test_internal_vi_receipt_lookup_does_not_infer_vi_from_success(monkeypatch) -> None:

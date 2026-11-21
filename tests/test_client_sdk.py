@@ -477,6 +477,7 @@ class TestAgentIntegration:
         import sys
         from contextlib import nullcontext
         from types import SimpleNamespace
+
         from x402_secure_client import run_agent_payment
         from x402_secure_client.tracing import OpenAITraceCollector
 

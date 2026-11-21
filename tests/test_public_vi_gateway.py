@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
-
 import base64
 import json
+from typing import Any, Dict, Optional
 
 import httpx
 import pytest

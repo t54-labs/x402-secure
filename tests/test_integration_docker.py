@@ -253,7 +253,9 @@ class TestDockerIntegration:
             "Origin": "https://test.example.com",
         }
 
-        verified = await http_client.post(f"{GATEWAY_URL}/x402/verify", json=payment_data, headers=headers)
+        verified = await http_client.post(
+            f"{GATEWAY_URL}/x402/verify", json=payment_data, headers=headers
+        )
         assert verified.status_code == 200 and verified.json()["isValid"] is True
         headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
 

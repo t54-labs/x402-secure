@@ -24,6 +24,9 @@ async def main():
             agent_gateway_url=gateway,
             network=os.getenv("NETWORK", "base-sepolia"),
             buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
+            expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+            expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+            max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
         )
     )
 

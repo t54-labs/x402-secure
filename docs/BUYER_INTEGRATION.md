@@ -54,12 +54,21 @@ buyer = BuyerClient(BuyerConfig(
     seller_base_url="https://api.example.com",
     agent_gateway_url="https://x402-proxy.t54.ai",
     buyer_private_key=BUYER_PRIVATE_KEY,
+    expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+    expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+    max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
     network="base-sepolia"  # or "base" for mainnet
 ))
+
 
 # Initialize risk client
 risk_client = RiskClient("https://x402-proxy.t54.ai")
 ```
+
+Set `BUYER_EXPECTED_PAY_TO` and `BUYER_EXPECTED_ASSET` to the configured seller address
+and payment token contract. Set `BUYER_MAX_AMOUNT_ATOMIC` to the per-payment limit in
+the token's smallest unit. Direct calls and payment plans use the same checks and sign only
+when the seller advertises exactly one eligible offer on the configured network.
 
 ### 2. Trace Collection
 
@@ -421,7 +430,10 @@ buyer = BuyerClient(BuyerConfig(
     seller_base_url=os.getenv("SELLER_BASE_URL", "http://localhost:8010"),
     agent_gateway_url=os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000"),
     network="base-sepolia",
-    buyer_private_key=os.getenv("BUYER_PRIVATE_KEY")
+    buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
+    expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+    expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+    max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
 ))
 
 risk_client = RiskClient(os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000"))
@@ -460,7 +472,10 @@ async def test_payment_flow():
         seller_base_url="http://localhost:8010",
         agent_gateway_url="http://localhost:8000",
         network="base-sepolia",
-        buyer_private_key=os.getenv("BUYER_PRIVATE_KEY")
+        buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
+        expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+        expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+        max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
     ))
 
     risk = RiskClient("http://localhost:8000")

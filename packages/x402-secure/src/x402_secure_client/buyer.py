@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
 
 import httpx
 
@@ -14,8 +14,10 @@ from .risk import RiskClient
 
 def _normalize_pr_keys(pr: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(pr)
-    out["payTo"] = pr.get("payTo") or pr.get("pay_to")
-    out["maxAmountRequired"] = pr.get("maxAmountRequired") or pr.get("max_amount_required")
+    for canonical, alias in (("payTo", "pay_to"), ("maxAmountRequired", "max_amount_required")):
+        if canonical in pr and alias in pr and pr[canonical] != pr[alias]:
+            raise ValueError(f"Conflicting quote fields: {canonical} and {alias}")
+        out[canonical] = pr.get(canonical, pr.get(alias))
     out["resource"] = pr.get("resource")
     out["network"] = pr.get("network")
     out["asset"] = pr.get("asset")
@@ -27,7 +29,10 @@ class BuyerConfig:
     seller_base_url: str
     agent_gateway_url: str
     network: str = "base-sepolia"
-    buyer_private_key: Optional[str] = None
+    buyer_private_key: Optional[str] = field(default=None, repr=False)
+    expected_pay_to: Optional[str] = None
+    expected_asset: Optional[str] = None
+    max_amount_atomic: Optional[int] = None
 
 
 class BuyerClient:
@@ -47,18 +52,65 @@ class BuyerClient:
 
         self.risk = RiskClient(cfg.agent_gateway_url)
 
+    def _seller_url(self, endpoint: str) -> httpx.URL:
+        base = httpx.URL(self.cfg.seller_base_url)
+        if (
+            base.scheme not in {"http", "https"}
+            or not base.host
+            or base.userinfo
+            or base.query
+            or base.fragment
+            or not isinstance(endpoint, str)
+            or not endpoint.startswith("/")
+            or endpoint.startswith("//")
+            or "#" in endpoint
+            or "\\" in endpoint
+            or any(ord(char) <= 32 or ord(char) == 127 for char in endpoint)
+        ):
+            raise ValueError("Paid requests require a path on the configured seller origin")
+        url = httpx.URL(f"{str(base).rstrip('/')}{endpoint}")
+        if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port):
+            raise ValueError("Paid request changed the seller origin")
+        return url
+
     async def _first_request_402(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        r = await self.http.get(url, params=params)
+        r = await self.http.get(url, params=params, follow_redirects=False)
         if r.status_code != 402:
             raise RuntimeError(f"Expected 402 Payment Required, got {r.status_code}")
         ctype = (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
         if ctype != "application/json":
             raise RuntimeError("seller preflight content-type must be application/json")
         body = r.json()
-        accepts = body.get("accepts")
+        accepts = body.get("accepts") if isinstance(body, dict) else None
         if not accepts or not isinstance(accepts, list):
             raise RuntimeError("seller preflight missing 'accepts'")
-        return accepts[0]
+        matches = []
+        for offer in accepts:
+            if not isinstance(offer, dict) or offer.get("network") != self.cfg.network:
+                continue
+            pr = _normalize_pr_keys(offer)
+            if pr.get("scheme") != "exact":
+                continue
+            if any(
+                not isinstance(pr.get(key), str) or pr[key].lower() != expected.lower()
+                for key, expected in (
+                    ("payTo", self.cfg.expected_pay_to),
+                    ("asset", self.cfg.expected_asset),
+                )
+                if expected is not None
+            ):
+                continue
+            amount = pr["maxAmountRequired"]
+            if isinstance(amount, str) and re.fullmatch(r"[0-9]{1,78}", amount):
+                if self.cfg.max_amount_atomic is not None and 0 < int(amount) <= min(
+                    self.cfg.max_amount_atomic, 2**256 - 1
+                ):
+                    matches.append(pr)
+        if len(matches) != 1:
+            raise ValueError(
+                "Seller must offer exactly one payment within the configured buyer policy"
+            )
+        return matches[0]
 
     async def execute_paid_request_with_headers(
         self,
@@ -72,12 +124,23 @@ class BuyerClient:
         ap2_evidence_header: Optional[str] = None,
     ) -> Any:
         params = params or {}
-        url = f"{self.cfg.seller_base_url.rstrip('/')}{endpoint}"
-        pr = await self._first_request_402(url, params)
-        pr = _normalize_pr_keys(pr)
+        url = self._seller_url(endpoint)
 
         if not self.cfg.buyer_private_key:
             raise RuntimeError("BUYER_PRIVATE_KEY required for signing X-PAYMENT")
+        if (
+            not re.fullmatch(r"0x[0-9a-fA-F]{40}", self.cfg.expected_pay_to or "")
+            or not re.fullmatch(r"0x[0-9a-fA-F]{40}", self.cfg.expected_asset or "")
+            or type(self.cfg.max_amount_atomic) is not int
+            or self.cfg.max_amount_atomic <= 0
+        ):
+            raise ValueError("Configure an expected payee, asset and positive atomic payment limit")
+        headers = httpx.Headers(extra_headers)
+        if any(key in headers for key in ("Host", "Origin", "X-PAYMENT", "X-RISK-SESSION")):
+            raise ValueError("Extra headers cannot override the payment or seller origin")
+        if "X-PAYMENT-SECURE" not in headers:
+            raise RuntimeError("X-PAYMENT-SECURE missing in extra_headers")
+        pr = await self._first_request_402(str(url), params)
 
         # Build signed X-PAYMENT (EIP-3009) using x402
         from eth_account import Account
@@ -93,22 +156,16 @@ class BuyerClient:
         encoded = exact.sign_payment_header(acct, pr_model, header)
         _ = exact.decode_payment(encoded)  # Validate but not used
 
-        origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
-        headers: Dict[str, str] = {
-            "X-PAYMENT": encoded,
-            "Origin": origin,
-            "X-RISK-SESSION": risk_sid,
-        }
-        if extra_headers:
-            headers.update(extra_headers)
+        origin = f"{url.scheme}://{url.netloc.decode('ascii')}"
+        headers["X-PAYMENT"] = encoded
+        headers["Origin"] = origin
+        headers["X-RISK-SESSION"] = risk_sid
         if verifiable_intent_header:
             headers["X-VERIFIABLE-INTENT"] = verifiable_intent_header
         if ap2_evidence_header:
             headers["X-AP2-EVIDENCE"] = ap2_evidence_header
-        if "X-PAYMENT-SECURE" not in headers:
-            raise RuntimeError("X-PAYMENT-SECURE missing in extra_headers")
 
-        final = await self.http.get(url, params=params, headers=headers)
+        final = await self.http.get(url, params=params, headers=headers, follow_redirects=False)
         final.raise_for_status()
         return final.json()
 

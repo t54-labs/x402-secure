@@ -70,6 +70,9 @@ class TestBuyerClient:
             agent_gateway_url="http://localhost:8000",
             network="base-sepolia",
             buyer_private_key="0x" + "a" * 64,
+            expected_pay_to="0x" + "c" * 40,
+            expected_asset="0x" + "a" * 40,
+            max_amount_atomic=1000000,
         )
         return BuyerClient(config)
 
@@ -82,11 +85,12 @@ class TestBuyerClient:
         preflight_response.json.return_value = {
             "accepts": [
                 {
+                    "scheme": "exact",
                     "payTo": "0x" + "c" * 40,
                     "maxAmountRequired": "1000000",
                     "resource": "/api/data",
                     "network": "base-sepolia",
-                    "asset": "USDC",
+                    "asset": "0x" + "a" * 40,
                 }
             ]
         }
@@ -103,6 +107,86 @@ class TestBuyerClient:
             assert pr["maxAmountRequired"] == "1000000"
             assert pr["network"] == "base-sepolia"
             mock_get.assert_called_once()
+
+    async def test_signs_only_matching_offer_on_canonical_seller_origin(self, buyer_client):
+        import httpx
+        from x402 import exact
+
+        accepted = {
+            "scheme": "exact",
+            "network": "base-sepolia",
+            "asset": buyer_client.cfg.expected_asset,
+            "payTo": buyer_client.cfg.expected_pay_to,
+            "maxAmountRequired": "100",
+            "resource": "http://localhost:8001/data",
+            "description": "Paid data",
+            "mimeType": "application/json",
+            "maxTimeoutSeconds": 30,
+            "extra": {"name": "USDC", "version": "2"},
+        }
+        requests = []
+
+        def seller(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(
+                    402, json={"accepts": [{**accepted, "network": "base"}, accepted]}
+                )
+            paid = exact.decode_payment(request.headers["X-PAYMENT"])
+            assert paid["network"] == "base-sepolia"
+            authorization = paid["payload"]["authorization"]
+            assert authorization["value"] == "100"
+            assert authorization["to"] == accepted["payTo"]
+            return httpx.Response(200, json={"ok": True})
+
+        await buyer_client.http.aclose()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(seller), follow_redirects=True
+        ) as client:
+            buyer_client.http = client
+            result = await buyer_client.execute_paid_request_with_headers(
+                "/data",
+                task="buy",
+                risk_sid="session",
+                extra_headers={"X-PAYMENT-SECURE": "trace"},
+            )
+        assert result == {"ok": True}
+        assert [str(request.url) for request in requests] == ["http://localhost:8001/data"] * 2
+
+    @pytest.mark.parametrize(
+        "endpoint", ["//other.example/data", "https://other.example/data", "/\\other.example"]
+    )
+    async def test_rejects_endpoint_outside_seller_path_before_request(
+        self, buyer_client, endpoint
+    ):
+        with patch.object(buyer_client.http, "get") as mock_get:
+            with pytest.raises(ValueError, match="configured seller origin"):
+                await buyer_client.execute_paid_request_with_headers(
+                    endpoint,
+                    task="buy",
+                    risk_sid="session",
+                    extra_headers={"X-PAYMENT-SECURE": "trace"},
+                )
+            mock_get.assert_not_called()
+
+    async def test_preflight_fails_before_signing_when_two_offers_match(self, buyer_client):
+        offer = {
+            "scheme": "exact",
+            "network": buyer_client.cfg.network,
+            "asset": buyer_client.cfg.expected_asset,
+            "payTo": buyer_client.cfg.expected_pay_to,
+            "maxAmountRequired": "100",
+        }
+        with patch.object(buyer_client.http, "get") as mock_get:
+            mock_get.return_value = Mock(
+                status_code=402,
+                headers={"content-type": "application/json"},
+            )
+            mock_get.return_value.json.return_value = {
+                "accepts": [offer, {**offer, "maxAmountRequired": "200"}]
+            }
+            with pytest.raises(ValueError, match="exactly one"):
+                await buyer_client._first_request_402("http://localhost:8001/data", {})
 
 
 @pytest.mark.asyncio
@@ -250,6 +334,7 @@ class TestSellerClient:
             verify_response.raise_for_status = Mock()
             verify_response.headers = {
                 "content-type": "application/json",
+                "X-PAYMENT-AUTHORIZATION": "verified-payment-token",
                 "X-VI-DECISION-ID": "vi_dec_1",
                 "X-VI-EVIDENCE-REF": "tl_evd_1",
             }
@@ -285,9 +370,35 @@ class TestSellerClient:
                 "tl://evidence/vi_1"
             )
             assert verify_call["json"]["viPolicy"]["requireVerifiableIntent"] is True
+            assert settle_call["headers"]["X-PAYMENT-AUTHORIZATION"] == "verified-payment-token"
             assert settle_call["headers"]["X-VI-DECISION-ID"] == "vi_dec_1"
             assert settle_call["headers"]["X-VI-EVIDENCE-REF"] == "tl_evd_1"
             assert settle_call["headers"]["X-SETTLEMENT-ATTEMPT-ID"] == "settle_attempt_1"
+
+    @pytest.mark.parametrize(
+        "body,error",
+        [
+            ({"success": False}, "SettlementDeclined"),
+            ({"success": "true", "transaction": "tx"}, "SettlementUnknown"),
+            ({"success": True}, "SettlementUnknown"),
+            ({"success": True, "status": "pending", "transaction": "tx"}, "SettlementUnknown"),
+        ],
+    )
+    async def test_settle_distinguishes_decline_from_unknown(self, seller_client, body, error):
+        import x402_secure_client
+
+        with patch.object(seller_client.http, "post") as mock_post:
+            mock_post.return_value = Mock(headers={"content-type": "application/json"})
+            mock_post.return_value.json.return_value = body
+            with pytest.raises(getattr(x402_secure_client, error)):
+                await seller_client.settle(
+                    {},
+                    {},
+                    x_payment_b64="header",
+                    origin="https://seller.example",
+                    x_payment_secure="trace",
+                    risk_sid="session",
+                )
 
     async def test_settle_does_not_reuse_last_vi_headers_by_default(self, seller_client):
         """Test bare settle calls do not leak a prior verify decision."""
@@ -359,6 +470,34 @@ class TestAgentIntegration:
         assert len(collector.events) >= 2
         assert collector.model_config["model"] == "gpt-4"
         assert collector.events[0]["type"] == "user_input"
+
+    async def test_agent_payment_plan_checks_origin_before_sending_requests(
+        self, buyer_client, monkeypatch
+    ):
+        import sys
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from x402_secure_client import run_agent_payment
+        from x402_secure_client.tracing import OpenAITraceCollector
+
+        model = SimpleNamespace(
+            responses=SimpleNamespace(stream=lambda **kwargs: nullcontext(None))
+        )
+        monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=lambda: model))
+        plan = {"tool_results": {"prepare_payment": {"endpoint": "//other.example/pay"}}}
+        with patch.object(OpenAITraceCollector, "process_stream", return_value=plan):
+            with patch("x402_secure_client.agent.RiskClient") as risk:
+                with pytest.raises(ValueError, match="configured seller origin"):
+                    await run_agent_payment(
+                        buyer=buyer_client,
+                        gateway_url="http://localhost:8000",
+                        messages=[],
+                        tools={"prepare_payment": lambda: None},
+                        tool_defs=[],
+                        task="buy",
+                        environment={},
+                    )
+                risk.assert_not_called()
 
     async def test_store_agent_trace(self, risk_client):
         """Test storing agent trace."""

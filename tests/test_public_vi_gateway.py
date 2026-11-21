@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import base64
+import json
+
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -79,6 +82,7 @@ def _body_json(body: ProxyVerifyRequest) -> Dict[str, Any]:
 
 def _proxy_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("PROXY_LOCAL_RISK", "1")
+    monkeypatch.setenv("PROXY_PAYMENT_AUTHORIZATION_KEY", "test-only-key-" * 3)
     monkeypatch.setenv("PROXY_UPSTREAM_VERIFY_URL", "http://testserver/upstream/verify")
     monkeypatch.setenv("PROXY_UPSTREAM_SETTLE_URL", "http://testserver/upstream/settle")
 
@@ -186,7 +190,7 @@ def test_extract_vi_policy_body_cannot_relax_merchant_policy() -> None:
         ).paymentRequirements,
         {
             "requireVerifiedIntent": False,
-            "acceptedIssuers": ["did:web:other.example"],
+            "acceptedIssuers": [],
             "reviewMode": "allow",
         },
     )
@@ -404,6 +408,7 @@ def test_proxy_verify_denies_when_required_vi_is_not_verified_by_trustline(
 
 
 def test_proxy_verify_maps_ap2_evidence_header_into_trustline_payload(monkeypatch) -> None:
+    monkeypatch.setenv("PROXY_PUBLIC_MERCHANT_POLICY_JSON", '{"allowAp2MandateReference":true}')
     client = _proxy_client(monkeypatch)
     sid = _risk_session(client)
     captured: Dict[str, Any] = {}
@@ -443,6 +448,7 @@ def test_proxy_verify_maps_ap2_evidence_header_into_trustline_payload(monkeypatc
 
 
 def test_proxy_verify_accepts_normalized_ap2_payment_mandate(monkeypatch) -> None:
+    monkeypatch.setenv("PROXY_PUBLIC_MERCHANT_POLICY_JSON", '{"allowAp2MandateReference":true}')
     client = _proxy_client(monkeypatch)
     sid = _risk_session(client)
     captured: Dict[str, Any] = {}
@@ -518,10 +524,19 @@ def test_proxy_settle_ignores_decision_header_without_vi_assessment(monkeypatch)
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
+    body = _body_json(_body())
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": _risk_session(client),
+        "Origin": "https://merchant.example",
+    }
+    verified = client.post("/x402/verify", json=body, headers=headers)
+    headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
     response = client.post(
         "/x402/settle",
-        json=_body_json(_body()),
+        json=body,
         headers={
+            **headers,
             "X-VI-DECISION-ID": "vi_dec_1",
             "X-VI-EVIDENCE-REF": "tl_evd_1",
             "X-SETTLEMENT-ATTEMPT-ID": "settle_attempt_1",
@@ -534,22 +549,62 @@ def test_proxy_settle_ignores_decision_header_without_vi_assessment(monkeypatch)
     assert "x-vi-receipt-status" not in response.headers
 
 
-def test_proxy_settle_without_vi_does_not_call_trustline(monkeypatch) -> None:
+def test_proxy_settle_requires_current_allow_for_same_payment(monkeypatch) -> None:
     client = _proxy_client(monkeypatch)
+    body = _body_json(_body())
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": _risk_session(client),
+    }
+    assert client.post("/x402/settle", json=body, headers=headers).status_code == 403
 
-    async def fake_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        raise AssertionError("Trustline should not be called for non-VI settle")
+    verified = client.post("/x402/verify", json=body, headers=headers)
+    headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
+    other = _body_json(_body())
+    other["paymentPayload"]["payload"]["authorization"]["nonce"] = "0x" + "1" * 64
+    assert client.post("/x402/settle", json=other, headers=headers).status_code == 403
+    assert client.post("/x402/settle", json=body, headers=headers).json()["success"] is True
 
-    monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
+    monkeypatch.setattr("x402_proxy.routes._now_s", lambda: 2**40)
+    assert client.post("/x402/settle", json=body, headers=headers).status_code == 403
 
-    response = client.post(
-        "/x402/settle",
-        json=_body_json(_body()),
-        headers={"Origin": "https://merchant.example"},
+
+def test_proxy_ingress_checks_header_matches_body(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    body = _body_json(_body())
+    header_payload = _body_json(_body())["paymentPayload"]
+    header_payload["payload"]["authorization"]["value"] = "999"
+    headers = {"X-PAYMENT": base64.b64encode(json.dumps(header_payload).encode()).decode()}
+    assert client.post("/x402/verify", json=body, headers=headers).status_code == 422
+
+
+def test_proxy_mandatory_ap2_policy_requires_signed_evidence(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    monkeypatch.setenv(
+        "PROXY_PUBLIC_MERCHANT_POLICY_JSON", '{"ap2":{"requirePaymentMandate":true}}'
     )
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": _risk_session(client),
+    }
+    body = _body_json(_body(extra={"ap2": {"requirePaymentMandate": False}}))
+    assert client.post("/x402/verify", json=body, headers=headers).status_code == 422
 
-    assert response.status_code == 200
-    assert "x-vi-receipt-status" not in response.headers
+
+def test_proxy_risk_review_blocks_verify(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    from x402_proxy.risk_routes import Decision, EvaluateResponse
+
+    async def needs_review(*args, **kwargs):
+        return EvaluateResponse(decision=Decision.review, decision_id="manual_review")
+
+    route = next(route for route in client.app.routes if route.path == "/risk/evaluate")
+    monkeypatch.setattr(route.dependant, "call", needs_review)
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": _risk_session(client),
+    }
+    assert client.post("/x402/verify", json=_body_json(_body()), headers=headers).status_code == 403
 
 
 def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
@@ -570,20 +625,20 @@ def test_proxy_settle_receipt_failure_is_non_blocking(monkeypatch) -> None:
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
-    response = client.post(
-        "/x402/settle",
-        json=_body_json(
-            _body(
-                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
-                verifiableIntent={"presentationRef": "tl://evidence/body"},
-            )
-        ),
-        headers={
-            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
-            "X-RISK-SESSION": sid,
-            "Origin": "https://merchant.example",
-        },
+    body = _body_json(
+        _body(
+            extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+            verifiableIntent={"presentationRef": "tl://evidence/body"},
+        )
     )
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": sid,
+        "Origin": "https://merchant.example",
+    }
+    verified = client.post("/x402/verify", json=body, headers=headers)
+    headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
+    response = client.post("/x402/settle", json=body, headers=headers)
 
     assert response.status_code == 200
     assert response.headers["x-vi-receipt-status"] == "failed"
@@ -616,20 +671,20 @@ def test_proxy_settle_receipt_network_failure_is_non_blocking(monkeypatch) -> No
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
-    response = client.post(
-        "/x402/settle",
-        json=_body_json(
-            _body(
-                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
-                verifiableIntent={"presentationRef": "tl://evidence/body"},
-            )
-        ),
-        headers={
-            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
-            "X-RISK-SESSION": sid,
-            "Origin": "https://merchant.example",
-        },
+    body = _body_json(
+        _body(
+            extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+            verifiableIntent={"presentationRef": "tl://evidence/body"},
+        )
     )
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": sid,
+        "Origin": "https://merchant.example",
+    }
+    verified = client.post("/x402/verify", json=body, headers=headers)
+    headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
+    response = client.post("/x402/settle", json=body, headers=headers)
 
     assert response.status_code == 200
     assert response.headers["x-vi-receipt-status"] == "failed"
@@ -661,21 +716,21 @@ def test_proxy_settle_assesses_vi_when_policy_present_without_decision_header(
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
-    response = client.post(
-        "/x402/settle",
-        json=_body_json(
-            _body(
-                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
-                verifiableIntent={"presentationRef": "tl://evidence/body"},
-            )
-        ),
-        headers={
-            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
-            "X-RISK-SESSION": sid,
-            "X-VI-EVIDENCE-REF": "client_supplied_evidence",
-            "Origin": "https://merchant.example",
-        },
+    body = _body_json(
+        _body(
+            extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+            verifiableIntent={"presentationRef": "tl://evidence/body"},
+        )
     )
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": sid,
+        "X-VI-EVIDENCE-REF": "client_supplied_evidence",
+        "Origin": "https://merchant.example",
+    }
+    verified = client.post("/x402/verify", json=body, headers=headers)
+    headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
+    response = client.post("/x402/settle", json=body, headers=headers)
 
     assert response.status_code == 200
     assert response.headers["x-vi-decision"] == "allow"
@@ -714,22 +769,22 @@ def test_proxy_settle_decision_header_does_not_bypass_required_vi_assessment(
 
     monkeypatch.setattr("x402_proxy.routes.post_trustline_validation", fake_post)
 
-    response = client.post(
-        "/x402/settle",
-        json=_body_json(
-            _body(
-                extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
-                verifiableIntent={"presentationRef": "tl://evidence/body"},
-            )
-        ),
-        headers={
-            "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
-            "X-RISK-SESSION": sid,
-            "X-VI-DECISION-ID": "client_supplied_decision",
-            "Origin": "https://merchant.example",
-        },
+    body = _body_json(
+        _body(
+            extra={"vi": {"requireVerifiableIntent": True, "reviewMode": "block"}},
+            verifiableIntent={"presentationRef": "tl://evidence/body"},
+        )
     )
+    headers = {
+        "X-PAYMENT-SECURE": f"w3c.v1;tp={_TRACEPARENT}",
+        "X-RISK-SESSION": sid,
+        "X-VI-DECISION-ID": "client_supplied_decision",
+        "Origin": "https://merchant.example",
+    }
+    verified = client.post("/x402/verify", json=body, headers=headers)
+    assert verified.status_code == 403
+    response = client.post("/x402/settle", json=body, headers=headers)
 
     assert response.status_code == 403
-    assert response.json()["error"]["code"] == "VI_DENIED"
+    assert verified.json()["error"]["code"] == "VI_DENIED"
     assert [path for path, _payload in calls] == ["assess-verifiable-intent"]

@@ -5,17 +5,19 @@ from __future__ import annotations
 import base64
 import json
 import json as _json
+import hmac
 import logging
 import os
 import time
 import uuid
 from datetime import datetime
 from hashlib import sha256
+import re
 from typing import Any, Dict, List, NamedTuple, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -40,7 +42,7 @@ except Exception:  # pragma: no cover - optional dependency path
 
 try:  # pragma: no cover - optional dependency path
     from eth_account import Account  # type: ignore
-    from eth_account.messages import encode_structured_data  # type: ignore
+    from eth_account.messages import encode_typed_data  # type: ignore
 
     HAVE_EIP712 = True
 except Exception:  # pragma: no cover - optional dependency path
@@ -67,6 +69,8 @@ def _parse_iso8601(ts: str) -> int:
 
 def _b32(hexstr: str) -> bytes:
     h = hexstr[2:] if hexstr.startswith("0x") else hexstr
+    if not re.fullmatch(r"[0-9a-fA-F]{1,64}", h):
+        raise ValueError("Expected a bytes32 hex value")
     return bytes.fromhex(h.zfill(64))
 
 
@@ -224,16 +228,48 @@ class AP2Policy(BaseModel):
     acceptedMerchantIds: Optional[List[str]] = None
 
 
-def extract_ap2_policy(payment_requirements: PaymentRequirements) -> AP2Policy:
-    extra = getattr(payment_requirements, "extra", {}) or {}
-    ap2 = extra.get("ap2") or extra.get("ap2-evidence") or {}
-    try:
-        return AP2Policy(**ap2)
-    except ValidationError as e:  # pragma: no cover - input validation
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid AP2 policy in paymentRequirements.extra: {e}",
-        )
+_AP2_POLICY_ALIASES = {
+    "require_intent_mandate": "requireIntentMandate",
+    "require_cart_mandate": "requireCartMandate",
+    "require_payment_mandate": "requirePaymentMandate",
+    "require_trace": "requireTrace",
+    "accepted_merchant_ids": "acceptedMerchantIds",
+}
+
+
+def extract_ap2_policy(
+    payment_requirements: PaymentRequirements, floor: Optional[AP2Policy] = None
+) -> AP2Policy:
+    extra = payment_requirements.extra or {}
+    sources = [extra[alias] for alias in ("ap2", "ap2-evidence") if alias in extra]
+    return _merge_ap2_policies(sources, floor)
+
+
+def _merge_ap2_policies(sources: list, floor: Optional[AP2Policy] = None) -> AP2Policy:
+    policy = (floor or AP2Policy()).model_dump()
+    for source in sources:
+        if not isinstance(source, dict):
+            raise HTTPException(status_code=422, detail="Invalid AP2 policy")
+        for name, incoming in source.items():
+            key = _AP2_POLICY_ALIASES.get(name, name)
+            if key == "acceptedMerchantIds":
+                if not isinstance(incoming, list) or any(
+                    not isinstance(mid, str) or not mid for mid in incoming
+                ):
+                    raise HTTPException(status_code=422, detail="Invalid AP2 merchant constraints")
+                if incoming:
+                    allowed = policy[key]
+                    policy[key] = sorted(set(incoming) & set(allowed)) if allowed else incoming
+                    if not policy[key]:
+                        raise HTTPException(
+                            status_code=422, detail="Conflicting AP2 merchant constraints"
+                        )
+            elif key in policy:
+                required = _coerce_policy_bool(incoming)
+                if required is None:
+                    raise HTTPException(status_code=422, detail="Invalid AP2 policy")
+                policy[key] |= required
+    return AP2Policy(**policy)
 
 
 def parse_ap2_evidence_b64(header_val: Optional[str], body_val: Optional[str]) -> AP2Evidence:
@@ -248,24 +284,25 @@ def parse_ap2_evidence_b64(header_val: Optional[str], body_val: Optional[str]) -
 
 
 def enforce_policy_flags(policy: AP2Policy, ev: AP2Evidence) -> None:
-    if policy.requireIntentMandate and not ev.intent_uid:
+    if policy.requireIntentMandate and not (ev.intent_uid and any(_b32(ev.intent_uid))):
         raise HTTPException(status_code=422, detail="AP2: intent_uid required")
-    if policy.requireCartMandate and not ev.cart_uid:
+    if policy.requireCartMandate and not (ev.cart_uid and any(_b32(ev.cart_uid))):
         raise HTTPException(status_code=422, detail="AP2: cart_uid required")
-    if policy.requirePaymentMandate and not ev.payment_uid:
+    if policy.requirePaymentMandate and not (ev.payment_uid and any(_b32(ev.payment_uid))):
         raise HTTPException(status_code=422, detail="AP2: payment_uid required")
-    if policy.requireTrace and not ev.trace_uid:
+    if policy.requireTrace and not (ev.trace_uid and any(_b32(ev.trace_uid))):
         raise HTTPException(status_code=422, detail="AP2: trace_uid required")
 
 
 def verify_origin_binding(
     ev: AP2Evidence, payment_requirements: PaymentRequirements, origin_header: Optional[str]
 ) -> None:
-    if origin_header:
-        origin = origin_header
-    else:
-        parsed = urlparse(payment_requirements.resource)
-        origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+    resource = httpx.URL(payment_requirements.resource)
+    origin = f"{resource.scheme}://{resource.netloc.decode('ascii')}"
+    if resource.scheme not in {"http", "https"} or not resource.host:
+        raise HTTPException(status_code=422, detail="Invalid AP2 resource origin")
+    if origin_header and origin_header.lower() != origin.lower():
+        raise HTTPException(status_code=422, detail="AP2: origin differs from payment requirements")
     expected = _sha256_lower_origin(origin)
     if _b32(ev.originHash).hex() != expected.hex():
         raise HTTPException(status_code=422, detail="AP2: originHash mismatch")
@@ -315,7 +352,9 @@ def verify_payment_hash_binding(
     ev: AP2Evidence, req: Request, payment_payload: PaymentPayload
 ) -> None:
     payload_obj = payment_payload.model_dump(by_alias=True)
-    expected = compute_expected_payment_hash(req, payload_obj)
+    expected = compute_expected_payment_hash(
+        req, getattr(req.state, "payment_payload", payload_obj)
+    )
     if _b32(ev.paymentHash) != expected:
         raise HTTPException(status_code=422, detail="AP2: paymentHash mismatch")
 
@@ -400,7 +439,7 @@ def verify_eip712_signature_if_present(
     }
     typed = {"types": types, "primaryType": "Evidence", "domain": domain, "message": message}
     try:
-        enc = encode_structured_data(typed)  # type: ignore
+        enc = encode_typed_data(full_message=typed)  # type: ignore
         sig_bytes = bytes.fromhex(ev.sig[2:] if ev.sig.startswith("0x") else ev.sig)
         recovered = Account.recover_message(enc, signature=sig_bytes)
         if recovered.lower() != (payer or "").lower():
@@ -414,23 +453,18 @@ def verify_eip712_signature_if_present(
 def enforce_amount_and_asset(
     payment_payload: PaymentPayload, payment_requirements: PaymentRequirements
 ) -> None:
-    # Enforce amount <= maxAmountRequired when provided
-    pr = payment_requirements
-    pp = payment_payload.model_dump(by_alias=True)
-    value: Optional[int] = None
+    auth = payment_payload.model_dump(by_alias=True)["payload"].get("authorization")
     try:
-        value = int(pp.get("payload", {}).get("authorization", {}).get("value"))
-    except Exception:
-        pass
-    if value is not None and pr.max_amount_required is not None:
-        try:
-            max_amt = int(pr.max_amount_required)
-            if value > max_amt:
-                raise HTTPException(status_code=422, detail="Amount exceeds maxAmountRequired")
-        except Exception:
-            # If merchant omitted max or non-integer, skip
-            pass
-    # Asset address congruence is enforced against AP2 evidence; payload may not include it.
+        value = auth["value"]
+        limit_value = payment_requirements.max_amount_required
+        if any(not re.fullmatch(r"[0-9]{1,78}", str(item)) for item in (value, limit_value)):
+            raise ValueError("Invalid atomic amount")
+        amount = int(value)
+        limit = int(limit_value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="AP2: invalid authorized amount") from exc
+    if not 0 < amount <= limit:
+        raise HTTPException(status_code=422, detail="AP2: amount exceeds payment requirements")
 
 
 async def fetch_and_validate_ap2_context(
@@ -513,18 +547,31 @@ def verify_ap2(
     body: ProxyVerifyRequest,
     origin_header: Optional[str],
     ap2_header: Optional[str],
-) -> None:
-    policy = extract_ap2_policy(body.paymentRequirements)
+    *,
+    required_policy: Optional[AP2Policy] = None,
+) -> Optional[AP2Evidence]:
+    policy = extract_ap2_policy(body.paymentRequirements, required_policy)
+    required = any(policy.model_dump().values())
+    if not required and not (ap2_header or body.ap2EvidenceHeader):
+        return None
+    if ap2_header and body.ap2EvidenceHeader and ap2_header != body.ap2EvidenceHeader:
+        raise HTTPException(status_code=422, detail="Conflicting AP2 evidence")
     ev = parse_ap2_evidence_b64(ap2_header, body.ap2EvidenceHeader)
-    enforce_policy_flags(policy, ev)
-    verify_congruence(ev, body.paymentRequirements)
-    verify_ttl(ev)
-    verify_origin_binding(ev, body.paymentRequirements, origin_header)
-    verify_payment_hash_binding(ev, request, body.paymentPayload)
-    verify_merchant_identity(policy, body.paymentRequirements)
-    payer = _extract_payer_from_payment_payload(body.paymentPayload.model_dump(by_alias=True))
-    verify_eip712_signature_if_present(ev, body.paymentRequirements, payer)
-    enforce_amount_and_asset(body.paymentPayload, body.paymentRequirements)
+    if required and (not ev.sig or not ev.notAfter):
+        raise HTTPException(status_code=422, detail="AP2: signed evidence with expiry required")
+    try:
+        enforce_policy_flags(policy, ev)
+        verify_congruence(ev, body.paymentRequirements)
+        verify_ttl(ev)
+        verify_origin_binding(ev, body.paymentRequirements, origin_header)
+        verify_payment_hash_binding(ev, request, body.paymentPayload)
+        verify_merchant_identity(policy, body.paymentRequirements)
+        payer = _extract_payer_from_payment_payload(_payment_payload_dict(body, request))
+        verify_eip712_signature_if_present(ev, body.paymentRequirements, payer)
+        enforce_amount_and_asset(body.paymentPayload, body.paymentRequirements)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid AP2 evidence fields") from exc
+    return ev
 
 
 # -------------------------------
@@ -544,12 +591,18 @@ class ProxyRuntimeConfig(BaseModel):
         )
     )
     timeout_s: float = Field(default_factory=lambda: float(os.getenv("PROXY_TIMEOUT_S", "15")))
-    # Feature flag: optionally enforce risk evaluate at settle (default OFF)
-    # TODO(later): Consider enabling by default once prod readiness is confirmed.
+    # Optionally evaluate again at settle, in addition to checking the verify authorization.
     settle_risk_enabled: bool = Field(
         default_factory=lambda: (
             os.getenv("PROXY_SETTLE_RISK_ENABLED", "0").lower() in {"1", "true", "yes"}
         )
+    )
+
+    authorization_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("PROXY_PAYMENT_AUTHORIZATION_KEY"), repr=False
+    )
+    merchant_policy: dict = Field(
+        default_factory=lambda: json.loads(os.getenv("PROXY_PUBLIC_MERCHANT_POLICY_JSON", "{}"))
     )
 
 
@@ -590,7 +643,8 @@ def _error_code_from_message(msg: str) -> str:
         "unsupported x-payment-secure version": "TRACE_HEADER_UNSUPPORTED",
         "unsupported x-ap2-evidence version": "EVIDENCE_HEADER_UNSUPPORTED",
         # Risk outcome gating
-        "risk denied": "RISK_DENIED",
+        "risk deny": "RISK_DENIED",
+        "current risk allow": "PAYMENT_AUTHORIZATION_REQUIRED",
         "risk review": "RISK_REVIEW",
         "vi denied": "VI_DENIED",
         "vi review required": "VI_REVIEW_REQUIRED",
@@ -637,16 +691,69 @@ def _first_non_empty(*values: Any) -> Any:
     return None
 
 
+def _unique_json(raw: str | bytes) -> Any:
+    def object_pairs(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError("Duplicate JSON object key")
+            obj[key] = value
+        return obj
+
+    def invalid_constant(value):
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    return json.loads(raw, object_pairs_hook=object_pairs, parse_constant=invalid_constant)
+
+
 def _payment_payload_dict(body: ProxyVerifyRequest, request: Request) -> Dict[str, Any]:
-    x_payment = request.headers.get("X-PAYMENT")
-    if x_payment:
-        try:
-            decoded = json.loads(safe_base64_decode(x_payment))
-            if isinstance(decoded, dict):
-                return decoded
-        except Exception:
-            pass
-    return body.paymentPayload.model_dump(by_alias=True, exclude_none=True)
+    return getattr(request.state, "payment_payload", None) or body.paymentPayload.model_dump(
+        by_alias=True, exclude_none=True
+    )
+
+
+async def _public_payment_ingress(body: ProxyVerifyRequest, request: Request) -> None:
+    try:
+        raw = _unique_json(await request.body())
+        payload = raw["paymentPayload"]
+        headers = request.headers.getlist("X-PAYMENT")
+        if len(headers) > 1:
+            raise ValueError("Multiple X-PAYMENT headers")
+        if headers:
+            decoded = _unique_json(safe_base64_decode(headers[0]))
+            if not isinstance(decoded, dict) or _fingerprint_json(decoded) != _fingerprint_json(
+                payload
+            ):
+                raise ValueError("X-PAYMENT and paymentPayload disagree")
+        # Compare the fields shared by the signed payment, the outer request and the quote.
+        pr = body.paymentRequirements
+        if (
+            type(payload.get("x402Version")) is not int
+            or payload["x402Version"] != body.x402Version
+            or body.x402Version != 1
+            or payload.get("network") != pr.network
+            or payload.get("scheme") != pr.scheme
+            or ("version" in payload and payload["version"] != body.x402Version)
+            or ("protocol" in payload and payload["protocol"] not in {"x402", pr.scheme})
+        ):
+            raise ValueError("Payment and requirements disagree")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail="Invalid or conflicting payment representation"
+        ) from exc
+    if pr.scheme == "eip3009" or (
+        pr.scheme == "exact" and re.fullmatch(r"0x[0-9a-fA-F]{40}", pr.pay_to)
+    ):
+        enforce_amount_and_asset(body.paymentPayload, pr)
+        authorization = payload["payload"]["authorization"]
+        if (
+            not isinstance(authorization.get("to"), str)
+            or authorization["to"].lower() != pr.pay_to.lower()
+        ):
+            raise HTTPException(
+                status_code=422, detail="Authorized recipient differs from payment requirements"
+            )
+    request.state.payment_payload = payload
 
 
 def _payment_requirements_dict(
@@ -716,23 +823,17 @@ def _normalize_policy_issuers(value: Any) -> List[str]:
 def _merge_vi_policy_source(
     policy_data: Dict[str, Any],
     candidate: Optional[Dict[str, Any]],
-    *,
-    tightening_only: bool,
 ) -> None:
     if not isinstance(candidate, dict):
         return
 
     for raw_key, value in candidate.items():
         key = _canonical_vi_policy_key(str(raw_key))
-        if not tightening_only:
-            policy_data[key] = value
-            continue
-
         if key in _VI_POLICY_BOOL_KEYS:
             incoming = _coerce_policy_bool(value)
             existing = _coerce_policy_bool(policy_data.get(key, False))
             if incoming is None or existing is None:
-                policy_data[key] = value
+                raise HTTPException(status_code=422, detail=f"Invalid VI policy: {key}")
             else:
                 policy_data[key] = existing or incoming
             continue
@@ -741,7 +842,7 @@ def _merge_vi_policy_source(
             current = policy_data.get(key)
             incoming = str(value).strip().lower()
             if incoming not in _VI_POLICY_REVIEW_RANK:
-                policy_data[key] = value
+                raise HTTPException(status_code=422, detail="Invalid VI policy: reviewMode")
             elif current is None:
                 policy_data[key] = incoming
             else:
@@ -760,10 +861,10 @@ def _merge_vi_policy_source(
             incoming = _normalize_policy_issuers(value)
             if not existing:
                 policy_data[key] = incoming
-            elif incoming and set(incoming).issubset(set(existing)):
-                policy_data[key] = [item for item in existing if item in set(incoming)]
-            else:
-                policy_data[key] = existing
+            elif incoming:
+                policy_data[key] = sorted(set(existing) & set(incoming))
+                if not policy_data[key]:
+                    raise HTTPException(status_code=422, detail="Conflicting VI issuer constraints")
             continue
 
         if key not in policy_data:
@@ -773,6 +874,7 @@ def _merge_vi_policy_source(
 def extract_vi_policy(
     payment_requirements: PaymentRequirements,
     *policy_sources: Optional[Dict[str, Any]],
+    floor: Optional[Dict[str, Any]] = None,
 ) -> InternalPolicy:
     extra = getattr(payment_requirements, "extra", {}) or {}
     candidates: List[Optional[Dict[str, Any]]] = [
@@ -785,10 +887,10 @@ def extract_vi_policy(
         ),
     ]
     policy_data: Dict[str, Any] = {}
-    for candidate in candidates:
-        _merge_vi_policy_source(policy_data, candidate, tightening_only=False)
-    for candidate in policy_sources:
-        _merge_vi_policy_source(policy_data, candidate, tightening_only=True)
+    _merge_vi_policy_source(policy_data, floor)
+    policy_data.setdefault("reviewMode", "block")
+    for candidate in (*candidates, *policy_sources):
+        _merge_vi_policy_source(policy_data, candidate)
     try:
         return InternalPolicy(**policy_data)
     except ValidationError as e:
@@ -899,7 +1001,9 @@ def build_public_vi_assessment_payload(
     risk_trace: Optional[str],
     origin: Optional[str],
 ) -> Dict[str, Any]:
-    policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
+    policy = getattr(request.state, "vi_policy", None) or extract_vi_policy(
+        body.paymentRequirements, body.policy, body.vi_policy
+    )
     verifiable_intent = extract_verifiable_intent_evidence(
         vi_header,
         body.verifiable_intent,
@@ -907,7 +1011,7 @@ def build_public_vi_assessment_payload(
     payment_context = build_public_payment_context(body, request, origin)
     trace = trace_context or body.trace_context or {}
     merchant_id = _merchant_id_from_origin(origin, body.paymentRequirements.resource)
-    merged_ap2_context = {**(ap2_context or {}), **(body.ap2_context or {})}
+    merged_ap2_context = {**(body.ap2_context or {}), **(ap2_context or {})}
 
     return {
         "agentId": payment_context.get("payer"),
@@ -1037,13 +1141,13 @@ def enforce_public_vi_policy_inputs(payload: Dict[str, Any]) -> None:
 
 
 def _normalize_vi_decision(value: Any) -> str:
-    normalized = str(value or "review").lower()
+    normalized = str(value or "").lower()
     if normalized in {"approve", "approved", "accept", "accepted"}:
         return "allow"
     if normalized in {"reject", "rejected", "decline", "declined", "block", "blocked"}:
         return "deny"
     if normalized not in {"allow", "deny", "review"}:
-        return "review"
+        return "deny"
     return normalized
 
 
@@ -1082,7 +1186,7 @@ def enforce_required_verified_vi_result(
     reasons: List[str],
     warnings: List[str],
 ) -> str:
-    if not policy.require_verified_intent or bool(vi_result.get("verified")):
+    if not policy.require_verified_intent or vi_result.get("verified") is True:
         return decision
     reason = "Verified Verifiable Intent required"
     if reason not in reasons:
@@ -1176,560 +1280,349 @@ def _proxy_local_risk_enabled() -> bool:
     return os.getenv("PROXY_LOCAL_RISK", "0").lower() in {"1", "true", "yes"}
 
 
+_AUTHORIZATION_HEADER = "X-PAYMENT-AUTHORIZATION"
+
+
+def _authorization_key(cfg: ProxyRuntimeConfig) -> bytes:
+    key = (cfg.authorization_key or "").encode()
+    if len(key) < 32:
+        raise HTTPException(status_code=503, detail="Invalid payment authorization configuration")
+    return key
+
+
+def _issue_authorization(cfg: ProxyRuntimeConfig, claims: dict) -> str:
+    data = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode()
+    signature = hmac.digest(_authorization_key(cfg), data.encode(), "sha256").hex()
+    return f"{data}.{signature}"
+
+
+def _read_authorization(cfg: ProxyRuntimeConfig, token: Optional[str], binding: str) -> dict:
+    if token and len(token) <= 4096:
+        data, _, signature = token.partition(".")
+        expected = hmac.digest(_authorization_key(cfg), data.encode(), "sha256").hex()
+        if signature.isascii() and hmac.compare_digest(expected, signature):
+            claims = json.loads(base64.urlsafe_b64decode(data))
+            if claims["binding"] == binding and _now_s() < claims["exp"]:
+                return claims
+    raise HTTPException(status_code=403, detail="Current risk allow for this payment required")
+
+
+def _upstream_request(body: ProxyVerifyRequest, request: Request) -> Dict[str, Any]:
+    payload = _payment_payload_dict(body, request)
+    requirements = _payment_requirements_dict(body.paymentRequirements)
+    # The public v1 facilitator adapter forwards EIP-3009 token metadata in extra.
+    if "extra" in requirements:
+        requirements["extra"] = {
+            key: value for key, value in requirements["extra"].items() if key in {"name", "version"}
+        }
+    return {
+        "x402Version": body.x402Version,
+        "paymentPayload": payload,
+        "paymentRequirements": requirements,
+        "paymentHeader": request.headers.get("X-PAYMENT")
+        or safe_base64_encode(json.dumps(payload, separators=(",", ":"))),
+    }
+
+
+def _same_host_transport(request: Request, url: str) -> Optional[ASGITransport]:
+    if urlparse(url).netloc == request.url.netloc:
+        return ASGITransport(app=request.app)
+    return None
+
+
+async def _public_gate_inputs(body: ProxyVerifyRequest, request: Request, cfg: ProxyRuntimeConfig):
+    _authorization_key(cfg)
+    await _public_payment_ingress(body, request)
+    origin = request.headers.get("Origin")
+    sid, tid = parse_risk_ids(
+        request.headers.get("X-RISK-SESSION"), request.headers.get("X-RISK-TRACE")
+    )
+    tc = parse_x_payment_secure(request.headers.get("X-PAYMENT-SECURE") or "")
+    if tid is None and tc.get("ts"):
+        try:
+            decoded = json.loads(base64.b64decode(unquote(tc["ts"])))
+            tid = decoded.get("tid") if isinstance(decoded, dict) else None
+        except (TypeError, ValueError):
+            pass
+        if tid:
+            _, tid = parse_risk_ids(sid, tid)
+    ap2_header = request.headers.get("X-AP2-EVIDENCE")
+    mandate = (
+        parse_x_ap2_evidence(ap2_header)
+        if ap2_header and ap2_header.startswith("evd.v1;")
+        else None
+    )
+    signed_ap2 = None if mandate else ap2_header
+    try:
+        floor_ap2 = _merge_ap2_policies([cfg.merchant_policy.get("ap2", {})])
+        floor_vi = cfg.merchant_policy.get("vi", {})
+        allow_mandate_reference = cfg.merchant_policy.get("allowAp2MandateReference", False)
+        if (
+            cfg.merchant_policy.keys() - {"ap2", "vi", "allowAp2MandateReference"}
+            or not isinstance(floor_vi, dict)
+            or type(allow_mandate_reference) is not bool
+        ):
+            raise ValueError("Invalid public merchant policy")
+    except (ValueError, HTTPException) as exc:
+        raise HTTPException(status_code=503, detail="Invalid public merchant policy") from exc
+    request.state.vi_policy = policy = extract_vi_policy(
+        body.paymentRequirements, body.policy, body.vi_policy, floor=floor_vi
+    )
+    if policy.require_payment_mandate and not allow_mandate_reference:
+        floor_ap2.requirePaymentMandate = True
+    if policy.require_trace and not tid:
+        raise HTTPException(status_code=422, detail="Trace context required")
+    evidence = verify_ap2(request, body, origin, signed_ap2, required_policy=floor_ap2)
+    context = build_public_payment_context(body, request, origin)
+    vi_header = request.headers.get("X-VERIFIABLE-INTENT")
+    trace_context = {
+        "traceparent": tc["tp"],
+        **({"tracestate": tc["ts"]} if "ts" in tc else {}),
+        **({"riskTrace": tid} if tid else {}),
+        "riskSession": sid,
+    }
+    ap2_context = _ap2_context_from_mandate_header(mandate)
+    if evidence and evidence.sig and evidence.payment_uid:
+        ap2_context["paymentMandateId"] = evidence.payment_uid
+    vi_payload = None
+    if public_vi_assessment_requested(policy, body, vi_header):
+        vi_payload = build_public_vi_assessment_payload(
+            body,
+            request,
+            vi_header=vi_header,
+            trace_context=trace_context,
+            ap2_context=ap2_context,
+            risk_session=sid,
+            risk_trace=tid,
+            origin=origin,
+        )
+        enforce_public_vi_policy_inputs(vi_payload)
+    evaluate_json = {
+        "sid": sid,
+        "tid": tid,
+        "trace_context": tc,
+        "payment": {
+            "protocol": context["scheme"],
+            "version": body.x402Version,
+            "network": context["network"],
+            "payload": context["payload"]["payload"],
+            "extra": {
+                "paymentContext": {key: value for key, value in context.items() if key != "payload"}
+            },
+        },
+    }
+    if mandate:
+        evaluate_json["mandate"] = {
+            "ref": mandate["mr"],
+            "sha256_b64url": mandate["ms"],
+            "mime": mandate["mt"],
+            "size": int(mandate["sz"]),
+        }
+    binding = _fingerprint_json(
+        {
+            "risk": evaluate_json,
+            "vi": vi_payload,
+            "policy": cfg.merchant_policy,
+            "ap2Evidence": evidence.model_dump() if evidence else None,
+            "upstream": [cfg.upstream_verify_url, cfg.upstream_settle_url],
+        }
+    )
+    return binding, evaluate_json, vi_payload
+
+
+async def _evaluate_public_risk(
+    request: Request, cfg: ProxyRuntimeConfig, payload: dict
+) -> EvaluateResponse:
+    if _proxy_local_risk_enabled():
+        url = "http://proxy-local"
+        transport = ASGITransport(app=request.app)
+    else:
+        url = _risk_engine_url()
+        transport = _same_host_transport(request, url)
+    token = os.getenv("RISK_INTERNAL_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with httpx.AsyncClient(timeout=cfg.timeout_s, transport=transport) as client:
+        result = await client.post(f"{url}/risk/evaluate", json=payload, headers=headers)
+    if result.status_code != 200:
+        raise HTTPException(status_code=result.status_code, detail="Risk evaluation failed")
+    try:
+        risk = EvaluateResponse.model_validate(result.json())
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Invalid risk response") from exc
+    if risk.decision != Decision.allow:
+        raise HTTPException(status_code=403, detail=f"Risk {risk.decision.value}")
+    if risk.ttl_seconds <= 0:
+        raise HTTPException(status_code=403, detail="Risk allow has expired")
+    return risk
+
+
+async def _forward_public_payment(
+    body: ProxyVerifyRequest, request: Request, cfg: ProxyRuntimeConfig, url: str
+) -> dict:
+    transport = _same_host_transport(request, url)
+    async with httpx.AsyncClient(timeout=cfg.timeout_s, transport=transport) as client:
+        result = await client.post(url, json=_upstream_request(body, request))
+    if result.status_code != 200:
+        raise HTTPException(
+            status_code=result.status_code, detail="Upstream payment request failed"
+        )
+    try:
+        outcome = result.json()
+        if isinstance(outcome, dict):
+            return outcome
+    except ValueError:
+        pass
+    raise HTTPException(status_code=502, detail="Invalid upstream payment response")
+
+
+def _public_decision_headers(response: Response, claims: dict) -> None:
+    response.headers["X-Risk-Decision"] = "allow"
+    response.headers["X-Risk-Decision-ID"] = claims.get("vi_id") or claims["risk_id"]
+    response.headers["X-Risk-TTL-Seconds"] = str(max(0, claims["exp"] - _now_s()))
+    if claims.get("vi_id"):
+        response.headers["X-VI-Decision"] = "allow"
+        response.headers["X-VI-Decision-ID"] = claims["vi_id"]
+        if claims.get("vi_verified") is not None:
+            response.headers["X-VI-Verified"] = str(claims["vi_verified"]).lower()
+        if claims.get("evidence_ref"):
+            response.headers["X-VI-Evidence-Ref"] = claims["evidence_ref"]
+
+
 @router.post("/verify", response_model=VerifyResponse)
 async def proxy_verify(
     body: ProxyVerifyRequest,
     request: Request,
-    x_ap2_evidence: Optional[str] = Header(None, alias="X-AP2-EVIDENCE"),
-    x_verifiable_intent: Optional[str] = Header(None, alias="X-VERIFIABLE-INTENT"),
-    x_payment_secure: Optional[str] = Header(None, alias="X-PAYMENT-SECURE"),
-    x_risk_session: Optional[str] = Header(None, alias="X-RISK-SESSION"),
-    x_risk_trace: Optional[str] = Header(None, alias="X-RISK-TRACE"),
-    origin: Optional[str] = Header(None, alias="Origin"),
+    response: Response,
     cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg),
-    response: Response = None,
 ):
     req_id = uuid.uuid4().hex
-    if response is not None:
-        response.headers["X-Request-ID"] = req_id
+    response.headers["X-Request-ID"] = req_id
     try:
-        # Parse required IDs and trace context; optional mandate
-        sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
-        if not x_payment_secure:
-            raise HeaderError("X-PAYMENT-SECURE required")
-        tc = parse_x_payment_secure(x_payment_secure)
-        mandate = None
-        if x_ap2_evidence:
-            mandate = parse_x_ap2_evidence(x_ap2_evidence)
-
-        # Extract tid from tracestate if present
-        extracted_tid = tid  # from X-RISK-TRACE header (if exists)
-        if not extracted_tid and "ts" in tc:
-            try:
-                # Decode tracestate to extract tid
-                from urllib.parse import unquote
-
-                ts_decoded = unquote(tc["ts"])
-                ts_json = json.loads(base64.b64decode(ts_decoded))
-                extracted_tid = ts_json.get("tid")
-                if extracted_tid:
-                    logger.info(
-                        f"[{req_id}] [PROXY] Extracted tid from tracestate: {extracted_tid}"
-                    )
-            except Exception as e:
-                logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
-
-        # Construct payment context from paymentPayload
-        payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
-        xpay = request.headers.get("X-PAYMENT")
-        if xpay:
-            try:
-                # Decode X-PAYMENT to preserve all fields
-                payment_payload_dict = json.loads(safe_base64_decode(xpay))
-            except Exception:
-                pass  # Fall back to Pydantic serialization
-
-        payment_context = {
-            "protocol": payment_payload_dict.get("protocol") or payment_payload_dict.get("scheme"),
-            "version": payment_payload_dict.get("version")
-            or payment_payload_dict.get("x402Version"),
-            "network": payment_payload_dict.get("network"),
-            "payload": payment_payload_dict.get("payload", {}),
+        binding, evaluate_json, vi_payload = await _public_gate_inputs(body, request, cfg)
+        started = _now_s()
+        risk = await _evaluate_public_risk(request, cfg, evaluate_json)
+        claims = {
+            "binding": binding,
+            "risk_id": risk.decision_id,
+            "exp": started + risk.ttl_seconds,
         }
-
-        evaluate_json: Dict[str, Any] = {
-            "sid": sid,
-            **({"tid": extracted_tid} if extracted_tid else {}),
-            "trace_context": {"tp": tc["tp"], **({"ts": tc["ts"]} if "ts" in tc else {})},
-            "payment": payment_context,
-        }
-        if mandate:
-            evaluate_json["mandate"] = {
-                "ref": mandate["mr"],
-                "sha256_b64url": mandate["ms"],
-                "mime": mandate["mt"],
-                "size": int(mandate["sz"]),
-            }
-        # In local mode, use proxy's own /risk/evaluate endpoint (same app)
-        if _proxy_local_risk_enabled():
-            # Use in-process ASGI transport to call local /risk/evaluate
-            rurl = "http://proxy-local"  # Placeholder URL for ASGI transport
-            risk_transport = ASGITransport(app=request.app)
-            logger.info(f"[{req_id}] [PROXY] ▶ Local /risk/evaluate (in-process)")
-        else:
-            rurl = _risk_engine_url()
-            logger.info(f"[{req_id}] [PROXY] ▶ Risks /risk/evaluate {rurl}")
-            # Use in-app transport for local/testing when targeting same host
-            risk_transport = None
-            try:
-                if urlparse(rurl).netloc == urlparse(str(request.url)).netloc:
-                    risk_transport = ASGITransport(app=request.app)
-            except Exception:
-                risk_transport = None
-        # Attach internal Bearer token when configured
-        headers = {}
-        token = os.getenv("RISK_INTERNAL_TOKEN")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        async with httpx.AsyncClient(timeout=cfg.timeout_s, transport=risk_transport) as client:
-            r = await client.post(f"{rurl}/risk/evaluate", json=evaluate_json, headers=headers)
-        if r.status_code != 200:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-
-        # Validate and parse risk response
-        try:
-            risk_response = EvaluateResponse(**r.json())
-            logger.info(f"[{req_id}] [PROXY] Risk response: {risk_response.model_dump_json()}")
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Invalid risk response: {str(e)}")
-
-        decision = risk_response.decision
-        if response is not None:
-            response.headers["X-Risk-Decision"] = decision.value
-        if risk_response.decision_id:
-            response.headers["X-Risk-Decision-ID"] = risk_response.decision_id
-        if risk_response.ttl_seconds:
-            response.headers["X-Risk-TTL-Seconds"] = str(risk_response.ttl_seconds)
-        logger.info(
-            "[%s] [PROXY] ✅ Risk decision: %s (id=%s)",
-            req_id,
-            decision.value,
-            risk_response.decision_id,
-        )
-
-        # Gate forwarding on decision
-        if decision == Decision.deny:
-            msg = "Risk denied" + (
-                f": {', '.join(risk_response.reasons)}" if risk_response.reasons else ""
-            )
-            raise HTTPException(status_code=403, detail=msg)
-
-        trace_context = {
-            "traceparent": tc["tp"],
-            **({"tracestate": tc["ts"]} if "ts" in tc else {}),
-            **({"riskTrace": extracted_tid} if extracted_tid else {}),
-            "riskSession": sid,
-        }
-        vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
-        if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
-            vi_payload = build_public_vi_assessment_payload(
-                body,
-                request,
-                vi_header=x_verifiable_intent,
-                trace_context=trace_context,
-                ap2_context=_ap2_context_from_mandate_header(mandate),
-                risk_session=sid,
-                risk_trace=extracted_tid,
-                origin=origin,
-            )
-            vi_assessment = await assess_public_verifiable_intent(vi_payload)
-            vi_decision = vi_assessment["decision"]
-            if response is not None:
-                response.headers["X-VI-Decision"] = vi_decision
-                response.headers["X-Risk-Decision"] = vi_decision
-                response.headers["X-VI-Decision-ID"] = vi_assessment["decision_id"]
-                response.headers["X-Risk-Decision-ID"] = vi_assessment["decision_id"]
-                vi_details = vi_assessment.get("vi") or {}
-                if "verified" in vi_details:
-                    response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
-                evidence_ref = vi_details.get("evidence_ref") or vi_details.get("evidenceRef")
-                if evidence_ref:
-                    response.headers["X-VI-Evidence-Ref"] = str(evidence_ref)
-            if vi_decision == "deny":
-                msg = "VI denied" + (
-                    f": {', '.join(vi_assessment['reasons'])}"
-                    if vi_assessment.get("reasons")
-                    else ""
-                )
-                raise HTTPException(status_code=403, detail=msg)
-            if vi_decision == "review":
+        if vi_payload is not None:
+            started = _now_s()
+            assessment = await assess_public_verifiable_intent(vi_payload)
+            if assessment["decision"] == "deny":
+                raise HTTPException(status_code=403, detail="VI denied")
+            if assessment["decision"] != "allow":
                 raise HTTPException(status_code=403, detail="VI review required")
-    except HTTPException as e:
-        return _error_response(e, req_id)
-    except HeaderError as e:
-        logger.error(f"[{req_id}] [PROXY] Header validation failed (verify): {e}")
-        return _error_response(HTTPException(status_code=400, detail=str(e)), req_id)
-
-    # Use in-app transport for test/local stubs when targeting same host
-    transport = None
-    try:
-        if urlparse(cfg.upstream_verify_url).netloc == urlparse(str(request.url)).netloc:
-            transport = ASGITransport(app=request.app)
-    except Exception:
-        transport = None
-    # Build request compatible with both facilitator shapes (paymentPayload or paymentHeader)
-    xpay = request.headers.get("X-PAYMENT")
-
-    # Preserve original payment payload fields (including ap2Ref) by decoding X-PAYMENT directly
-    # instead of using Pydantic model_dump which may strip extra fields
-    payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
-    if xpay:
-        try:
-            # Decode X-PAYMENT to preserve all fields including ap2Ref
-            payment_payload_dict = json.loads(safe_base64_decode(xpay))
-        except Exception:
-            pass  # Fall back to Pydantic serialization
-
-    # Strip custom AP2 fields from PaymentRequirements before forwarding to upstream
-    # The proxy has already validated AP2, so upstream (e.g., CDP) only needs standard x402 fields
-    payment_requirements_dict = body.paymentRequirements.model_dump(
-        by_alias=True, exclude_none=True
-    )
-    if "extra" in payment_requirements_dict:
-        extra = payment_requirements_dict["extra"]
-        # Remove ALL custom fields - keep only standard x402 token metadata
-        # CDP expects only: name, version (for EIP-3009 signing)
-        standard_fields = {}
-        if "name" in extra:
-            standard_fields["name"] = extra["name"]
-        if "version" in extra:
-            standard_fields["version"] = extra["version"]
-        payment_requirements_dict["extra"] = standard_fields if standard_fields else {}
-
-    # Remove null fields that CDP doesn't like
-    payment_requirements_dict = {
-        k: v for k, v in payment_requirements_dict.items() if v is not None
-    }
-
-    req_json = {
-        "x402Version": body.x402Version,
-        "paymentPayload": payment_payload_dict,
-        "paymentRequirements": payment_requirements_dict,
-    }
-
-    try:
-        if xpay:
-            # Pass through exact header form for facilitators expecting paymentHeader
-            req_json["paymentHeader"] = xpay
-        else:
-            # Fallback: create header from canonicalized payload
-            req_json["paymentHeader"] = safe_base64_encode(
-                json.dumps(req_json["paymentPayload"], separators=(",", ":"))
+            details = assessment["vi"]
+            ttl = assessment["ttl_seconds"]
+            if type(ttl) is not int or ttl <= 0:
+                raise HTTPException(status_code=502, detail="Invalid VI authorization TTL")
+            claims.update(
+                exp=min(claims["exp"], started + ttl),
+                vi_id=assessment["decision_id"],
+                vi_verified=details.get("verified") is True if "verified" in details else None,
+                evidence_ref=details.get("evidence_ref") or details.get("evidenceRef"),
             )
-    except Exception:
-        pass
-
-    # Debug: log what we're sending to upstream
-    logger.info(f"[{req_id}] 📤 Forwarding to upstream: {cfg.upstream_verify_url}")
-    pr_json = json.dumps(payment_requirements_dict, indent=2)
-    logger.info("[%s] PaymentRequirements (cleaned): %s", req_id, pr_json)
-
-    async with httpx.AsyncClient(
-        timeout=cfg.timeout_s, transport=transport, follow_redirects=True
-    ) as client:
-        resp = await client.post(
-            cfg.upstream_verify_url,
-            json=req_json,
+        data = await _forward_public_payment(body, request, cfg, cfg.upstream_verify_url)
+        if type(data.get("isValid")) is not bool:
+            raise HTTPException(status_code=502, detail="Invalid upstream verification outcome")
+        if data["isValid"]:
+            if _now_s() >= claims["exp"]:
+                raise HTTPException(status_code=403, detail="Payment authorization expired")
+            response.headers[_AUTHORIZATION_HEADER] = _issue_authorization(cfg, claims)
+            _public_decision_headers(response, claims)
+        return VerifyResponse(
+            isValid=data["isValid"],
+            payer=str(data.get("payer") or ""),
+            invalidReason=data.get("invalidReason") or data.get("error"),
         )
-    try:
-        resp_json = resp.json()
-    except Exception:
-        resp_json = None
-
-    if resp.status_code != 200:
+    except HTTPException as exc:
+        return _error_response(exc, req_id)
+    except HeaderError as exc:
+        return _error_response(HTTPException(status_code=400, detail=str(exc)), req_id)
+    except httpx.HTTPError:
         return _error_response(
-            HTTPException(status_code=resp.status_code, detail=resp.text), req_id
+            HTTPException(status_code=502, detail="Payment verification unavailable"), req_id
         )
-    data = resp_json or {}
-    return VerifyResponse(
-        isValid=bool(data.get("isValid")),
-        payer=str(data.get("payer", "")),
-        invalidReason=data.get("invalidReason") or data.get("error") or None,
-    )
 
 
 @router.post("/settle", response_model=SettleResponse)
 async def proxy_settle(
     body: ProxySettleRequest,
     request: Request,
-    x_ap2_evidence: Optional[str] = Header(None, alias="X-AP2-EVIDENCE"),
-    x_verifiable_intent: Optional[str] = Header(None, alias="X-VERIFIABLE-INTENT"),
-    x_payment_secure: Optional[str] = Header(None, alias="X-PAYMENT-SECURE"),
-    x_risk_session: Optional[str] = Header(None, alias="X-RISK-SESSION"),
-    x_risk_trace: Optional[str] = Header(None, alias="X-RISK-TRACE"),
-    x_vi_decision_id: Optional[str] = Header(None, alias="X-VI-DECISION-ID"),
-    x_vi_evidence_ref: Optional[str] = Header(None, alias="X-VI-EVIDENCE-REF"),
-    x_settlement_attempt_id: Optional[str] = Header(None, alias="X-SETTLEMENT-ATTEMPT-ID"),
-    x_idempotency_key: Optional[str] = Header(None, alias="X-IDEMPOTENCY-KEY"),
-    origin: Optional[str] = Header(None, alias="Origin"),
+    response: Response,
     cfg: ProxyRuntimeConfig = Depends(get_proxy_cfg),
-    response: Response = None,
 ):
     req_id = uuid.uuid4().hex
-    settle_vi_decision_id: Optional[str] = None
-    settle_vi_evidence_ref: Optional[str] = None
-    settle_vi_decision_assessed = False
-    if response is not None:
-        response.headers["X-Request-ID"] = req_id
+    response.headers["X-Request-ID"] = req_id
     try:
+        binding, evaluate_json, _ = await _public_gate_inputs(body, request, cfg)
+        token = request.headers.get(_AUTHORIZATION_HEADER)
+        claims = _read_authorization(cfg, token, binding)
         if cfg.settle_risk_enabled:
-            # Full risk path (unchanged): require trace headers and call Risk Engine.
-            sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
-            if not x_payment_secure:
-                raise HeaderError("X-PAYMENT-SECURE required")
-            tc = parse_x_payment_secure(x_payment_secure)
-            mandate = None
-            if x_ap2_evidence:
-                mandate = parse_x_ap2_evidence(x_ap2_evidence)
-
-            # Extract tid from tracestate if present
-            extracted_tid = tid  # from X-RISK-TRACE header (if exists)
-            if not extracted_tid and "ts" in tc:
-                try:
-                    # Decode tracestate to extract tid
-                    from urllib.parse import unquote
-
-                    ts_decoded = unquote(tc["ts"])
-                    ts_json = json.loads(base64.b64decode(ts_decoded))
-                    extracted_tid = ts_json.get("tid")
-                    if extracted_tid:
-                        logger.info(
-                            f"[{req_id}] [PROXY] Extracted tid from tracestate: {extracted_tid}"
-                        )
-                except Exception as e:
-                    logger.debug(f"[{req_id}] Could not extract tid from tracestate: {e}")
-
-            # Construct payment context from paymentPayload
-            payment_payload_dict = body.paymentPayload.model_dump(by_alias=True)
-            xpay = request.headers.get("X-PAYMENT")
-            if xpay:
-                try:
-                    # Decode X-PAYMENT to preserve all fields
-                    payment_payload_dict = json.loads(safe_base64_decode(xpay))
-                except Exception:
-                    pass  # Fall back to Pydantic serialization
-
-            payment_context = {
-                "protocol": payment_payload_dict.get("protocol")
-                or payment_payload_dict.get("scheme"),
-                "version": payment_payload_dict.get("version")
-                or payment_payload_dict.get("x402Version"),
-                "network": payment_payload_dict.get("network"),
-                "payload": payment_payload_dict.get("payload", {}),
-            }
-
-            evaluate_json: Dict[str, Any] = {
-                "sid": sid,
-                **({"tid": extracted_tid} if extracted_tid else {}),
-                "trace_context": {"tp": tc["tp"], **({"ts": tc["ts"]} if "ts" in tc else {})},
-                "payment": payment_context,
-            }
-            if mandate:
-                evaluate_json["mandate"] = {
-                    "ref": mandate["mr"],
-                    "sha256_b64url": mandate["ms"],
-                    "mime": mandate["mt"],
-                    "size": int(mandate["sz"]),
-                }
-            # In local mode, use proxy's own /risk/evaluate endpoint (same app)
-            if _proxy_local_risk_enabled():
-                # Use in-process ASGI transport to call local /risk/evaluate
-                rurl = "http://proxy-local"  # Placeholder URL for ASGI transport
-                risk_transport = ASGITransport(app=request.app)
-                logger.info(f"[{req_id}] [PROXY] ▶ Local /risk/evaluate (in-process)")
-            else:
-                rurl = _risk_engine_url()
-                logger.info(f"[{req_id}] [PROXY] ▶ Risks /risk/evaluate {rurl}")
-                risk_transport = None
-                try:
-                    if urlparse(rurl).netloc == urlparse(str(request.url)).netloc:
-                        risk_transport = ASGITransport(app=request.app)
-                except Exception:
-                    risk_transport = None
-            # Attach internal Bearer token when configured
-            headers = {}
-            token = os.getenv("RISK_INTERNAL_TOKEN")
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            async with httpx.AsyncClient(timeout=cfg.timeout_s, transport=risk_transport) as client:
-                r = await client.post(f"{rurl}/risk/evaluate", json=evaluate_json, headers=headers)
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-
-            # Validate and parse risk response
-            try:
-                risk_response = EvaluateResponse(**r.json())
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Invalid risk response: {str(e)}")
-
-            decision = risk_response.decision
-            if response is not None:
-                response.headers["X-Risk-Decision"] = decision.value
-            if risk_response.decision_id:
-                response.headers["X-Risk-Decision-ID"] = risk_response.decision_id
-            if risk_response.ttl_seconds:
-                response.headers["X-Risk-TTL-Seconds"] = str(risk_response.ttl_seconds)
-            logger.info(
-                "[%s] [PROXY] ✅ Risk decision: %s (id=%s)",
-                req_id,
-                decision.value,
-                risk_response.decision_id,
+            await _evaluate_public_risk(request, cfg, evaluate_json)
+            claims = _read_authorization(cfg, token, binding)
+        data = await _forward_public_payment(body, request, cfg, cfg.upstream_settle_url)
+        if type(data.get("success")) is not bool:
+            raise HTTPException(status_code=502, detail="Invalid upstream settlement outcome")
+        status = data.get("status")
+        if status is not None and (
+            not isinstance(status, str)
+            or status not in ({"success", "settled"} if data["success"] else {"failed", "declined"})
+        ):
+            raise HTTPException(status_code=502, detail="Upstream settlement outcome is unknown")
+        refs = [
+            data[key]
+            for key in ("transaction", "txHash", "transactionHash")
+            if data.get(key) is not None
+        ]
+        if (
+            any(not isinstance(ref, str) or not ref.strip() for ref in refs)
+            or len(set(refs)) > 1
+            or (data["success"] and (not refs or data.get("errorReason") or data.get("error")))
+            or (
+                data.get("network") is not None
+                and data["network"] != body.paymentRequirements.network
             )
-
-            # Gate forwarding on decision
-            if decision == Decision.deny:
-                msg = "Risk denied" + (
-                    f": {', '.join(risk_response.reasons)}" if risk_response.reasons else ""
-                )
-                raise HTTPException(status_code=403, detail=msg)
-        else:
-            # Risk on settle disabled by configuration; do not call Risk Engine.
-            logger.info(
-                "[%s] [PROXY] ⏭️  Skipping /risk/evaluate at /x402/settle "
-                "(PROXY_SETTLE_RISK_ENABLED=0)",
-                req_id,
-            )
-            if response is not None:
-                response.headers["X-Risk-Decision"] = "skipped"
-
-        vi_policy = extract_vi_policy(body.paymentRequirements, body.policy, body.vi_policy)
-        if public_vi_assessment_requested(vi_policy, body, x_verifiable_intent):
-            sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
-            if not x_payment_secure:
-                raise HeaderError("X-PAYMENT-SECURE required")
-            tc = parse_x_payment_secure(x_payment_secure)
-            mandate = parse_x_ap2_evidence(x_ap2_evidence) if x_ap2_evidence else None
-            trace_context = {
-                "traceparent": tc["tp"],
-                **({"tracestate": tc["ts"]} if "ts" in tc else {}),
-                **({"riskTrace": tid} if tid else {}),
-                "riskSession": sid,
-            }
-            vi_payload = build_public_vi_assessment_payload(
-                body,
-                request,
-                vi_header=x_verifiable_intent,
-                trace_context=trace_context,
-                ap2_context=_ap2_context_from_mandate_header(mandate),
-                risk_session=sid,
-                risk_trace=tid,
-                origin=origin,
-            )
-            vi_assessment = await assess_public_verifiable_intent(vi_payload)
-            vi_decision = vi_assessment["decision"]
-            settle_vi_decision_id = vi_assessment["decision_id"]
-            settle_vi_decision_assessed = True
-            vi_details = vi_assessment.get("vi") or {}
-            settle_vi_evidence_ref = vi_details.get("evidence_ref") or vi_details.get("evidenceRef")
-            if response is not None:
-                response.headers["X-VI-Decision"] = vi_decision
-                response.headers["X-Risk-Decision"] = vi_decision
-                response.headers["X-VI-Decision-ID"] = settle_vi_decision_id
-                response.headers["X-Risk-Decision-ID"] = settle_vi_decision_id
-                if "verified" in vi_details:
-                    response.headers["X-VI-Verified"] = str(bool(vi_details["verified"])).lower()
-                if settle_vi_evidence_ref:
-                    response.headers["X-VI-Evidence-Ref"] = str(settle_vi_evidence_ref)
-            if vi_decision == "deny":
-                msg = "VI denied" + (
-                    f": {', '.join(vi_assessment['reasons'])}"
-                    if vi_assessment.get("reasons")
-                    else ""
-                )
-                raise HTTPException(status_code=403, detail=msg)
-            if vi_decision == "review":
-                raise HTTPException(status_code=403, detail="VI review required")
-    except HTTPException as e:
-        return _error_response(e, req_id)
-    except HeaderError as e:
-        logger.error(f"[{req_id}] [PROXY] Header validation failed (settle): {e}")
-        return _error_response(HTTPException(status_code=400, detail=str(e)), req_id)
-
-    transport = None
-    try:
-        if urlparse(cfg.upstream_settle_url).netloc == urlparse(str(request.url)).netloc:
-            transport = ASGITransport(app=request.app)
-    except Exception:
-        transport = None
-
-    # Strip custom AP2 fields from PaymentRequirements before forwarding to upstream
-    payment_requirements_dict = body.paymentRequirements.model_dump(
-        by_alias=True, exclude_none=True
-    )
-    if "extra" in payment_requirements_dict:
-        extra = payment_requirements_dict["extra"]
-        # Keep only standard x402 token metadata
-        standard_fields = {}
-        if "name" in extra:
-            standard_fields["name"] = extra["name"]
-        if "version" in extra:
-            standard_fields["version"] = extra["version"]
-        payment_requirements_dict["extra"] = standard_fields if standard_fields else {}
-
-    # Remove null fields that CDP doesn't like
-    payment_requirements_dict = {
-        k: v for k, v in payment_requirements_dict.items() if v is not None
-    }
-
-    req_json = {
-        "x402Version": body.x402Version,
-        "paymentPayload": body.paymentPayload.model_dump(by_alias=True),
-        "paymentRequirements": payment_requirements_dict,
-    }
-    xpay = request.headers.get("X-PAYMENT")
-    try:
-        if xpay:
-            req_json["paymentHeader"] = xpay
-        else:
-            req_json["paymentHeader"] = safe_base64_encode(
-                json.dumps(req_json["paymentPayload"], separators=(",", ":"))
-            )
-    except Exception:
-        pass
-    async with httpx.AsyncClient(
-        timeout=cfg.timeout_s, transport=transport, follow_redirects=True
-    ) as client:
-        resp = await client.post(
-            cfg.upstream_settle_url,
-            json=req_json,
-        )
-    try:
-        resp_json = resp.json()
-    except Exception:
-        resp_json = None
-
-    if resp.status_code != 200:
+        ):
+            raise HTTPException(status_code=502, detail="Invalid upstream settlement binding")
+        transaction = refs[0] if refs else None
+    except HTTPException as exc:
+        return _error_response(exc, req_id)
+    except HeaderError as exc:
+        return _error_response(HTTPException(status_code=400, detail=str(exc)), req_id)
+    except httpx.HTTPError:
         return _error_response(
-            HTTPException(status_code=resp.status_code, detail=resp.text), req_id
+            HTTPException(status_code=502, detail="Upstream settlement outcome is unknown"), req_id
         )
-    data = resp_json or {}
-    if settle_vi_decision_assessed and settle_vi_decision_id:
+
+    _public_decision_headers(response, claims)
+    if claims.get("vi_id"):
         receipt_payload = build_public_vi_receipt_payload(
             body,
             request,
-            decision_id=settle_vi_decision_id,
-            evidence_ref=settle_vi_evidence_ref,
-            settlement_attempt_id=x_settlement_attempt_id,
-            idempotency_key=x_idempotency_key,
+            decision_id=claims["vi_id"],
+            evidence_ref=claims.get("evidence_ref"),
+            settlement_attempt_id=request.headers.get("X-SETTLEMENT-ATTEMPT-ID"),
+            idempotency_key=request.headers.get("X-IDEMPOTENCY-KEY"),
             settle_response=data,
-            origin=origin,
+            origin=request.headers.get("Origin"),
         )
         try:
             receipt = await post_public_vi_receipt(receipt_payload)
-            if response is not None:
-                response.headers["X-VI-Receipt-Status"] = "recorded"
-                receipt_id = receipt.get("receipt_id") or receipt.get("receiptId")
-                if receipt_id:
-                    response.headers["X-VI-Receipt-ID"] = str(receipt_id)
-        except HTTPException as e:
-            logger.warning("[%s] [PROXY] VI receipt post failed: %s", req_id, e.detail)
-            if response is not None:
-                response.headers["X-VI-Receipt-Status"] = "failed"
-        except Exception as e:
-            logger.warning(
-                "[%s] [PROXY] VI receipt post failed: %s",
-                req_id,
-                e,
-                exc_info=True,
-            )
-            if response is not None:
-                response.headers["X-VI-Receipt-Status"] = "failed"
+            response.headers["X-VI-Receipt-Status"] = "recorded"
+            receipt_id = receipt.get("receipt_id") or receipt.get("receiptId")
+            if receipt_id:
+                response.headers["X-VI-Receipt-ID"] = str(receipt_id)
+        except Exception:
+            logger.warning("[%s] VI receipt post failed", req_id, exc_info=True)
+            response.headers["X-VI-Receipt-Status"] = "failed"
     return SettleResponse(
-        success=bool(data.get("success")),
-        payer=str(data.get("payer", "")),
-        transaction=data.get("transaction"),
+        success=data["success"],
+        payer=str(data.get("payer") or ""),
+        transaction=transaction,
         network=data.get("network"),
-        errorReason=data.get("errorReason") or data.get("error") or None,
+        errorReason=data.get("errorReason") or data.get("error"),
     )
 
 

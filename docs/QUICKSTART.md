@@ -53,6 +53,9 @@ async def main():
         seller_base_url="https://test.example.com",
         agent_gateway_url="https://x402-proxy.t54.ai",
         buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
+        expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+        expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+        max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
         network="base-sepolia"  # Use testnet for development
     ))
 
@@ -110,6 +113,9 @@ async def shopping_agent():
         seller_base_url="https://shop.example.com",
         agent_gateway_url="https://x402-proxy.t54.ai",
         buyer_private_key=os.getenv("BUYER_PRIVATE_KEY"),
+        expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+        expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+        max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
         network="base-sepolia"
     ))
 

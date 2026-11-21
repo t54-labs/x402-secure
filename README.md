@@ -116,13 +116,18 @@ x402-secure provides **clear responsibility boundaries** through:
 pip install x402-secure
 
 # 2. Initialize buyer client
+import os
+
 from x402_secure_client import BuyerClient, BuyerConfig, OpenAITraceCollector
 
 # Configure buyer client
 buyer = BuyerClient(BuyerConfig(
     seller_base_url="https://api.example.com",
     agent_gateway_url="https://x402-proxy.t54.ai",
-    buyer_private_key=YOUR_PRIVATE_KEY
+    buyer_private_key=YOUR_PRIVATE_KEY,
+    expected_pay_to=os.environ["BUYER_EXPECTED_PAY_TO"],
+    expected_asset=os.environ["BUYER_EXPECTED_ASSET"],
+    max_amount_atomic=int(os.environ["BUYER_MAX_AMOUNT_ATOMIC"]),
 ))
 
 # 3. Create risk session

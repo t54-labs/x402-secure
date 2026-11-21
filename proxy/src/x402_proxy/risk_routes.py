@@ -236,7 +236,6 @@ class _LocalStore:
                 )
 
         # Log payment context (required field)
-        logger.info(f"[LOCAL] Payment context: {req.payment}")
         logger.info(
             f"[LOCAL] Payment context: protocol={req.payment.protocol}, "
             f"network={req.payment.network}, version={req.payment.version}"

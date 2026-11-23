@@ -10,7 +10,12 @@ import urllib.parse
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
 
 load_dotenv()
 app = FastAPI(title="Seller Example (OSS)")
@@ -73,14 +78,19 @@ async def market_data(req: Request, symbol: str = "BTC/USD"):
             {"x402Version": 1, "accepts": [pr], "error": "Invalid X-PAYMENT"}, status_code=402
         )
 
-    v = await seller_sdk.verify_then_settle(
-        payment_payload,
-        pr,
-        x_payment_b64=x_payment,
-        origin=origin,
-        x_payment_secure=xps,
-        risk_sid=sid,
-    )
+    try:
+        v = await seller_sdk.verify_then_settle(
+            payment_payload,
+            pr,
+            x_payment_b64=x_payment,
+            origin=origin,
+            x_payment_secure=xps,
+            risk_sid=sid,
+        )
+    except (PaymentVerificationError, SettlementDeclined):
+        return JSONResponse({"error": "Payment declined"}, status_code=402)
+    except SettlementUnknown:
+        return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 
     payload_resp_b64 = base64.b64encode(json.dumps(v).encode()).decode()
 

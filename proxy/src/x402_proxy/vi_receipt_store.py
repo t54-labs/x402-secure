@@ -202,8 +202,8 @@ def _json_dumps(value: Mapping[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _key(kind: str, value: str) -> str:
-    return f"{KEY_PREFIX}:{kind}:{value}"
+def _key(kind: str, value: str, namespace: str) -> str:
+    return f"{KEY_PREFIX}:{namespace}:{kind}:{value}"
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -281,6 +281,8 @@ _BINDING_FIELDS: dict[str, tuple[str, ...]] = {
     "payer": ("payer", "payerWallet", "payer_wallet", "walletAddress", "wallet_address"),
     "destination": ("destination", "payTo", "pay_to"),
     "amount": ("amount",),
+    "amountUnit": ("amountUnit", "amount_unit"),
+    "destinationTag": ("destinationTag", "destination_tag"),
     "asset": ("asset", "currency"),
     "issuer": ("issuer",),
 }
@@ -375,6 +377,8 @@ def _save_json(key: str, value: Mapping[str, Any]) -> None:
 def record_vi_decision_snapshot(
     response: Mapping[str, Any],
     payment_binding: Optional[Mapping[str, Any]] = None,
+    *,
+    namespace: str = "unscoped",
 ) -> None:
     """Remember an evaluate decision so the receipt that settles it can be checked.
 
@@ -383,7 +387,7 @@ def record_vi_decision_snapshot(
     A store outage is logged and never fails the evaluation.
     """
     try:
-        _record_vi_decision_snapshot(response, payment_binding)
+        _record_vi_decision_snapshot(response, payment_binding, namespace)
     except VIReceiptStoreUnavailable as exc:
         logger.warning(
             "VI decision snapshot not stored (receipt store unavailable: %s) decision_id=%s",
@@ -395,6 +399,7 @@ def record_vi_decision_snapshot(
 def _record_vi_decision_snapshot(
     response: Mapping[str, Any],
     payment_binding: Optional[Mapping[str, Any]],
+    namespace: str,
 ) -> None:
     decision_id = _pick(response, "decision_id", "decisionId")
     if not decision_id:
@@ -419,12 +424,14 @@ def _record_vi_decision_snapshot(
         "verifiableIntent": _verified_vi(vi),
         "updatedAt": _now(),
     }
-    _save_json(_key("decision", decision_id), snapshot)
+    _save_json(_key("decision", decision_id, namespace), snapshot)
 
 
 def record_vi_receipt_snapshot(
     payload: Mapping[str, Any],
     trustline_response: Optional[Mapping[str, Any]] = None,
+    *,
+    namespace: str = "unscoped",
 ) -> None:
     """Store the lookup status for a settled payment's receipt.
 
@@ -434,7 +441,7 @@ def record_vi_receipt_snapshot(
     the receipt.
     """
     try:
-        _record_vi_receipt_snapshot(payload, trustline_response)
+        _record_vi_receipt_snapshot(payload, trustline_response, namespace)
     except VIReceiptStoreUnavailable as exc:
         logger.warning(
             "VI receipt not stored (receipt store unavailable: %s) decision_id=%s",
@@ -446,6 +453,7 @@ def record_vi_receipt_snapshot(
 def _record_vi_receipt_snapshot(
     payload: Mapping[str, Any],
     trustline_response: Optional[Mapping[str, Any]],
+    namespace: str,
 ) -> None:
     decision_id = _pick(payload, "decisionId", "decision_id")
     payment = _as_dict(payload.get("payment"))
@@ -474,7 +482,7 @@ def _record_vi_receipt_snapshot(
         "invoice_id",
     )
 
-    decision = _load_json(_key("decision", decision_id)) if decision_id else None
+    decision = _load_json(_key("decision", decision_id, namespace)) if decision_id else None
     binding_status = "decision_not_found"
     if decision is not None:
         binding_status, mismatched = _check_receipt_binding(
@@ -525,20 +533,20 @@ def _record_vi_receipt_snapshot(
     }
 
     if tx_hash:
-        _save_json(_key("tx", tx_hash), status)
+        _save_json(_key("tx", tx_hash, namespace), status)
     if invoice_id:
-        _save_json(_key("invoice", invoice_id), status)
+        _save_json(_key("invoice", invoice_id, namespace), status)
 
 
-def _lookup_one(query: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+def _lookup_one(query: Mapping[str, Any], namespace: str) -> Optional[dict[str, Any]]:
     requested_hash = _hash(
         _pick(query, "hash", "txHash", "tx_hash", "transactionHash", "transaction_hash")
     )
     invoice_id = _pick(query, "invoiceId", "invoice_id")
 
-    status = _load_json(_key("tx", requested_hash)) if requested_hash else None
+    status = _load_json(_key("tx", requested_hash, namespace)) if requested_hash else None
     if not status and invoice_id:
-        status = _load_json(_key("invoice", invoice_id))
+        status = _load_json(_key("invoice", invoice_id, namespace))
     if not status:
         return None
 
@@ -552,6 +560,8 @@ def _lookup_one(query: Mapping[str, Any]) -> Optional[dict[str, Any]]:
 
 def lookup_vi_receipt_statuses(
     transactions: list[Mapping[str, Any]],
+    *,
+    namespace: str = "unscoped",
 ) -> list[dict[str, Any]]:
     """Return the stored status for each transaction hash or invoice id that has one.
 
@@ -561,7 +571,7 @@ def lookup_vi_receipt_statuses(
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for transaction in transactions:
-        status = _lookup_one(transaction)
+        status = _lookup_one(transaction, namespace)
         if not status:
             continue
         identity = _hash(status.get("hash")) or _string(status.get("invoiceId"))

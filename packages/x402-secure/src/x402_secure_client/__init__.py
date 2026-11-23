@@ -11,7 +11,7 @@ from .headers import (
 )
 from .otel import setup_otel_from_env
 from .risk import RiskClient
-from .seller import SellerClient
+from .seller import PaymentVerificationError, SellerClient, SettlementDeclined, SettlementUnknown
 from .tracing import OpenAITraceCollector
 
 __all__ = [
@@ -24,6 +24,9 @@ __all__ = [
     "BuyerConfig",
     "BuyerClient",
     "SellerClient",
+    "PaymentVerificationError",
+    "SettlementDeclined",
+    "SettlementUnknown",
     "OpenAITraceCollector",
     "store_agent_trace",
     "execute_payment_with_tid",

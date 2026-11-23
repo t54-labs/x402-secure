@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -18,6 +19,14 @@ from fastapi.testclient import TestClient
 
 def _client(monkeypatch) -> TestClient:
     monkeypatch.setenv("X402_SECURE_INTERNAL_TOKEN", "test-internal-token")
+    monkeypatch.setenv("X402_SECURE_INTERNAL_ENVIRONMENT", "test")
+    monkeypatch.setenv("X402_SECURE_INTERNAL_POLICY", "pol_xrpl_default")
+    monkeypatch.setenv("X402_SECURE_INTERNAL_POLICY_VERSION", "v1")
+    monkeypatch.setenv("X402_SECURE_INTERNAL_TRUSTLINE_TOKEN", "test-scoped-trustline-token")
+    monkeypatch.setenv(
+        "X402_SECURE_INTERNAL_ACTIONS",
+        "evaluate,evidence_session,evidence_upload,receipt_write,receipt_lookup",
+    )
     from x402_proxy import internal_router
     from x402_proxy.vi_receipt_store import reset_vi_receipt_store_for_tests
 
@@ -44,6 +53,7 @@ def _evaluate_payload(*, amount: Any = "10.00") -> Dict[str, Any]:
             "chain": "xrpl",
             "asset": "XRP",
             "amount": amount,
+            "amountUnit": "xrp",
             "destination": "rMerchantDestination",
             "resource": "https://merchant.example/dataset",
             "payload": {
@@ -144,8 +154,8 @@ def test_internal_auth_fails_closed_without_configured_token(monkeypatch) -> Non
 
     response = client.post("/internal/x402-secure/facilitator/evaluate", json=_evaluate_payload())
 
-    assert response.status_code == 500
-    assert "auth token is not configured" in response.json()["detail"]
+    assert response.status_code == 503
+    assert "service configuration" in response.json()["detail"]
 
 
 def test_internal_evaluate_builds_trustline_payload(monkeypatch) -> None:
@@ -299,9 +309,9 @@ def test_internal_evaluate_forwards_payment_payer_as_wallet_address(monkeypatch)
     assert payload["paymentContext"]["destination"] == "rMerchantDestination"
 
 
-def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None:
+def test_internal_evaluate_compares_xrpl_drops_with_validated_amount(monkeypatch) -> None:
     client = _client(monkeypatch)
-    body = _evaluate_payload(amount=None)
+    body = _evaluate_payload(amount="2.5")
     body["payment"]["payload"]["Amount"] = "2500000"
     captured: dict = {}
 
@@ -330,6 +340,7 @@ def test_internal_evaluate_converts_xrpl_drops_from_payload(monkeypatch) -> None
 def test_internal_evaluate_converts_xrpl_drops_from_context_amount(monkeypatch) -> None:
     client = _client(monkeypatch)
     body = _evaluate_payload(amount="1000")
+    body["payment"]["amountUnit"] = "drops"
     body["payment"]["payload"] = {
         "signedTxBlob": "120000228000000024000000016140000000000003E8",
     }
@@ -359,8 +370,8 @@ def test_internal_evaluate_converts_xrpl_drops_from_context_amount(monkeypatch) 
 
 def test_internal_evaluate_extracts_xrpl_issued_currency_amount(monkeypatch) -> None:
     client = _client(monkeypatch)
-    body = _evaluate_payload(amount=None)
-    body["payment"].pop("asset")
+    body = _evaluate_payload(amount="12.5")
+    body["payment"].update(asset="USD", issuer="rIssuerAccount", amountUnit="issued")
     body["payment"]["payload"]["Amount"] = {
         "currency": "USD",
         "issuer": "rIssuerAccount",
@@ -1349,90 +1360,123 @@ def test_internal_evidence_session_forwards_policy(monkeypatch) -> None:
     assert response.json()["session_id"] == "vi_sess_123"
 
 
-def test_internal_trustline_auth_headers_prefer_org_token(monkeypatch) -> None:
-    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
+def test_authenticated_service_selects_one_credential(monkeypatch) -> None:
+    client = _client(monkeypatch)
     monkeypatch.setenv(
-        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
-        '{"org_xrpl_dev":"org-token"}',
+        "X402_SECURE_INTERNAL_SERVICES_JSON",
+        json.dumps(
+            {
+                "facilitator": {
+                    "token": "test-internal-token",
+                    "trustline_token": "scoped-token",
+                    "organization": "org-A",
+                    "environment": "test",
+                    "policy": "pol_xrpl_default",
+                    "policy_version": "v1",
+                    "actions": ["evaluate"],
+                },
+                "reader": {
+                    "token": "lookup-only",
+                    "organization": "org-B",
+                    "environment": "test",
+                    "policy": "pol_xrpl_default",
+                    "policy_version": "v1",
+                    "actions": ["receipt_lookup"],
+                },
+            }
+        ),
     )
-    monkeypatch.setenv(
-        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
-        '{"pol_xrpl_default":"policy-token"}',
-    )
-
     from x402_proxy.internal_facilitator import _trustline_auth_headers
 
-    headers = _trustline_auth_headers(
-        {
-            "metadata": {"developerOrgId": "org_xrpl_dev"},
-            "policy": {"policyId": "pol_xrpl_default"},
+    async def fake_post(path, payload):
+        assert _trustline_auth_headers(payload, scoped=True) == {
+            "Authorization": "Bearer scoped-token"
         }
+        return await _verified_trustline(path, payload)
+
+    monkeypatch.setattr("x402_proxy.internal_facilitator.post_trustline_validation", fake_post)
+    body = _evaluate_payload(amount="1")
+    body["metadata"] = {"developerOrgId": "org-A"}
+    path = "/internal/x402-secure/facilitator/evaluate"
+    assert client.post(path, json=body, headers=_auth_headers()).status_code == 200
+    body["metadata"]["organizationId"] = "org-B"
+    assert client.post(path, json=body, headers=_auth_headers()).status_code == 403
+    assert (
+        client.post(path, json=body, headers={"Authorization": "Bearer lookup-only"}).status_code
+        == 403
     )
+    assert _lookup(client, {"hash": "ABC123"}).status_code == 403
 
-    assert headers == {"Authorization": "Bearer org-token"}
 
-
-def test_internal_trustline_auth_headers_use_policy_token(monkeypatch) -> None:
-    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
-    monkeypatch.setenv(
-        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
-        '{"pol_xrpl_default":"policy-token"}',
+def test_internal_rejects_legacy_selector_map(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    monkeypatch.setenv("X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON", '{"org-A":"old-token"}')
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate",
+        json=_evaluate_payload(),
+        headers=_auth_headers(),
     )
+    assert response.status_code == 503
 
+
+def test_public_trustline_auth_is_separate(monkeypatch) -> None:
+    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "public-token")
+    monkeypatch.setenv("X402_SECURE_INTERNAL_TRUSTLINE_TOKEN", "scoped-token")
     from x402_proxy.internal_facilitator import _trustline_auth_headers
 
-    headers = _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
-
-    assert headers == {"Authorization": "Bearer policy-token"}
+    assert _trustline_auth_headers({}, scoped=False) == {"Authorization": "Bearer public-token"}
 
 
-def test_public_trustline_auth_headers_ignore_internal_route_maps(monkeypatch) -> None:
-    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
-    monkeypatch.setenv(
-        "X402_SECURE_TRUSTLINE_TOKENS_BY_ORG_JSON",
-        '{"org_xrpl_dev":"org-token"}',
+def test_internal_evaluate_rejects_unsigned_xrpl_amount_conflict(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    body = _evaluate_payload(amount="1")
+    body["payment"]["payload"]["Amount"] = "1"
+    response = client.post(
+        "/internal/x402-secure/facilitator/evaluate", json=body, headers=_auth_headers()
     )
-    monkeypatch.setenv(
-        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
-        '{"pol_xrpl_default":"policy-token"}',
-    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["code"] == "XRPL_TERMS_CONFLICT"
 
-    from x402_proxy.internal_facilitator import _trustline_auth_headers
 
-    headers = _trustline_auth_headers(
-        {
-            "metadata": {"developerOrgId": "org_xrpl_dev"},
-            "policy": {"policyId": "pol_xrpl_default"},
+def test_vi_receipt_lookup_isolated_by_service_scope(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    registry = {
+        "writer": {
+            "token": "test-internal-token",
+            "trustline_token": "scoped-a",
+            "organization": "org-a",
+            "environment": "test",
+            "policy": "pol_xrpl_default",
+            "policy_version": "v1",
+            "actions": ["evaluate", "receipt_write"],
         },
-        route_by_payload=False,
+        "reader-a": {
+            "token": "lookup-a",
+            "organization": "org-a",
+            "environment": "test",
+            "policy": "pol_xrpl_default",
+            "policy_version": "v1",
+            "actions": ["receipt_lookup"],
+        },
+        "reader-b": {
+            "token": "lookup-b",
+            "organization": "org-b",
+            "environment": "test",
+            "policy": "pol_xrpl_default",
+            "policy_version": "v1",
+            "actions": ["receipt_lookup"],
+        },
+    }
+    monkeypatch.setenv("X402_SECURE_INTERNAL_SERVICES_JSON", json.dumps(registry))
+    monkeypatch.setattr(
+        "x402_proxy.internal_facilitator.post_trustline_validation", _verified_trustline
     )
-
-    assert headers == {"Authorization": "Bearer default-token"}
-
-
-def test_internal_trustline_auth_headers_fallback_to_default_token(monkeypatch) -> None:
-    monkeypatch.setenv("TRUSTLINE_INTERNAL_TOKEN", "default-token")
-    monkeypatch.setenv(
-        "X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON",
-        '{"pol_other":"other-token"}',
-    )
-
-    from x402_proxy.internal_facilitator import _trustline_auth_headers
-
-    headers = _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
-
-    assert headers == {"Authorization": "Bearer default-token"}
-
-
-def test_internal_trustline_auth_headers_reject_invalid_policy_map(monkeypatch) -> None:
-    monkeypatch.setenv("X402_SECURE_TRUSTLINE_TOKENS_BY_POLICY_JSON", "not-json")
-
-    from x402_proxy.internal_facilitator import _trustline_auth_headers
-
-    try:
-        _trustline_auth_headers({"policy": {"policyId": "pol_xrpl_default"}})
-    except HTTPException as exc:
-        assert exc.status_code == 500
-        assert "must be a JSON object" in str(exc.detail)
-    else:  # pragma: no cover
-        raise AssertionError("Expected invalid policy-token map to fail closed")
+    _evaluate_then_receipt(client, _facilitator_receipt())
+    for token, expected_count in [("lookup-a", 1), ("lookup-b", 0)]:
+        result = client.post(
+            "/internal/x402-secure/facilitator/vi-receipts/lookup",
+            json={"transactions": [{"hash": "ABC123"}]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert result.status_code == 200
+        assert len(result.json()["items"]) == expected_count

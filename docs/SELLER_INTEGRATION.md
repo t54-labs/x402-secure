@@ -685,3 +685,17 @@ if __name__ == "__main__":
 - 📧 Email: support@x402-secure.com
 - 💬 Discord: [Join our community](https://discord.gg/x402secure)
 - 📖 API Docs: [docs.x402-secure.com](https://docs.x402-secure.com)
+
+
+## Settlement outcomes
+
+Serve paid content only after `verify_then_settle` returns a successful result with its
+transaction reference. The SDK raises `PaymentVerificationError` when verification did not
+establish validity, `SettlementDeclined` when the facilitator explicitly declined, and
+`SettlementUnknown` when a pending, malformed or unavailable response leaves the outcome
+unconfirmed. Return without serving the content for all three. Resolve an unknown outcome
+through the facilitator's settlement status or reconciliation flow before authorizing another payment.
+
+`verify_then_settle` forwards the payment authorization from the same verify call.
+HTTP callers using separate calls must send the verify response's `X-PAYMENT-AUTHORIZATION`
+on settle with the same payment, requirements and evidence.

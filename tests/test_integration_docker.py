@@ -248,11 +248,16 @@ class TestDockerIntegration:
 
         # Settle payment
         headers = {
-            "X-PAYMENT": "base64encodedpayment",
             "X-PAYMENT-SECURE": "w3c.v1;tp=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
             "X-RISK-SESSION": sid,
             "Origin": "https://test.example.com",
         }
+
+        verified = await http_client.post(
+            f"{GATEWAY_URL}/x402/verify", json=payment_data, headers=headers
+        )
+        assert verified.status_code == 200 and verified.json()["isValid"] is True
+        headers["X-PAYMENT-AUTHORIZATION"] = verified.headers["X-PAYMENT-AUTHORIZATION"]
 
         response = await http_client.post(
             f"{GATEWAY_URL}/x402/settle", json=payment_data, headers=headers

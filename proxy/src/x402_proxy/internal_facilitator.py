@@ -16,7 +16,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
@@ -135,6 +135,8 @@ class VerifiableIntentChainReference(BaseModel):
 class AP2ReferenceSet(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
+    payment_mandate: Optional[Dict[str, Any]] = Field(default=None, alias="paymentMandate")
+
     intent_mandate_ref: Optional[str] = Field(default=None, alias="intentMandateRef")
     cart_mandate_ref: Optional[str] = Field(default=None, alias="cartMandateRef")
     payment_mandate_ref: Optional[str] = Field(default=None, alias="paymentMandateRef")
@@ -146,6 +148,8 @@ class AP2ReferenceSet(BaseModel):
 
 class TraceReferenceSet(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+    agent_trace: Optional[Dict[str, Any]] = Field(default=None, alias="agentTrace")
 
     risk_session: Optional[str] = Field(default=None, alias="riskSession")
     trace_id: Optional[str] = Field(default=None, alias="traceId")
@@ -188,9 +192,16 @@ class InternalPaymentContext(BaseModel):
     asset: Optional[str] = None
     issuer: Optional[str] = None
     amount: Optional[Any] = None
+    amount_unit: Optional[Literal["xrp", "issued", "drops"]] = Field(
+        default=None, alias="amountUnit"
+    )
+    environment: Optional[str] = None
     currency: Optional[str] = None
     destination: Optional[str] = None
     pay_to: Optional[str] = Field(default=None, alias="payTo")
+    destination_tag: Optional[int] = Field(
+        default=None, alias="destinationTag", ge=0, le=4294967295
+    )
     payer: Optional[str] = None
     payer_wallet: Optional[str] = Field(default=None, alias="payerWallet")
     wallet_address: Optional[str] = Field(default=None, alias="walletAddress")
@@ -314,27 +325,158 @@ def _configured_internal_token() -> Optional[str]:
     )
 
 
-def require_internal_auth(
+_INTERNAL_ACTIONS = {
+    "evaluate": "evaluate",
+    "evidence-session": "evidence_session",
+    "evidence": "evidence_upload",
+    "receipt": "receipt_write",
+    "lookup": "receipt_lookup",
+}
+
+
+class InternalServiceScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, repr=False)
+    trustline_token: Optional[str] = Field(default=None, min_length=1, repr=False)
+    organization: Optional[str] = Field(default=None, min_length=1)
+    environment: Optional[str] = Field(default=None, min_length=1)
+    policy: Optional[str] = Field(default=None, min_length=1)
+    policy_version: Optional[str] = Field(default=None, min_length=1)
+    actions: set[
+        Literal[
+            "evaluate", "evidence_session", "evidence_upload", "receipt_write", "receipt_lookup"
+        ]
+    ]
+
+    @property
+    def receipt_namespace(self) -> str:
+        return _fingerprint([self.organization, self.environment, self.policy, self.policy_version])
+
+
+_service_scope: ContextVar[Optional[InternalServiceScope]] = ContextVar(
+    "internal_service_scope", default=None
+)
+
+
+def _internal_service_scopes() -> list[InternalServiceScope]:
+    try:
+        if _trustline_token_by_org() or _trustline_token_by_policy():
+            raise ValueError("Selector-based credential mapping is unsupported")
+        configured = os.getenv("X402_SECURE_INTERNAL_SERVICES_JSON")
+        if configured is not None:
+            registry = json.loads(configured)
+            if not isinstance(registry, dict) or not registry:
+                raise ValueError("Expected a nonempty service registry")
+            scopes = [InternalServiceScope.model_validate(value) for value in registry.values()]
+            inbound = set()
+            credentials = {}
+            for scope in scopes:
+                if (
+                    not scope.organization
+                    or not scope.environment
+                    or not scope.policy
+                    or not scope.actions
+                ):
+                    raise ValueError(
+                        "Each service needs an organization, environment, policy and actions"
+                    )
+                if scope.token in inbound or (
+                    scope.actions != {"receipt_lookup"} and not scope.trustline_token
+                ):
+                    raise ValueError("Invalid service credential assignment")
+                inbound.add(scope.token)
+                if scope.trustline_token:
+                    prior = credentials.setdefault(scope.trustline_token, scope.receipt_namespace)
+                    if prior != scope.receipt_namespace:
+                        raise ValueError("A credential cannot span service scopes")
+            return scopes
+        expected = _configured_internal_token()
+        if not expected:
+            raise ValueError("Single-service auth token is missing")
+        scope = InternalServiceScope(
+            token=expected,
+            trustline_token=os.getenv("X402_SECURE_INTERNAL_TRUSTLINE_TOKEN"),
+            organization=os.getenv("X402_SECURE_INTERNAL_ORGANIZATION"),
+            environment=os.getenv("X402_SECURE_INTERNAL_ENVIRONMENT"),
+            policy=os.getenv("X402_SECURE_INTERNAL_POLICY"),
+            policy_version=os.getenv("X402_SECURE_INTERNAL_POLICY_VERSION"),
+            actions=set(
+                os.getenv(
+                    "X402_SECURE_INTERNAL_ACTIONS",
+                    "evaluate,evidence_session,evidence_upload,receipt_write",
+                ).split(",")
+            ),
+        )
+        if scope.actions != {"receipt_lookup"} and not scope.trustline_token:
+            raise ValueError("Single-service Trustline credential is missing")
+        return [scope]
+    except (ValueError, HTTPException) as exc:
+        raise HTTPException(
+            status_code=503, detail="Invalid internal facilitator service configuration"
+        ) from exc
+
+
+async def require_internal_auth(
+    request: Request,
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_internal_token: Optional[str] = Header(default=None, alias="X-Internal-Token"),
-) -> None:
-    expected = _configured_internal_token()
-    if not expected:
-        disabled = os.getenv("X402_SECURE_INTERNAL_AUTH_DISABLED", "").lower()
-        if disabled in {"1", "true", "yes"}:
-            return
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal facilitator auth token is not configured",
-        )
+):
+    scopes = _internal_service_scopes()
     supplied = x_internal_token
-    if authorization and authorization.lower().startswith("bearer "):
-        supplied = authorization.split(" ", 1)[1].strip()
-    if not supplied or not secrets.compare_digest(supplied, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid internal token",
-        )
+    if authorization is not None:
+        scheme, _, bearer = authorization.partition(" ")
+        if scheme.lower() != "bearer" or (supplied and supplied != bearer):
+            raise HTTPException(status_code=401, detail="Invalid internal token")
+        supplied = bearer
+    scope = None
+    for candidate in scopes:
+        if supplied and secrets.compare_digest(supplied.encode(), candidate.token.encode()):
+            scope = candidate
+    if scope is None:
+        raise HTTPException(status_code=401, detail="Invalid internal token")
+    action = _INTERNAL_ACTIONS.get(request.url.path.rsplit("/", 1)[-1])
+    if action not in scope.actions:
+        raise HTTPException(status_code=403, detail="Internal action outside service scope")
+    ctx_token = _service_scope.set(scope)
+    try:
+        yield
+    finally:
+        _service_scope.reset(ctx_token)
+
+
+_ORG_SELECTORS = ("developerOrgId", "developer_org_id", "organizationId", "organization_id")
+_POLICY_SELECTORS = ("policyId", "policy_id")
+_ENV_SELECTORS = ("environment", "ledgerEnvironment", "ledger_environment")
+
+
+def _authenticated_scope(payload: Dict[str, Any]) -> InternalServiceScope:
+    scope = _service_scope.get()
+    if scope is None:
+        raise HTTPException(status_code=503, detail="Internal service scope unavailable")
+    metadata = payload.get("metadata") or {}
+    sources = [
+        payload,
+        metadata,
+        payload.get("payment") or {},
+        payload.get("paymentContext") or {},
+        metadata.get("facilitator") or {},
+        payload.get("correlation") or {},
+        _extract_policy(payload),
+    ]
+    for names, expected in (
+        (_ORG_SELECTORS, scope.organization),
+        (_POLICY_SELECTORS, scope.policy),
+        (("policyVersion", "policy_version"), scope.policy_version),
+        (_ENV_SELECTORS, scope.environment),
+    ):
+        for source in sources:
+            for key in names:
+                if key in source and source[key] is not None and source[key] != expected:
+                    raise HTTPException(
+                        status_code=403, detail="Internal selector outside service scope"
+                    )
+    return scope
 
 
 def _canonical_json(value: Any) -> str:
@@ -365,28 +507,18 @@ def _decimal_string(value: Any) -> Optional[str]:
     return text or "0"
 
 
-def _xrpl_amount_from_payload(payment: InternalPaymentContext) -> Optional[str]:
-    raw_amount = payment.payload.get("Amount")
-    if isinstance(raw_amount, dict):
-        return _decimal_string(raw_amount.get("value"))
-    if raw_amount is None:
+def _xrpl_amount(value: Any, unit: str) -> Optional[str]:
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount <= 0 or not -96 <= amount.adjusted() <= 96:
+            return None
+        if unit == "drops":
+            if amount != amount.to_integral_value():
+                return None
+            amount /= Decimal(1000000)
+        return _decimal_string(amount)
+    except (ValueError, InvalidOperation):
         return None
-    asset = str(payment.asset or payment.currency or "XRP").upper()
-    text = str(raw_amount)
-    if asset == "XRP" and text.isdigit():
-        return _decimal_string(Decimal(text) / Decimal("1000000"))
-    return _decimal_string(text)
-
-
-def _xrpl_amount_from_context(payment: InternalPaymentContext) -> Optional[str]:
-    raw_amount = payment.amount
-    if raw_amount is None:
-        return None
-    asset = str(payment.asset or payment.currency or "XRP").upper()
-    text = str(raw_amount)
-    if asset == "XRP" and text.isdigit():
-        return _decimal_string(Decimal(text) / Decimal("1000000"))
-    return _decimal_string(text)
 
 
 def _add_violation(
@@ -403,17 +535,12 @@ def _add_violation(
 
 def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult:
     payload = payment.payload or {}
-    amount_object = payload.get("Amount") if isinstance(payload.get("Amount"), dict) else {}
-    amount = _xrpl_amount_from_payload(payment) or _xrpl_amount_from_context(payment)
-    asset = _first_present(
-        payment.asset,
-        payment.currency,
-        amount_object.get("currency"),
-        payload.get("currency"),
-        "XRP",
-    )
-    issuer = _first_present(payment.issuer, amount_object.get("issuer"), payload.get("issuer"))
-    destination = _first_present(payment.destination, payment.pay_to, payload.get("Destination"))
+    amount_object = payload.get("Amount")
+    amount_terms = amount_object if isinstance(amount_object, dict) else {}
+    asset, issuer, destination = payment.asset, payment.issuer, payment.destination
+    native = asset == "XRP"
+    unit = payment.amount_unit
+    amount = _xrpl_amount(payment.amount, unit) if unit else None
     resource = _first_present(payment.resource, payment.merchant_origin)
     hashes = {
         "paymentPayloadHash": payment.payload_hash or _fingerprint(payload),
@@ -424,8 +551,25 @@ def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult
         hashes["paymentHash"] = payment.payment_hash
 
     violations: List[Dict[str, Any]] = []
-    if not amount:
-        _add_violation(violations, "XRPL_AMOUNT_MISSING", "XRPL amount is required.", "amount")
+    if not amount or unit not in ({"xrp", "drops"} if native else {"issued"}):
+        _add_violation(
+            violations,
+            "XRPL_AMOUNT_INVALID",
+            "Valid XRPL amount and explicit unit are required.",
+            "amount",
+        )
+    if (
+        native
+        and amount
+        and Decimal(amount) * 1000000 != (Decimal(amount) * 1000000).to_integral_value()
+    ):
+        _add_violation(
+            violations, "XRPL_AMOUNT_INVALID", "Native amount must represent whole drops.", "amount"
+        )
+    if not asset or (native and issuer) or (asset and not native and not issuer):
+        _add_violation(
+            violations, "XRPL_ASSET_INVALID", "An issued currency requires its issuer.", "asset"
+        )
     if not destination:
         _add_violation(
             violations,
@@ -433,12 +577,47 @@ def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult
             "XRPL destination account is required.",
             "destination",
         )
-    if str(asset).upper() != "XRP" and not issuer:
+    wrapper_amount = (
+        _xrpl_amount(amount_terms.get("value"), "issued")
+        if isinstance(amount_object, dict)
+        else _xrpl_amount(amount_object, "drops")
+    )
+    if (
+        (
+            amount_object is not None
+            and (not wrapper_amount or wrapper_amount != amount or bool(amount_terms) == native)
+        )
+        or any(
+            candidate is not None and candidate != asset
+            for candidate in (
+                payment.currency,
+                payload.get("currency"),
+                amount_terms.get("currency"),
+            )
+        )
+        or any(
+            candidate is not None and candidate != issuer
+            for candidate in (
+                payload.get("issuer"),
+                amount_terms.get("issuer"),
+            )
+        )
+        or any(
+            candidate is not None and candidate != destination
+            for candidate in (
+                payment.pay_to,
+                payload.get("Destination"),
+            )
+        )
+        or (
+            payload.get("DestinationTag") is not None
+            and str(payload["DestinationTag"]) != str(payment.destination_tag)
+        )
+    ):
         _add_violation(
             violations,
-            "XRPL_ISSUER_MISSING",
-            "Issued XRPL currencies require an issuer.",
-            "issuer",
+            "XRPL_TERMS_CONFLICT",
+            "XRPL sources disagree with the validated payment terms.",
         )
 
     canonical = {
@@ -446,7 +625,9 @@ def _build_xrpl_binding(payment: InternalPaymentContext) -> BindingProfileResult
         "asset": asset,
         "issuer": issuer,
         "amount": amount,
+        "amountUnit": "xrp" if native else "issued",
         "destination": destination,
+        "destinationTag": payment.destination_tag,
         "resource": resource,
         "hashes": hashes,
     }
@@ -517,7 +698,7 @@ def _build_generic_binding(payment: InternalPaymentContext) -> BindingProfileRes
 
 def build_binding_profile(payment: InternalPaymentContext) -> BindingProfileResult:
     chain = str(_first_present(payment.chain, payment.network, "")).lower()
-    if chain == "xrpl":
+    if chain == "xrpl" or chain.startswith("xrpl:"):
         return _build_xrpl_binding(payment)
     return _build_generic_binding(payment)
 
@@ -535,6 +716,8 @@ def _evaluated_payment_binding(
         "payer": _first_present(payment.payer, payment.payer_wallet, payment.wallet_address),
         "destination": binding.destination,
         "amount": binding.amount,
+        "amountUnit": binding.canonical.get("amountUnit"),
+        "destinationTag": payment.destination_tag,
         "asset": binding.asset,
         "issuer": binding.issuer,
     }
@@ -645,52 +828,13 @@ def _extract_policy(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _extract_developer_org_id(payload: Dict[str, Any]) -> Optional[str]:
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    for key in ("developerOrgId", "developer_org_id", "organizationId", "organization_id"):
-        value = metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _extract_policy_id(payload: Dict[str, Any]) -> Optional[str]:
-    policy = _extract_policy(payload)
-    for key in ("policyId", "policy_id"):
-        value = policy.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _trustline_token_for_payload(payload: Dict[str, Any]) -> Optional[str]:
-    org_id = _extract_developer_org_id(payload)
-    if org_id:
-        token = _trustline_token_by_org().get(org_id)
-        if token:
-            return token
-
-    policy_id = _extract_policy_id(payload)
-    if policy_id:
-        token = _trustline_token_by_policy().get(policy_id)
-        if token:
-            return token
-
-    return _default_trustline_token()
-
-
-def _trustline_auth_headers(
-    payload: Optional[Dict[str, Any]] = None,
-    *,
-    route_by_payload: bool = True,
-) -> Dict[str, str]:
-    token = (
-        _trustline_token_for_payload(payload or {})
-        if route_by_payload
-        else _default_trustline_token()
-    )
+def _trustline_auth_headers(payload: Dict[str, Any], *, scoped: bool) -> Dict[str, str]:
+    if scoped:
+        token = _authenticated_scope(payload).trustline_token
+        if not token:
+            raise HTTPException(status_code=503, detail="Scoped Trustline credential is missing")
+    else:
+        token = _default_trustline_token()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -698,14 +842,14 @@ async def _post_trustline_validation(
     path: str,
     payload: Dict[str, Any],
     *,
-    route_by_payload: bool,
+    scoped: bool,
 ) -> Dict[str, Any]:
     base_url = _trustline_base_url()
     if base_url.endswith("/validation"):
         url = f"{base_url}/{path.lstrip('/')}"
     else:
         url = f"{base_url}{_trustline_validation_path(path)}"
-    headers = _trustline_auth_headers(payload, route_by_payload=route_by_payload)
+    headers = _trustline_auth_headers(payload, scoped=scoped)
     correlation_id = _correlation_id_ctx.get()
     if correlation_id:
         headers["X-Correlation-ID"] = correlation_id
@@ -744,14 +888,14 @@ async def _post_trustline_validation(
 
 
 async def post_trustline_validation(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return await _post_trustline_validation(path, payload, route_by_payload=True)
+    return await _post_trustline_validation(path, payload, scoped=True)
 
 
 async def post_trustline_validation_default_auth(
     path: str,
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
-    return await _post_trustline_validation(path, payload, route_by_payload=False)
+    return await _post_trustline_validation(path, payload, scoped=False)
 
 
 def _trustline_facilitator_verify_chain_path() -> str:
@@ -788,11 +932,15 @@ def build_trustline_assessment_payload(
         "protocol": payment.protocol,
         "chain": binding.chain or payment.chain,
         "network": payment.network or binding.chain,
+        "environment": payment.environment,
         "asset": binding.asset or payment.asset or payment.currency,
         "issuer": binding.issuer or payment.issuer,
         "amount": binding.amount or payment.amount,
-        "currency": payment.currency or binding.asset,
+        "amountUnit": binding.canonical.get("amountUnit"),
+        "currency": binding.asset,
         "destination": binding.destination or payment.destination or payment.pay_to,
+        "destinationTag": payment.destination_tag,
+        "invoiceId": payment.invoice_id,
         "merchantId": request.merchant.get("id"),
         "merchantOrigin": merchant_origin,
         "resource": binding.resource or payment.resource,
@@ -835,6 +983,7 @@ def build_trustline_assessment_payload(
         "paymentContext": payment_context,
         "binding": binding.model_dump(by_alias=True, exclude_none=True),
         "ap2Context": ap2_context,
+        "agentTrace": extension.trace.agent_trace if extension.trace else None,
         "traceContext": trace_context,
         "policy": extension.policy.model_dump(by_alias=True),
         "metadata": {
@@ -895,8 +1044,10 @@ def _vi_result_from_trustline_response(trustline_response: Dict[str, Any]) -> Di
     chain = trustline_response.get("chain")
     if not isinstance(chain, dict):
         return {}
-    chain_verified = bool(chain.get("verified"))
-    constraint_ok = chain.get("constraint_satisfied") is not False
+    chain_verified = chain.get("verified") is True
+    constraint_ok = (
+        chain.get("constraint_satisfied") is None or chain.get("constraint_satisfied") is True
+    )
     error_code = chain.get("error_code")
     verified_for_payment = chain_verified and constraint_ok and not error_code
     return {
@@ -977,7 +1128,10 @@ async def evaluate_facilitator_payment(
     _correlation_id_ctx.set(correlation_id)
     extension = _extract_extension(body.extensions)
     binding = build_binding_profile(body.payment)
+    if binding.chain == "xrpl" and not binding.payment_bound:
+        raise HTTPException(status_code=422, detail=binding.violations)
     payload = build_trustline_assessment_payload(body, extension, binding)
+    scope = _authenticated_scope(payload)
     trustline_path = _trustline_facilitator_verify_chain_path()
     try:
         trustline_response = await post_trustline_validation(trustline_path, payload)
@@ -1095,6 +1249,7 @@ async def evaluate_facilitator_payment(
         record_vi_decision_snapshot,
         response,
         payment_binding=_evaluated_payment_binding(body.payment, binding),
+        namespace=scope.receipt_namespace,
     )
     return response
 
@@ -1148,8 +1303,11 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
         "source": "x402_secure_internal_facilitator",
         "receivedAt": datetime.now(timezone.utc).isoformat(),
     }
+    scope = _authenticated_scope(payload)
     response = await post_trustline_validation("verifiable-intent-receipt", payload)
-    await run_in_threadpool(record_vi_receipt_snapshot, payload, response)
+    await run_in_threadpool(
+        record_vi_receipt_snapshot, payload, response, namespace=scope.receipt_namespace
+    )
     return response
 
 
@@ -1161,9 +1319,12 @@ async def record_facilitator_receipt(body: InternalReceiptRequest) -> Dict[str, 
 async def lookup_facilitator_vi_receipts(
     body: ViReceiptLookupRequest,
 ) -> Dict[str, Any] | JSONResponse:
+    scope = _authenticated_scope({})
     transactions = [item.model_dump(by_alias=True, exclude_none=True) for item in body.transactions]
     try:
-        items = await run_in_threadpool(lookup_vi_receipt_statuses, transactions)
+        items = await run_in_threadpool(
+            lookup_vi_receipt_statuses, transactions, namespace=scope.receipt_namespace
+        )
     except VIReceiptStoreUnavailable as exc:
         logger.warning("[INTERNAL] vi_receipt_lookup_unavailable reason=%s", exc)
         return JSONResponse(

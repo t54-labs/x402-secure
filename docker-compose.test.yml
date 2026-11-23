@@ -12,6 +12,7 @@ services:
     environment:
       # Proxy configuration
       - PROXY_LOCAL_RISK=1
+      - PROXY_PAYMENT_AUTHORIZATION_KEY=test-only-key-test-only-key-test-only-key
       - PROXY_UPSTREAM_VERIFY_URL=http://mock-facilitator:8001/verify
       - PROXY_UPSTREAM_SETTLE_URL=http://mock-facilitator:8001/settle
       - AGENT_GATEWAY_URL=http://facilitator-proxy:8000

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any, Dict, Optional
 
@@ -129,13 +128,16 @@ async def run_agent_payment(
         tools=tool_defs,
         reasoning={"effort": "low", "summary": "auto"},
     ) as stream:
-        result = asyncio.get_event_loop().run_until_complete(
-            tracer.process_stream(stream, tools=wrapped_tools)
-        )
+        result = await tracer.process_stream(stream, tools=wrapped_tools)
     tool_results = result.get("tool_results") or {}
     plan = tool_results.get(plan_key)
-    if not plan or plan.get("error"):
+    if not isinstance(plan, dict) or not plan or plan.get("error"):
         raise RuntimeError("agent did not produce a valid payment plan")
+
+    endpoint = plan.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise RuntimeError("payment plan missing endpoint")
+    buyer._seller_url(endpoint)
 
     # Create session + store trace
     rc = RiskClient(gateway_url)
@@ -152,10 +154,6 @@ async def run_agent_payment(
         events=tracer.events,
     )
 
-    # Execute payment
-    endpoint = plan.get("endpoint")
-    if not endpoint:
-        raise RuntimeError("payment plan missing endpoint")
     return await execute_payment_with_tid(
         buyer=buyer,
         endpoint=endpoint,

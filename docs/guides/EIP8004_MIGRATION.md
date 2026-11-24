@@ -30,14 +30,14 @@ The system currently accepts wallet addresses (e.g., `0x1234...5678`) as `agent_
 
 ## What is EIP-8004?
 
-EIP-8004 is an Ethereum standard (finalized October 2025) that enables decentralized AI agent identity management through:
+ERC-8004 is a **Draft** Standards Track ERC, not a finalized Ethereum standard (see the [canonical EIP status](https://eips.ethereum.org/EIPS/eip-8004)). Its proposal describes agent identity, reputation, and validation through:
 
 1. **Portable On-chain Identity**: Each agent is assigned an ERC-721 token (NFT) as their identity
-2. **Decentralized Identifiers (DIDs)**: Uses standard DID format instead of simple addresses
+2. **Agent identifiers**: Registry contracts and agent IDs identify agents. The DID-like format below is an integration proposal, not a normative ERC-8004 DID method.
 3. **Three On-chain Registries**:
    - Identity Registry
    - Reputation Registry
-   - Verification Registry
+   - Validation Registry
 
 ## EIP-8004 DID Format
 

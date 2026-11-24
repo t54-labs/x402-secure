@@ -8,8 +8,7 @@ This guide helps API and service providers accept secure payments from AI agents
 3. [Basic Integration](#basic-integration)
 4. [Risk Management](#risk-management)
 5. [Advanced Features](#advanced-features)
-6. [Dispute Handling](#dispute-handling)
-7. [Production Checklist](#production-checklist)
+6. [Production Checklist](#production-checklist)
 
 ## Prerequisites
 
@@ -43,16 +42,21 @@ pip install x402-secure[agent]
 ### 1. FastAPI Integration
 
 ```python
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
 import base64
 import json
 
 app = FastAPI()
 
-# Initialize seller client
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+# Initialize seller client with the gateway URL (SellerClient appends /x402)
+seller = SellerClient("https://x402-proxy.t54.ai")
 
 @app.post("/api/v1/generate-text")
 async def generate_text(request: Request, prompt: str):
@@ -90,7 +94,10 @@ async def generate_text(request: Request, prompt: str):
     # Verify and settle payment
     try:
         payment_data = json.loads(base64.b64decode(x_payment))
+    except Exception:
+        return JSONResponse({"error": "Invalid X-PAYMENT"}, status_code=402)
 
+    try:
         result = await seller.verify_then_settle(
             payment_data,
             payment_requirements,
@@ -99,35 +106,40 @@ async def generate_text(request: Request, prompt: str):
             x_payment_secure=x_payment_secure,
             risk_sid=risk_session
         )
+    except (PaymentVerificationError, SettlementDeclined):
+        # Verification failed (including a risk deny or review) or settlement was declined
+        return JSONResponse({"error": "Payment declined"}, status_code=402)
+    except SettlementUnknown:
+        return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 
-        # Process the request
-        text_result = await process_text_generation(prompt)
+    # Process the request
+    text_result = await process_text_generation(prompt)
 
-        # Return response with payment receipt
-        response_data = {"result": text_result}
-        return JSONResponse(
-            response_data,
-            headers={"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
-        )
-
-    except Exception as e:
-        # Handle errors - 403 indicates risk denial, other errors are payment failures
-        status_code = 403 if "Risk denied" in str(e) else 402
-        return JSONResponse({"error": str(e)}, status_code=status_code)
+    # Return response with payment receipt
+    response_data = {"result": text_result}
+    return JSONResponse(
+        response_data,
+        headers={"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
+    )
 ```
 
 ### 2. Flask Integration
 
 ```python
 from flask import Flask, request, jsonify
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
+import asyncio
 import base64
 import json
-import anyio
 
 app = Flask(__name__)
 
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+GATEWAY_URL = "https://x402-proxy.t54.ai"  # SellerClient appends /x402
 
 @app.route("/api/v1/analyze", methods=["POST"])
 def analyze_data():
@@ -158,12 +170,16 @@ def analyze_data():
             "error": "Payment required"
         }), 402
 
-    # Verify and settle payment
     try:
         payment_data = json.loads(base64.b64decode(x_payment))
+    except Exception:
+        return jsonify({"error": "Invalid X-PAYMENT"}), 402
 
-        # Note: SellerClient is async-only. For Flask, wrap with an async runner:
-        async def _verify_and_settle():
+    # SellerClient is async-only. Its httpx.AsyncClient cannot be reused across
+    # event loops, so create one per call inside the loop that asyncio.run starts.
+    async def _verify_and_settle():
+        seller = SellerClient(GATEWAY_URL)
+        try:
             return await seller.verify_then_settle(
                 payment_data,
                 payment_requirements,
@@ -172,23 +188,26 @@ def analyze_data():
                 x_payment_secure=x_payment_secure,
                 risk_sid=risk_session
             )
+        finally:
+            await seller.http.aclose()
 
-        result = anyio.from_thread.run(_verify_and_settle)
+    try:
+        result = asyncio.run(_verify_and_settle())
+    except (PaymentVerificationError, SettlementDeclined):
+        return jsonify({"error": "Payment declined"}), 402
+    except SettlementUnknown:
+        return jsonify({"error": "Settlement could not be confirmed"}), 502
 
-        # Process request
-        data = request.json
-        analysis_result = analyze_user_data(data)
+    # Process request
+    data = request.json
+    analysis_result = analyze_user_data(data)
 
-        return jsonify({
-            "result": analysis_result
-        }), 200, {"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
-
-    except Exception as e:
-        status_code = 403 if "Risk denied" in str(e) else 402
-        return jsonify({"error": str(e)}), status_code
+    return jsonify({
+        "result": analysis_result
+    }), 200, {"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
 ```
 
-> **Note**: The SellerClient is async-only. For Flask, you must use an async runner like `anyio.from_thread.run()` or consider using an async-capable framework like FastAPI for endpoints that handle payments.
+> **Note**: SellerClient is async-only. In Flask, run it with `asyncio.run(...)` and a client created per call, as above, or use an async framework such as FastAPI.
 
 ### 3. Payment Headers
 
@@ -211,7 +230,7 @@ X-AP2-EVIDENCE: evd.v1;mr=<ref>;ms=<sha256_b64url>;mt=application/json;sz=<bytes
 - `Origin`: Buyer's origin (for AP2 origin binding)
 
 **Optional Headers:**
-- `X-AP2-EVIDENCE`: AP2 mandate reference (format: `evd.v1;mr=...;ms=...;mt=application/json;sz=...`)
+- `X-AP2-EVIDENCE`: AP2 mandate reference (format: `evd.v1;mr=...;ms=...;mt=application/json;sz=...`), or base64(JSON signed AP2 evidence); see `protocol-spec/openapi.yaml`
 
 Your service forwards these headers to the proxy via `SellerClient`; the proxy validates them and calls the risk engine before forwarding to the upstream facilitator.
 
@@ -224,7 +243,7 @@ Risk evaluation happens **inside the proxy** before payment verification reaches
 1. Your service calls `seller.verify_then_settle(...)` with payment headers
 2. The proxy calls `/risk/evaluate` with session ID, trace context, and payment data
 3. The risk engine returns a decision: `allow`, `deny`, or `review`
-4. If `deny`, the proxy returns 403 with an error message
+4. If `deny` or `review`, the proxy returns 403 with an error body (`RISK_DENIED` or `RISK_REVIEW`); `SellerClient` raises `PaymentVerificationError`
 5. If `allow`, the proxy forwards the request to the upstream facilitator
 
 ### Handling Risk Decisions
@@ -232,12 +251,17 @@ Risk evaluation happens **inside the proxy** before payment verification reaches
 ```python
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
 import base64
 import json
 
 app = FastAPI()
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+seller = SellerClient("https://x402-proxy.t54.ai")  # SellerClient appends /x402
 
 @app.post("/api/premium-feature")
 async def premium_feature(request: Request):
@@ -267,7 +291,10 @@ async def premium_feature(request: Request):
 
     try:
         payment_data = json.loads(base64.b64decode(x_payment))
+    except Exception:
+        return JSONResponse({"error": "Invalid X-PAYMENT"}, status_code=402)
 
+    try:
         # Proxy handles risk evaluation internally
         result = await seller.verify_then_settle(
             payment_data,
@@ -277,64 +304,52 @@ async def premium_feature(request: Request):
             x_payment_secure=x_payment_secure,
             risk_sid=risk_session
         )
+    except (PaymentVerificationError, SettlementDeclined):
+        # A risk deny or review, a failed verification and a declined settlement
+        # all raise one of these; SellerClient does not expose the proxy status.
+        return JSONResponse({"error": "Payment declined"}, status_code=402)
+    except SettlementUnknown:
+        return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 
-        # Risk passed - deliver service
-        return {"data": "Premium content delivered"}
-
-    except Exception as e:
-        error_msg = str(e)
-
-        # Handle risk denial (403 from proxy)
-        if "Risk denied" in error_msg or "403" in error_msg:
-            return JSONResponse(
-                {"error": "Payment denied by risk assessment", "details": error_msg},
-                status_code=403
-            )
-
-        # Handle other payment failures
-        return JSONResponse(
-            {"error": "Payment verification failed", "details": error_msg},
-            status_code=402
-        )
+    # Risk passed and payment settled - deliver service
+    return {"data": "Premium content delivered"}
 ```
 
 ### Risk Response Headers
 
-The proxy adds these headers to responses (for observability):
+The proxy adds these headers to successful `/x402/verify` and `/x402/settle` responses (for observability):
 
-- `X-Risk-Decision`: The decision value (`allow`, `deny`, `review`)
+- `X-Risk-Decision`: `allow` (set only on successful responses; failures return an error body with `error.code`, e.g. `RISK_DENIED`, `RISK_REVIEW`)
 - `X-Risk-Decision-ID`: Unique ID for this risk evaluation
 - `X-Risk-TTL-Seconds`: How long this decision is valid
 
-**Note**: The current `SellerClient` returns only the JSON body. To access these headers in your service, you would need to call the proxy endpoints directly with `httpx` instead of using the SDK wrapper.
+**Note**: `SellerClient` returns only the JSON body. After a verify call, `SellerClient.last_vi_headers` holds `X-PAYMENT-AUTHORIZATION`, `X-VI-DECISION-ID` and `X-VI-EVIDENCE-REF` when present. To read the `X-Risk-*` headers, call the proxy endpoints directly with `httpx`.
 
 ### Error Handling Best Practices
+
+`SellerClient` does not raise `httpx.HTTPStatusError`. It wraps every failure in one of three exceptions, and does not pass on the proxy's status code or error body:
 
 ```python
 try:
     result = await seller.verify_then_settle(...)
-except httpx.HTTPStatusError as e:
-    if e.response.status_code == 403:
-        # Risk engine denied the payment
-        log_risk_denial(e.response.json())
-        return JSONResponse({"error": "Payment denied"}, status_code=403)
-    elif e.response.status_code == 422:
-        # Validation error (bad headers, AP2 mismatch, etc.)
-        return JSONResponse({"error": "Invalid payment data"}, status_code=422)
-    else:
-        # Other payment failures
-        return JSONResponse({"error": "Payment failed"}, status_code=402)
-except Exception as e:
-    # Network or unexpected errors
-    log_error(e)
-    return JSONResponse({"error": "Service unavailable"}, status_code=503)
+except PaymentVerificationError:
+    # Verification failed: risk deny/review, invalid payment, bad headers or proxy error
+    return JSONResponse({"error": "Payment declined"}, status_code=402)
+except SettlementDeclined:
+    # The facilitator explicitly declined settlement
+    return JSONResponse({"error": "Payment declined"}, status_code=402)
+except SettlementUnknown:
+    # Settlement outcome not confirmed; do not serve the content
+    return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 ```
+
+See [Settlement outcomes](#settlement-outcomes) for how to treat each case.
 
 ## Advanced Features
 
 ### AP2 Policy Enforcement
 
-You can enforce agent payment protection (AP2) requirements by adding policy flags to your payment requirements:
+You can enforce Agent Payments Protocol (AP2) requirements by adding policy flags to your payment requirements:
 
 ```python
 payment_requirements = {
@@ -365,13 +380,13 @@ payment_requirements = {
 
 **Supported AP2 Policy Flags:**
 
-- `requireTrace` (bool): Require agent trace context in payment
-- `requireIntentMandate` (bool): Require intent_uid in AP2 evidence
-- `requireCartMandate` (bool): Require cart_uid in AP2 evidence
-- `requirePaymentMandate` (bool): Require payment_uid in AP2 evidence
-- `acceptedMerchantIds` (list): Whitelist of accepted merchant DIDs
+Setting any of these flags requires signed AP2 evidence (base64 JSON in `X-AP2-EVIDENCE` or the body's `ap2EvidenceHeader`, with `sig` and `notAfter`). The buyer SDK does not produce it yet, so payments from SDK buyers fail with 422 when any flag is set.
 
-When a buyer provides the optional `X-AP2-EVIDENCE` header, the proxy validates:
+- `requireTrace`: evidence must include `trace_uid`
+- `requireIntentMandate` / `requireCartMandate` / `requirePaymentMandate`: evidence must include `intent_uid` / `cart_uid` / `payment_uid`
+- `acceptedMerchantIds`: `did:web:<host>` entries; the `resource` host must match one of them
+
+When AP2 evidence is present or required, the proxy validates:
 - Origin binding (originHash matches Origin header)
 - Payment hash binding (paymentHash matches X-PAYMENT)
 - TTL (notBefore/notAfter/exp timestamps)
@@ -392,6 +407,8 @@ async def multi_currency_endpoint(request: Request):
             "scheme": "exact",
             "network": "base-sepolia",
             "resource": str(request.url),
+            "description": "Multi-currency API",
+            "mimeType": "application/json",
             "payTo": "0xYourWalletAddress",
             "maxTimeoutSeconds": 30
         }
@@ -403,24 +420,14 @@ async def multi_currency_endpoint(request: Request):
             "extra": {"name": "USDC", "version": "2"}
         }
 
-        usdt_option = {
-            **base_requirements,
-            "asset": "0x...",  # USDT address
-            "maxAmountRequired": "1000000",  # 1.00 USDT
-            "extra": {"name": "USDT", "version": "2"}
-        }
-
-        dai_option = {
-            **base_requirements,
-            "asset": "0x...",  # DAI address
-            "maxAmountRequired": "1050000",  # 1.05 DAI (slight premium)
-            "extra": {"name": "DAI", "version": "2"}
-        }
+        # Add more options the same way. Only offer tokens that implement
+        # EIP-3009 (e.g. USDC); extra.name/version must match the token's
+        # EIP-712 domain.
 
         return JSONResponse(
             {
                 "x402Version": 1,
-                "accepts": [usdc_option, usdt_option, dai_option],
+                "accepts": [usdc_option],
                 "error": "Payment required"
             },
             status_code=402
@@ -431,43 +438,6 @@ async def multi_currency_endpoint(request: Request):
 ```
 
 **Note**: The proxy automatically strips non-standard fields from `extra` before forwarding to the upstream facilitator, keeping only `name` and `version` for EIP-3009 signing.
-
-> **Note**: The following examples demonstrate conceptual patterns for advanced payment scenarios. Some features like subscriptions, usage-based billing, and automated dispute handling are planned enhancements. For current implementation, focus on the basic integration pattern shown above.
-
-### 1. Streaming Responses with Payment
-
-```python
-from fastapi.responses import StreamingResponse
-
-@app.post("/api/stream")
-async def stream_response(request: Request):
-    # Check payment headers first
-    payment_headers = {
-        "x_payment": request.headers.get("X-PAYMENT"),
-        "x_payment_secure": request.headers.get("X-PAYMENT-SECURE"),
-        "risk_session": request.headers.get("X-RISK-SESSION")
-    }
-
-    if not all(payment_headers.values()):
-        raise HTTPException(402, "Payment required")
-
-    async def generate():
-        try:
-            # Start streaming
-            for chunk in await generate_ai_response():
-                yield chunk
-
-            # Settle after successful completion
-            # Note: In production, implement proper payment settlement
-            # await seller.settle_payment(...)
-
-        except Exception as e:
-            # Handle errors appropriately
-            # In production, implement refund logic if needed
-            raise
-
-    return StreamingResponse(generate())
-```
 
 ### Planned Features
 
@@ -507,7 +477,7 @@ For updates on these features, see our [GitHub roadmap](https://github.com/t54-l
   - [ ] Honor 4xx/5xx from proxy and surface X-Request-ID for support
 
 - [ ] **Settlement**
-  - [ ] Always settle after delivery
+  - [ ] Deliver only after settlement succeeds
   - [ ] Handle settlement failures
   - [ ] Implement retry logic for safe failures
 
@@ -515,7 +485,7 @@ For updates on these features, see our [GitHub roadmap](https://github.com/t54-l
   - [ ] Log all payment attempts with X-Request-ID
   - [ ] Log X-Risk-* headers from proxy responses (if accessing directly)
   - [ ] Monitor validation and settlement failures
-  - [ ] Track 403 (risk denial) vs 422 (validation) vs other errors
+  - [ ] Track verification failures vs declined vs unconfirmed settlements
 
 ### Compliance
 
@@ -556,31 +526,44 @@ For updates on these features, see our [GitHub roadmap](https://github.com/t54-l
 ```python
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
 import base64
 import json
 import logging
-import httpx
 
 app = FastAPI(title="AI Service API")
 logger = logging.getLogger(__name__)
 
-# Initialize seller client
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+# Initialize seller client with the gateway URL (SellerClient appends /x402)
+seller = SellerClient("https://x402-proxy.t54.ai")
 
-# Payment requirements for your service
-PAYMENT_REQUIREMENTS = {
-    "scheme": "exact",
-    "network": "base-sepolia",
-    "maxAmountRequired": "1000000",  # 1.00 USDC
-    "payTo": "0xYourWalletAddress",
-    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC
-    "description": "AI Content Generation"
-}
+
+def payment_requirements_for(request: Request) -> dict:
+    # resource must be the URL of this request, so build the quote per request
+    return {
+        "scheme": "exact",
+        "network": "base-sepolia",
+        "maxAmountRequired": "1000000",  # 1.00 USDC
+        "resource": str(request.url),
+        "description": "AI Content Generation",
+        "mimeType": "application/json",
+        "payTo": "0xYourWalletAddress",
+        "maxTimeoutSeconds": 30,
+        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC
+        "extra": {"name": "USDC", "version": "2"},
+    }
+
 
 # Protected endpoint
 @app.post("/api/v1/generate")
 async def generate_content(request: Request, prompt: str):
+    payment_requirements = payment_requirements_for(request)
+
     # Get payment headers
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
@@ -593,76 +576,53 @@ async def generate_content(request: Request, prompt: str):
         return JSONResponse(
             {
                 "x402Version": 1,
-                "accepts": [PAYMENT_REQUIREMENTS],
+                "accepts": [payment_requirements],
                 "error": "Payment required"
             },
             status_code=402
         )
 
     try:
-        # Decode payment data
         payment_data = json.loads(base64.b64decode(x_payment))
+    except Exception:
+        return JSONResponse({"error": "Invalid X-PAYMENT"}, status_code=402)
 
-        logger.info(f"Processing payment from session {risk_session}")
+    logger.info(f"Processing payment from session {risk_session}")
 
-        # Verify and settle payment
+    try:
         result = await seller.verify_then_settle(
             payment_data,
-            PAYMENT_REQUIREMENTS,
+            payment_requirements,
             x_payment_b64=x_payment,
             origin=origin,
             x_payment_secure=x_payment_secure,
             risk_sid=risk_session
         )
+    except (PaymentVerificationError, SettlementDeclined) as e:
+        logger.warning(f"Payment declined: {type(e).__name__}")
+        return JSONResponse({"error": "Payment declined"}, status_code=402)
+    except SettlementUnknown:
+        logger.error("Settlement outcome unknown; reconcile before retrying")
+        return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 
-        # Process the AI request
-        logger.info(f"Generating content for prompt: {prompt[:50]}...")
-        ai_result = await ai_generate(prompt)
+    # Process the AI request
+    logger.info(f"Generating content for prompt: {prompt[:50]}...")
+    ai_result = await ai_generate(prompt)
 
-        # Return response with payment receipt
-        response_data = {
-            "result": ai_result,
-            "usage": {"prompt_tokens": 100, "completion_tokens": 200}
+    # Return response with payment receipt
+    response_data = {
+        "result": ai_result,
+        "usage": {"prompt_tokens": 100, "completion_tokens": 200}
+    }
+
+    return JSONResponse(
+        response_data,
+        headers={
+            "X-PAYMENT-RESPONSE": base64.b64encode(
+                json.dumps(result).encode()
+            ).decode()
         }
-
-        return JSONResponse(
-            response_data,
-            headers={
-                "X-PAYMENT-RESPONSE": base64.b64encode(
-                    json.dumps(result).encode()
-                ).decode()
-            }
-        )
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error processing payment: {e.response.status_code}")
-
-        # Handle different error types
-        if e.response.status_code == 403:
-            # Risk engine denied the payment
-            return JSONResponse(
-                {"error": "Payment denied by risk assessment"},
-                status_code=403
-            )
-        elif e.response.status_code == 422:
-            # Validation error (bad headers, AP2 mismatch, etc.)
-            return JSONResponse(
-                {"error": "Invalid payment data", "details": str(e)},
-                status_code=422
-            )
-        else:
-            # Other payment failures
-            return JSONResponse(
-                {"error": "Payment verification failed", "details": str(e)},
-                status_code=402
-            )
-
-    except Exception as e:
-        logger.error(f"Unexpected error processing request: {e}")
-        return JSONResponse(
-            {"error": "Service unavailable", "details": str(e)},
-            status_code=503
-        )
+    )
 
 # Health check (no payment required)
 @app.get("/health")
@@ -677,7 +637,7 @@ async def ai_generate(prompt: str) -> str:
 # Start server
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8010)  # 8000 is the local proxy's default
 ```
 
 ## Support

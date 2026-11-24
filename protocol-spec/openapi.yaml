@@ -18,8 +18,8 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
 servers:
-  - url: <TRUSTLINE_API_URL>
-    description: Production Trustline API
+  - url: <X402_SECURE_PROXY_URL>
+    description: Hosted or self-hosted x402-secure proxy
   - url: http://localhost:8000
     description: Local development server
 tags:
@@ -28,8 +28,27 @@ tags:
   - name: x402 Proxy
     description: Payment verification and settlement proxy endpoints
   - name: Internal
-    description: Internal endpoints used by the proxy (not for direct client use)
+    description: Hosted-facilitator endpoints; require an internal bearer token
+  - name: Health
+    description: Liveness check
 paths:
+  /health:
+    get:
+      summary: Liveness check
+      operationId: health
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Proxy is running
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+
   /risk/session:
     post:
       summary: Create risk session
@@ -57,7 +76,8 @@ paths:
                   description: Agent DID (currently often same as wallet address; future DID formats)
                 wallet_address:
                   type: string
-                  description: EVM wallet address (0x...; future multi-chain support)
+                  pattern: '^0x.{40}$'
+                  description: EVM wallet address (0x followed by 40 characters); invalid values return 422
                 agent_endpoint:
                   type: string
                   nullable: true
@@ -92,8 +112,8 @@ paths:
         and runtime behavior. This data is used by Trustline for logic-level risk assessment
         and evidence-based validation.
 
-        Note: agent_trace must include all required fields (task, parameters, environment,
-        events, model_config, session_context, completed_at). See AgentTraceData schema.
+        agent_trace is optional at the proxy, which does not validate its fields. Send the
+        AgentTraceData fields you have; the risk engine may reject or down-score incomplete traces.
       tags:
         - Risk Management
       requestBody:
@@ -102,7 +122,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [sid, agent_trace]
+              required: [sid]
               properties:
                 sid:
                   type: string
@@ -119,7 +139,9 @@ paths:
                   nullable: true
                   description: Additional telemetry data (optional)
                 agent_trace:
-                  $ref: '#/components/schemas/AgentTraceData'
+                  nullable: true
+                  allOf:
+                    - $ref: '#/components/schemas/AgentTraceData'
       responses:
         '200':
           description: Trace stored
@@ -137,6 +159,9 @@ paths:
     get:
       summary: Query stored agent trace by trace ID
       operationId: getRiskTrace
+      description: |
+        Local mode only (PROXY_LOCAL_RISK=1). Returns 501 when the proxy forwards to a risk
+        engine. Requires no authentication.
       tags:
         - Risk Management
       parameters:
@@ -151,7 +176,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [sid, agent_trace]
+                required: [sid]
                 properties:
                   sid:
                     type: string
@@ -165,7 +190,9 @@ paths:
                     additionalProperties: true
                     nullable: true
                   agent_trace:
-                    $ref: '#/components/schemas/AgentTraceData'
+                    nullable: true
+                    allOf:
+                      - $ref: '#/components/schemas/AgentTraceData'
         '404':
           description: Trace not found
           content:
@@ -174,73 +201,51 @@ paths:
                 type: object
                 properties:
                   error: { type: object }
-        '4XX': { $ref: '#/components/responses/Error' }
-        '5XX': { $ref: '#/components/responses/Error' }
-
-  /risk/session/{sid}:
-    get:
-      summary: Query session by session ID
-      operationId: getRiskSession
-      tags:
-        - Risk Management
-      parameters:
-        - in: path
-          name: sid
-          required: true
-          schema: { type: string, format: uuid }
-      responses:
-        '200':
-          description: Session data
+        '501':
+          description: Not available in forward mode
           content:
             application/json:
-              schema:
-                type: object
-                required: [agent_id, expires_at]
-                properties:
-                  agent_id: { type: string }
-                  app_id: { type: string, nullable: true }
-                  device: { type: object, additionalProperties: true, nullable: true }
-                  expires_at: { type: string, format: date-time }
-        '404':
-          description: Session not found
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error: { type: object }
+              schema: { $ref: '#/components/schemas/HTTPError' }
         '4XX': { $ref: '#/components/responses/Error' }
         '5XX': { $ref: '#/components/responses/Error' }
 
   /risk/evaluate:
     post:
-      summary: Evaluate payment risk (internal use by proxy)
+      summary: Evaluate payment risk
       operationId: evaluateRisk
       description: |
-        Internal endpoint called by proxy to evaluate risk based on session, trace, and payment context.
-        In production mode (PROXY_LOCAL_RISK=0), this forwards to Trustline risk engine for:
-        - Logic-level evidence evaluation
-        - Prompt injection detection
-        - Agent behavior analysis
-        - Multi-factor risk assessment including code auditing and TEE attestation
+        Evaluates risk for a session/trace/payment. The proxy calls it during /x402/verify
+        (and /x402/settle when PROXY_SETTLE_RISK_ENABLED=1). The route is mounted on the
+        gateway and requires no authentication. With PROXY_LOCAL_RISK=1 it returns a local
+        decision; with PROXY_LOCAL_RISK=0 it forwards to RISK_ENGINE_URL. A decision obtained
+        here does not authorize settlement; only /x402/verify issues X-PAYMENT-AUTHORIZATION.
       tags:
-        - Internal
+        - Risk Management
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [sid, payment]
+              required: [sid, trace_context, payment]
               properties:
                 sid: { type: string, format: uuid }
                 tid: { type: string, format: uuid, nullable: true }
                 trace_context:
                   type: object
+                  required: [tp]
                   properties:
                     tp: { type: string, description: W3C traceparent }
-                    ts: { type: string, description: URL-encoded tracestate, nullable: true }
-                mandate: { type: object, additionalProperties: true, nullable: true }
+                    ts: { type: string, description: ts value from X-PAYMENT-SECURE, nullable: true }
+                mandate:
+                  type: object
+                  nullable: true
+                  required: [ref, sha256_b64url, mime, size]
+                  properties:
+                    ref: { type: string }
+                    sha256_b64url: { type: string }
+                    mime: { type: string }
+                    size: { type: integer }
                 payment:
                   $ref: '#/components/schemas/PaymentContext'
       responses:
@@ -253,10 +258,12 @@ paths:
                 required: [decision, decision_id]
                 properties:
                   decision: { type: string, enum: [allow, deny, review] }
-                  decision_id: { type: string, format: uuid }
-                  ttl_seconds: { type: integer }
+                  decision_id: { type: string }
+                  ttl_seconds: { type: integer, default: 300 }
                   reasons: { type: array, items: { type: string } }
                   risk_level: { type: string, enum: [high, medium, low], default: low }
+                  used_mandate: { type: boolean, default: false }
+                  warnings: { type: array, items: { type: string } }
                   extra: { type: object, additionalProperties: true }
         '4XX': { $ref: '#/components/responses/Error' }
         '5XX': { $ref: '#/components/responses/Error' }
@@ -332,6 +339,16 @@ paths:
                 type: object
                 additionalProperties: true
         '401': { $ref: '#/components/responses/Error' }
+        '403':
+          description: Token valid but the action, or a request selector (organization, environment, policy), is outside its service scope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          description: Internal service registry misconfigured, or Trustline unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
         '5XX': { $ref: '#/components/responses/Error' }
 
   /internal/x402-secure/facilitator/evidence:
@@ -357,6 +374,16 @@ paths:
                 type: object
                 additionalProperties: true
         '401': { $ref: '#/components/responses/Error' }
+        '403':
+          description: Token valid but the action, or a request selector (organization, environment, policy), is outside its service scope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          description: Internal service registry misconfigured, or Trustline unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
         '5XX': { $ref: '#/components/responses/Error' }
 
   /internal/x402-secure/facilitator/receipt:
@@ -382,7 +409,75 @@ paths:
                 type: object
                 additionalProperties: true
         '401': { $ref: '#/components/responses/Error' }
+        '403':
+          description: Token valid but the action, or a request selector (organization, environment, policy), is outside its service scope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          description: Internal service registry misconfigured, or Trustline unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
         '5XX': { $ref: '#/components/responses/Error' }
+
+  /internal/x402-secure/facilitator/vi-receipts/lookup:
+    post:
+      summary: Look up stored VI receipt status for settled transactions
+      operationId: lookupInternalFacilitatorViReceipts
+      description: Requires a token granted the receipt_lookup action.
+      tags:
+        - Internal
+      security:
+        - InternalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                transactions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      hash: { type: string, nullable: true }
+                      transactionHash: { type: string, nullable: true }
+                      invoiceId: { type: string, nullable: true }
+                      rawMemo: { type: string, nullable: true }
+      responses:
+        '200':
+          description: Receipts found in the caller's service scope
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { type: object, additionalProperties: true } }
+        '401':
+          description: Missing or invalid internal token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '403':
+          description: Token valid but receipt_lookup is outside its service scope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HTTPError' }
+        '503':
+          description: No shared receipt store is configured or reachable, or the service registry is misconfigured
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reason: { type: string, enum: [vi_receipt_store_unavailable] }
+                  retryable: { type: boolean }
+                  detail: { type: string }
 
   /x402/verify:
     post:
@@ -392,17 +487,21 @@ paths:
         Verify x402 payment with Trustline risk assessment before forwarding to upstream facilitator.
         Supports AP2 integration through X-AP2-EVIDENCE header for enhanced agent payment protection.
         Risk decisions are made based on agent behavior, mandate compliance, and logic-level analysis.
+        Returns 503 when the proxy is misconfigured (missing PROXY_PAYMENT_AUTHORIZATION_KEY or
+        invalid PROXY_PUBLIC_MERCHANT_POLICY_JSON).
       tags:
         - x402 Proxy
       parameters:
         - in: header
           name: X-PAYMENT
-          required: true
+          required: false
+          description: When present, must decode to the same JSON as paymentPayload (else 422); more than one is rejected.
           schema: { type: string }
         - in: header
           name: X-PAYMENT-SECURE
           required: true
-          schema: { type: string, description: "w3c.v1;tp=<traceparent>[;ts=<url-encoded-tracestate>]" }
+          description: Missing or invalid → 400 TRACE_HEADER_INVALID.
+          schema: { type: string, description: "w3c.v1;tp=<traceparent>[;ts=<url-encoded value>]" }
         - in: header
           name: X-RISK-SESSION
           required: true
@@ -410,11 +509,22 @@ paths:
         - in: header
           name: X-AP2-EVIDENCE
           required: false
+          description: Mandate reference (evd.v1;...) or, when the value does not start with "evd.v1;", base64 signed AP2 evidence JSON.
           schema: { type: string, description: evd.v1;mr=<ref>;ms=<sha256b64url>;mt=application/json;sz=<bytes> }
         - in: header
           name: Origin
-          required: true
+          required: false
+          description: When present, must equal the origin of paymentRequirements.resource for AP2 evidence.
           schema: { type: string }
+        - in: header
+          name: X-RISK-TRACE
+          required: false
+          description: tid from /risk/trace (UUID v1 or v4). If absent, the proxy reads tid from the ts field of X-PAYMENT-SECURE.
+          schema: { type: string, format: uuid }
+        - in: header
+          name: X-VERIFIABLE-INTENT
+          required: false
+          schema: { type: string, maxLength: 4096, description: "vi.v1;ref=<ref>;sha256=sha256:<hex>;mt=<media-type>;sz=<bytes>" }
       requestBody:
         required: true
         content:
@@ -422,10 +532,20 @@ paths:
             schema:
               type: object
               required: [x402Version, paymentPayload, paymentRequirements]
+              additionalProperties: true
+              description: |
+                paymentPayload.x402Version must equal x402Version, and paymentPayload.scheme/network
+                must match paymentRequirements.
               properties:
                 x402Version: { type: integer, enum: [1] }
                 paymentPayload: { type: object }
                 paymentRequirements: { type: object }
+                ap2EvidenceHeader: { type: string, description: base64(JSON signed AP2 evidence) if not sent in X-AP2-EVIDENCE }
+                verifiableIntent: { type: object, additionalProperties: true, description: Inline Verifiable Intent evidence or reference metadata }
+                ap2Context: { type: object, additionalProperties: true, description: AP2 mandate references or inline mandate context }
+                traceContext: { type: object, additionalProperties: true, description: Agent trace context supplied by SDKs or facilitators }
+                viPolicy: { type: object, additionalProperties: true, description: Per-request Verifiable Intent policy overrides }
+                policy: { type: object, additionalProperties: true, description: Generic policy object accepted for facilitator compatibility }
       responses:
         '200':
           description: Upstream facilitator response (normalized)
@@ -438,19 +558,41 @@ paths:
                   isValid: { type: boolean }
                   payer: { type: string }
                   invalidReason: { type: string, nullable: true }
+          headers:
+            X-PAYMENT-AUTHORIZATION:
+              description: Present only when isValid is true. Pass unchanged to /x402/settle.
+              schema: { type: string }
+            X-Request-ID: { schema: { type: string } }
+            X-Risk-Decision: { schema: { type: string, enum: [allow] } }
+            X-Risk-Decision-ID: { schema: { type: string } }
+            X-Risk-TTL-Seconds: { schema: { type: integer } }
+            X-VI-Decision: { schema: { type: string, enum: [allow] } }
+            X-VI-Decision-ID: { schema: { type: string } }
+            X-VI-Verified: { schema: { type: string, enum: ["true", "false"] } }
+            X-VI-Evidence-Ref: { schema: { type: string } }
+        '503': { $ref: '#/components/responses/Error' }
         '4XX': { $ref: '#/components/responses/Error' }
         '5XX': { $ref: '#/components/responses/Error' }
 
   /x402/settle:
     post:
-      summary: Settle payment (optional risk gating based on env)
+      summary: Settle a payment previously allowed by /x402/verify
       operationId: proxySettle
+      description: |
+        Requires the X-PAYMENT-AUTHORIZATION returned by /x402/verify for the same payment,
+        requirements and evidence. PROXY_SETTLE_RISK_ENABLED=1 adds a second risk evaluation.
       tags:
         - x402 Proxy
       parameters:
         - in: header
-          name: X-PAYMENT
+          name: X-PAYMENT-AUTHORIZATION
           required: true
+          description: Token returned by /x402/verify for this exact payment. Missing, altered, expired or mismatched → 403 PAYMENT_AUTHORIZATION_REQUIRED.
+          schema: { type: string, maxLength: 4096 }
+        - in: header
+          name: X-PAYMENT
+          required: false
+          description: When present, must decode to the same JSON as paymentPayload (else 422); more than one is rejected.
           schema: { type: string }
         - in: header
           name: X-PAYMENT-SECURE
@@ -463,10 +605,31 @@ paths:
         - in: header
           name: X-AP2-EVIDENCE
           required: false
+          description: Mandate reference (evd.v1;...) or, when the value does not start with "evd.v1;", base64 signed AP2 evidence JSON.
           schema: { type: string }
         - in: header
           name: Origin
-          required: true
+          required: false
+          description: When present, must equal the origin of paymentRequirements.resource for AP2 evidence.
+          schema: { type: string }
+        - in: header
+          name: X-RISK-TRACE
+          required: false
+          description: tid from /risk/trace (UUID v1 or v4). If absent, the proxy reads tid from the ts field of X-PAYMENT-SECURE.
+          schema: { type: string, format: uuid }
+        - in: header
+          name: X-VERIFIABLE-INTENT
+          required: false
+          schema: { type: string, maxLength: 4096, description: "vi.v1;ref=<ref>;sha256=sha256:<hex>;mt=<media-type>;sz=<bytes>" }
+        - in: header
+          name: X-SETTLEMENT-ATTEMPT-ID
+          required: false
+          description: Copied into the VI receipt.
+          schema: { type: string }
+        - in: header
+          name: X-IDEMPOTENCY-KEY
+          required: false
+          description: Copied into the VI receipt.
           schema: { type: string }
       requestBody:
         required: true
@@ -475,10 +638,20 @@ paths:
             schema:
               type: object
               required: [x402Version, paymentPayload, paymentRequirements]
+              additionalProperties: true
+              description: |
+                paymentPayload.x402Version must equal x402Version, and paymentPayload.scheme/network
+                must match paymentRequirements.
               properties:
                 x402Version: { type: integer, enum: [1] }
                 paymentPayload: { type: object }
                 paymentRequirements: { type: object }
+                ap2EvidenceHeader: { type: string, description: base64(JSON signed AP2 evidence) if not sent in X-AP2-EVIDENCE }
+                verifiableIntent: { type: object, additionalProperties: true, description: Inline Verifiable Intent evidence or reference metadata }
+                ap2Context: { type: object, additionalProperties: true, description: AP2 mandate references or inline mandate context }
+                traceContext: { type: object, additionalProperties: true, description: Agent trace context supplied by SDKs or facilitators }
+                viPolicy: { type: object, additionalProperties: true, description: Per-request Verifiable Intent policy overrides }
+                policy: { type: object, additionalProperties: true, description: Generic policy object accepted for facilitator compatibility }
       responses:
         '200':
           description: Upstream facilitator response (normalized)
@@ -493,6 +666,17 @@ paths:
                   transaction: { type: string, nullable: true }
                   network: { type: string, nullable: true }
                   errorReason: { type: string, nullable: true }
+          headers:
+            X-Request-ID: { schema: { type: string } }
+            X-Risk-Decision: { schema: { type: string, enum: [allow] } }
+            X-Risk-Decision-ID: { schema: { type: string } }
+            X-Risk-TTL-Seconds: { schema: { type: integer } }
+            X-VI-Decision: { schema: { type: string, enum: [allow] } }
+            X-VI-Decision-ID: { schema: { type: string } }
+            X-VI-Verified: { schema: { type: string, enum: ["true", "false"] } }
+            X-VI-Evidence-Ref: { schema: { type: string } }
+            X-VI-Receipt-Status: { schema: { type: string, enum: [recorded, failed] } }
+            X-VI-Receipt-ID: { schema: { type: string } }
         '4XX': { $ref: '#/components/responses/Error' }
         '5XX': { $ref: '#/components/responses/Error' }
 
@@ -502,7 +686,10 @@ components:
       type: http
       scheme: bearer
       bearerFormat: internal-token
-      description: Internal token shared between the hosted XRPL Facilitator and x402-secure Proxy.
+      description: |
+        Per-service bearer token configured via X402_SECURE_INTERNAL_SERVICES_JSON (or the
+        single-service X402_SECURE_INTERNAL_TOKEN). Each token is limited to a set of actions
+        and an organization/environment/policy scope. The token may also be sent as X-Internal-Token.
 
   schemas:
     FacilitatorInfo:
@@ -869,6 +1056,12 @@ components:
           type: object
           additionalProperties: true
 
+    HTTPError:
+      type: object
+      description: Default FastAPI error body
+      properties:
+        detail: { type: string }
+
     PaymentContext:
       type: object
       description: Generic payment context supporting multiple protocols
@@ -881,7 +1074,9 @@ components:
           description: 'Payment protocol identifier (e.g., "eip3009", "x402:exact", "solana:transfer", "btc:psbt")'
           example: "eip3009"
         version:
-          type: [string, integer]
+          oneOf:
+            - { type: string }
+            - { type: integer }
           nullable: true
           description: Protocol version
         network:

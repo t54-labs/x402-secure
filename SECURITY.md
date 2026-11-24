@@ -66,8 +66,8 @@ If you are looking for somewhere to start:
 - Bypassing risk gating on `/x402/verify` or `/x402/settle`
 - Forging or replaying `X-PAYMENT-SECURE`, `X-AP2-EVIDENCE`,
   `X-VERIFIABLE-INTENT`, or `X-RISK-SESSION`
-- SSRF through the mandate fetcher, including allowlist bypass
-  (note `MANDATE_URL_ALLOWLIST` defaults to `*`)
+- SSRF or request smuggling through upstream, risk-engine or Trustline calls
+  (`proxy/src/x402_proxy/`)
 - Leaking mandate contents, buyer keys, or internal tokens into logs
 - Authentication weaknesses on `/internal/x402-secure/facilitator/*`
 

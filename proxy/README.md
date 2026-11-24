@@ -1,17 +1,17 @@
 # X-402 Proxy Server
 
-A FastAPI-based proxy that validates AP2 (Attestation Protocol 2) evidence and forwards payments to upstream x402 facilitators.
+A FastAPI-based proxy that validates AP2 (Agent Payments Protocol) evidence and forwards payments to upstream x402 facilitators.
 
 **Note:** This is an internal service package, not published to PyPI. For the client SDK, see `packages/x402-secure`.
 
 ## Features
 
 - ✅ **AP2 Policy Enforcement** - Validates X-AP2-EVIDENCE header against merchant policy
-- ✅ **UID-Based Risk Assessment** - Fetches trace context and PaymentMandate from Risk Engine using UIDs
+- ✅ **Risk gating** - evaluates every payment against the risk engine (`/risk/evaluate`) before forwarding
 - ✅ **Cryptographic Validation** - Payment hash binding, origin binding, TTL checks
 - ✅ **EIP-712 Signatures** - Optional payer signature verification
 - ✅ **Clean x402 Forwarding** - Strips custom fields before forwarding to upstream
-- ✅ **Flexible Upstream** - Works with CDP facilitator, local Risk Engine, or stubs
+- ✅ **Flexible Upstream** - Works with any x402 v1 facilitator, or the bundled stub
 
 ## Installation
 
@@ -27,17 +27,22 @@ pip install -e .
 
 ```python
 from fastapi import FastAPI
-from x402_proxy import router
+from x402_proxy import risk_router, router
 
 app = FastAPI()
 
-# Mount the proxy router
+# Mount the proxy and risk routers. /x402/verify calls /risk/evaluate in-app
+# when PROXY_LOCAL_RISK=1, so local mode needs risk_router mounted.
 app.include_router(router)
+app.include_router(risk_router)
 
 # Now your app exposes:
 # - POST /x402/verify
 # - POST /x402/settle
+# - POST /risk/session, /risk/trace, /risk/evaluate
 ```
+
+`run_facilitator_proxy.py` at the repo root builds the full app, including the internal facilitator router.
 
 ### Configuration
 
@@ -48,8 +53,10 @@ Configure via environment variables:
 export PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
 export PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
 
-# Risk Engine for AP2 UID lookups
-export RISK_ENGINE_URL=http://localhost:8001
+# Risk engine (required unless PROXY_LOCAL_RISK=1)
+export RISK_ENGINE_URL=<risk engine base URL>
+# Or, for development only: in-memory risk sessions and traces in this process
+# export PROXY_LOCAL_RISK=1
 
 # Timeout for upstream requests
 export PROXY_TIMEOUT_S=15
@@ -92,16 +99,18 @@ Facilitator Proxy (/x402/verify)
   ├─ 4. Verify TTL (notBefore, notAfter)
   ├─ 5. Verify origin binding (originHash)
   ├─ 6. Verify payment hash binding (paymentHash)
-  ├─ 7. Fetch trace context via trace_uid (from Risk Engine)
-  ├─ 8. Fetch PaymentMandate VC via payment_uid (from Risk Engine)
-  ├─ 9. Strip custom AP2 fields from PaymentRequirements
-  └─ 10. Forward clean x402 to upstream facilitator
+  ├─ 7. Evaluate risk (POST /risk/evaluate; deny/review → 403)
+  ├─ 8. Optional VI assessment
+  ├─ 9. Forward x402 v1 request (extra reduced to name/version)
+  └─ 10. On success return X-PAYMENT-AUTHORIZATION (required on /x402/settle)
        ↓
 Upstream x402 Facilitator (CDP, local, etc.)
   └─ Validates standard x402 payment and returns result
 ```
 
 ### X-AP2-EVIDENCE Structure
+
+Header value: base64 of this JSON (or the `evd.v1;mr=...` mandate reference form).
 
 ```json
 {
@@ -125,16 +134,22 @@ Upstream x402 Facilitator (CDP, local, etc.)
 
 ## Risk Engine Integration
 
-The proxy fetches deep risk assessment data from your Risk Engine using UIDs:
+When `PROXY_LOCAL_RISK` is not set, the proxy calls your risk engine at `RISK_ENGINE_URL`:
 
-Required APIs (read by the proxy):
-- `GET /ap2/trace/{trace_uid}` - Returns trace context
-- `GET /ap2/mandate/payment/{payment_uid}` - Returns PaymentMandate VC
+- `POST /risk/evaluate`: called on every `/x402/verify` (and on `/x402/settle` when `PROXY_SETTLE_RISK_ENABLED` is set); must return `decision`, `decision_id`, `ttl_seconds`
+- `POST /risk/session` and `POST /risk/trace`: buyer calls to the gateway's `/risk/*` routes are forwarded here
+
+`RISK_INTERNAL_TOKEN` is sent as a Bearer token. `RISK_ENGINE_COMPAT=trustline` adapts session and trace payloads.
 
 ## Environment Variables
 
 - `PROXY_UPSTREAM_VERIFY_URL` / `PROXY_UPSTREAM_SETTLE_URL`: Upstream x402 facilitator URLs.
-- `RISK_ENGINE_URL`: Base URL of your Risk Engine for trace/mandate lookups (default: `http://localhost:8001`).
+- `RISK_ENGINE_URL`: Base URL of the risk engine that receives `/risk/evaluate` (and forwarded `/risk/session`, `/risk/trace`) calls. Required unless `PROXY_LOCAL_RISK=1`.
+- `PROXY_LOCAL_RISK`: `1` keeps risk sessions and traces in memory in this process instead of calling a risk engine. For development only; it is per process, so do not combine it with multiple workers.
+- `PROXY_LOCAL_RISK_TTL`: Lifetime in seconds of local-mode sessions and traces (default 900).
+- `RISK_INTERNAL_TOKEN`: Bearer token sent to the risk engine.
+- `RISK_ENGINE_COMPAT`: Set to `trustline` to adapt session and trace payloads to the Trustline API.
+- `X402_SECURE_VI_RECEIPT_STORE`, `X402_SECURE_VI_RECEIPT_REDIS_URL`, `X402_SECURE_VI_RECEIPT_REDIS_TIMEOUT_SECONDS`, `X402_SECURE_VI_RECEIPT_TTL_SECONDS`: VI receipt store (see `env.example`).
 - `PROXY_TIMEOUT_S`: Timeout for upstream calls.
 - `PROXY_NETWORK_CHAIN_MAP`: JSON or `k:v` pairs extending network→chainId mapping for EIP-712 verification.
 - Set `PROXY_PAYMENT_AUTHORIZATION_KEY` to a random secret of at least 32 bytes shared by all replicas serving the same upstream pair. Pass the verify response's `X-PAYMENT-AUTHORIZATION` on settle. The authorization expires with the risk and VI decisions and binds the payment, requirements, policy, evidence, and upstream pair.
@@ -145,9 +160,10 @@ Required APIs (read by the proxy):
 
 ## Testing
 
+From the repo root:
+
 ```bash
-cd sdk/secure_x402
-pytest
+uv run pytest
 ```
 
 ## License

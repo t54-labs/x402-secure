@@ -22,11 +22,11 @@ This guide helps AI agent developers integrate x402-secure for protected payment
 ## Installation
 
 ```bash
-# Basic installation (includes OpenAI client dependency)
+# Basic installation (seller-only; buyers need [signing,otel] below)
 pip install x402-secure
 
 # For full buyer functionality (EIP-3009 signing + OpenTelemetry tracing)
-pip install x402-secure[signing,otel]
+pip install "x402-secure[signing,otel]"
 ```
 
 **Note**: The package is imported as `x402_secure_client`.
@@ -75,6 +75,8 @@ when the seller advertises exactly one eligible offer on the configured network.
 #### OpenAI Integration
 
 ```python
+import os
+
 from openai import OpenAI
 from x402_secure_client import OpenAITraceCollector, store_agent_trace, execute_payment_with_tid
 import json
@@ -109,20 +111,19 @@ async def agent_task(user_request: str):
     ]
 
     with openai_client.responses.stream(
-        model="gpt-4",
+        model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
         input=messages,
+        # Responses API function tools use the flat shape (no nested "function" key)
         tools=[{
             "type": "function",
-            "function": {
-                "name": "make_purchase",
-                "description": "Make a purchase on behalf of the user",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "item": {"type": "string"},
-                        "price": {"type": "string"},
-                        "merchant": {"type": "string"}
-                    }
+            "name": "make_purchase",
+            "description": "Make a purchase on behalf of the user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item": {"type": "string"},
+                    "price": {"type": "string"},
+                    "merchant": {"type": "string"}
                 }
             }
         }]
@@ -272,7 +273,7 @@ tracer.record_system_prompt("You are a helpful shopping assistant.", version="v1
 # Set model configuration
 tracer.set_model_config(
     provider="openai",
-    model="gpt-4",
+    model="gpt-5-mini",
     tools_enabled=["make_purchase", "check_inventory"]
 )
 
@@ -360,11 +361,11 @@ except httpx.HTTPStatusError as e:
     # Non-2xx response from seller or proxy
     print(f"Payment failed: {e.response.status_code}")
     print(f"Response: {e.response.text}")
-    # Check specific status codes:
+    # Check specific status codes. You see the seller's status, not the proxy's:
+    # the reference seller maps a risk deny, a failed verification and a
+    # declined settlement all to 402.
     if e.response.status_code == 402:
-        print("Payment required - check wallet balance")
-    elif e.response.status_code == 403:
-        print("Payment blocked by risk engine or seller")
+        print("Seller declined payment (verification, risk or settlement)")
     elif e.response.status_code == 404:
         print("Endpoint not found")
 except httpx.RequestError as e:
@@ -521,7 +522,7 @@ Before going live:
 - [ ] **Wallet Security**
   - [ ] Private key stored securely (use environment variables or secret manager)
   - [ ] Separate wallets for development and production
-  - [ ] Wallet has sufficient funds for gas fees
+  - [ ] Wallet holds enough of the payment token (e.g. USDC)
 
 - [ ] **Error Handling**
   - [ ] Graceful handling of all error types

@@ -38,7 +38,7 @@ uvx ruff@0.8.4 check .
 uvx ruff@0.8.4 format --check .
 ```
 
-Optionally install the pre-commit hooks, which cover the same ground:
+Optionally install the pre-commit hooks (Ruff plus file hygiene and pydocstyle checks):
 
 ```bash
 uv run pre-commit install
@@ -78,9 +78,10 @@ parties build against them. For anything that alters the wire format:
 
 ## Code style
 
-Ruff handles formatting and linting; line length is 100. Public functions
-use Google-convention docstrings (enforced by pydocstyle in pre-commit).
-Match the conventions of the file you are editing.
+Ruff handles formatting and linting; line length is 100. Prefer
+Google-convention docstrings on new public functions (the optional pre-commit
+pydocstyle hook checks this; CI does not). Match the conventions of the file
+you are editing.
 
 ## Licensing
 

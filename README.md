@@ -54,6 +54,7 @@ Edit `.env` and set:
 PROXY_LOCAL_RISK=1
 PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
 PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
+PROXY_PAYMENT_AUTHORIZATION_KEY=<generate with openssl rand -hex 32>
 ```
 
 ### Run the Proxy
@@ -67,6 +68,7 @@ curl http://localhost:8000/health
 
 ### Common Issues
 - **"risk endpoints 500"**: Ensure `PROXY_LOCAL_RISK=1` for local mode, or set `RISK_ENGINE_URL` for forward mode.
+- **"/x402/verify returns 503"**: Set `PROXY_PAYMENT_AUTHORIZATION_KEY` to a random secret of at least 32 bytes.
 - **Port in use**: Adjust `PROXY_PORT` in `.env` or free port 8000.
 
 ### Next Steps
@@ -112,13 +114,21 @@ x402-secure provides **clear responsibility boundaries** through:
 > **Note on Package Naming**: The PyPI package name is `x402-secure`, but the import module is `x402_secure_client`.
 
 ```python
-# 1. Install SDK
-pip install x402-secure
+# 1. Install SDK (buyers need the signing and otel extras)
+pip install "x402-secure[signing,otel]"
 
 # 2. Initialize buyer client
 import os
 
-from x402_secure_client import BuyerClient, BuyerConfig, OpenAITraceCollector
+from x402_secure_client import (
+    BuyerClient,
+    BuyerConfig,
+    OpenAITraceCollector,
+    setup_otel_from_env,
+)
+
+# Required: X-PAYMENT-SECURE is built from an active OpenTelemetry span
+setup_otel_from_env()
 
 # Configure buyer client
 buyer = BuyerClient(BuyerConfig(
@@ -169,20 +179,23 @@ print(f"Payment completed: {payment_result}")
 ### Complete Flow Example
 
 ```python
-# Simplified helper for common use case
 from x402_secure_client import run_agent_payment
 
-# All-in-one helper that handles the complete flow
+# buyer is the BuyerClient from the previous example; tool_defs are OpenAI
+# function tools, and the agent must call a `prepare_payment` tool that returns
+# {"endpoint": "/api/...", "params": {...}}.
 result = await run_agent_payment(
+    buyer=buyer,
     gateway_url="https://x402-proxy.t54.ai",
-    seller_base_url="https://api.example.com",
-    buyer_private_key=YOUR_PRIVATE_KEY,
-    endpoint="/api/purchase",
-    task="Buy coffee maker",
-    params={"item_id": "12345"},
-    events=tracer.events  # Your collected AI trace
+    messages=[{"role": "user", "content": "Buy the BTC price feed"}],
+    tools={"prepare_payment": prepare_payment},
+    tool_defs=tool_defs,
+    task="Buy BTC price",
+    environment={"network": "base-sepolia"},
 )
 ```
+
+See [`packages/x402-secure/examples/buyer_agent_openai.py`](packages/x402-secure/examples/buyer_agent_openai.py) for a full example.
 
 ### Liability Protection
 
@@ -208,18 +221,23 @@ result = await run_agent_payment(
 ### Quick Integration (10 minutes)
 
 ```python
-# 1. Install SDK
+# 1. Install SDK (sellers need no extras)
 pip install x402-secure
 
 # 2. Add to your FastAPI app
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
 
 app = FastAPI()
 
-# Initialize seller client with your proxy endpoint
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+# Initialize seller client with the gateway URL (SellerClient appends /x402)
+seller = SellerClient("https://x402-proxy.t54.ai")
 
 @app.get("/api/your-service")
 async def your_api(request: Request, param: str):
@@ -245,8 +263,9 @@ async def your_api(request: Request, param: str):
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
+    origin = request.headers.get("Origin")
 
-    if not all([x_payment, x_payment_secure, risk_session]):
+    if not all([x_payment, x_payment_secure, risk_session, origin]):
         # Return 402 Payment Required
         return JSONResponse(
             {"accepts": [payment_requirements], "error": "Payment required"},
@@ -254,37 +273,38 @@ async def your_api(request: Request, param: str):
         )
 
     # Verify and settle payment
+    import base64, json
     try:
-        import base64, json
         payment_data = json.loads(base64.b64decode(x_payment))
+    except Exception:
+        return JSONResponse({"error": "Invalid X-PAYMENT"}, status_code=402)
 
+    try:
         result = await seller.verify_then_settle(
             payment_data,
             payment_requirements,
             x_payment_b64=x_payment,
-            origin=request.headers.get("Origin"),
+            origin=origin,
             x_payment_secure=x_payment_secure,
             risk_sid=risk_session
         )
+    except (PaymentVerificationError, SettlementDeclined):
+        return JSONResponse({"error": "Payment declined"}, status_code=402)
+    except SettlementUnknown:
+        return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 
-        # Payment successful - deliver your service
-        service_result = {"data": f"Processed: {param}"}
+    # Payment settled - deliver your service
+    service_result = {"data": f"Processed: {param}"}
 
-        return JSONResponse(
-            service_result,
-            headers={"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
-        )
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=402)
+    return JSONResponse(
+        service_result,
+        headers={"X-PAYMENT-RESPONSE": base64.b64encode(json.dumps(result).encode()).decode()}
+    )
 ```
 
 ### Risk Scoring
 
-Every payment response will include a 'risk_level' with ENUM value options:
-- 🟢 **Low**: Clear reasoning, expected behavior
-- 🟡 **Medium**: Some anomalies, proceed with caution
-- 🔴 **High**: Suspicious patterns, consider blocking
+The proxy evaluates risk before forwarding a payment. A deny or review decision fails verification, and `verify_then_settle` raises `PaymentVerificationError`. Successful proxy responses carry `X-Risk-Decision`, `X-Risk-Decision-ID` and `X-Risk-TTL-Seconds` headers.
 
 ### Dispute Protection
 
@@ -311,7 +331,7 @@ sequenceDiagram
     Note over Buyer,Upstream: Phase 1: Create Risk Session
 
     Buyer->>Gateway: POST /risk/session
-    Note right of Buyer: agent_id: 0x-address<br/>device: ua=x402-agent
+    Note right of Buyer: agent_did, wallet_address: 0x-address
     Gateway->>Risk: Forward to risk engine
     Risk-->>Gateway: Return session info
     Gateway-->>Buyer: {"sid": "uuid", "expires_at": "timestamp"}
@@ -362,8 +382,10 @@ sequenceDiagram
     Gateway->>Upstream: Forward standard x402 verify
     Upstream-->>Gateway: Verification result
     Gateway-->>Seller: {"isValid": true, "payer": "0x-address"}
+    Note right of Gateway: X-PAYMENT-AUTHORIZATION,<br/>X-Risk-* headers
 
     Seller->>Gateway: POST /x402/settle
+    Note right of Seller: X-PAYMENT-AUTHORIZATION from verify
     Gateway->>Upstream: Forward settle request
     Upstream-->>Gateway: Settlement result
     Gateway-->>Seller: {"success": true, "transaction": "0x-hash"}

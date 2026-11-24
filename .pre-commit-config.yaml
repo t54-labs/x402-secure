@@ -25,7 +25,7 @@ repos:
       - id: end-of-file-fixer
         exclude: ^htmlcov/
       - id: check-yaml
-        exclude: ^(htmlcov/|gke/k8s/)
+        exclude: ^htmlcov/
       - id: check-added-large-files
         args: ['--maxkb=1000']
       - id: check-merge-conflict

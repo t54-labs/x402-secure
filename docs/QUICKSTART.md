@@ -20,11 +20,8 @@ Get started with x402-secure in 5 minutes!
 ### 1. Install the SDK
 
 ```bash
-# Install with signing dependencies (required for payments)
-pip install x402-secure[signing]
-
-# Optional: Install OpenTelemetry for observability
-pip install x402-secure[signing,otel]
+# Signing and OpenTelemetry are both required for payments
+pip install "x402-secure[signing,otel]"
 ```
 
 ### 2. Get Test Wallet (Development)
@@ -45,7 +42,7 @@ import os
 from x402_secure_client import BuyerClient, BuyerConfig, setup_otel_from_env
 
 async def main():
-    # Optional: Initialize OpenTelemetry for observability
+    # Required: X-PAYMENT-SECURE needs an active OpenTelemetry span
     setup_otel_from_env()
 
     # Initialize buyer client
@@ -59,7 +56,7 @@ async def main():
         network="base-sepolia"  # Use testnet for development
     ))
 
-    # Create risk session (requires app_id and device info)
+    # Create risk session (app_id and device are optional)
     session = await buyer.create_risk_session(
         app_id=None,
         device={"ua": "quickstart-demo"}
@@ -125,11 +122,11 @@ async def shopping_agent():
     # Configure model info for trace context
     tracer.set_model_config(
         provider="openai",
-        model="gpt-4",
+        model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
         tools_enabled=["purchase_item"]
     )
 
-    # Create risk session (requires app_id and device info)
+    # Create risk session (app_id and device are optional)
     session = await buyer.create_risk_session(
         app_id=None,
         device={"ua": "shopping-agent"}
@@ -153,9 +150,11 @@ async def shopping_agent():
     ]
 
     with openai_client.responses.stream(
-        model="gpt-4",
+        model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
         input=messages,
-        tools=[{"type": "function", "function": {
+        # Responses API function tools use the flat shape (no nested "function" key)
+        tools=[{
+            "type": "function",
             "name": "purchase_item",
             "description": "Purchase an item",
             "parameters": {"type": "object", "properties": {
@@ -163,7 +162,7 @@ async def shopping_agent():
                 "price": {"type": "string"},
                 "merchant": {"type": "string"}
             }}
-        }}]
+        }]
     ) as stream:
         result = await tracer.process_stream(
             stream=stream,
@@ -224,7 +223,7 @@ pip install x402-secure fastapi uvicorn pydantic
 
 # For Flask
 pip install x402-secure flask
-# Note: Flask requires async support (Flask 3+ with async views or use Quart)
+# Note: SellerClient is async-only; see the Flask note below
 ```
 
 ### 2. Add Payment Protection to Your API
@@ -232,15 +231,20 @@ pip install x402-secure flask
 #### FastAPI Example
 
 ```python
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from x402_secure_client import SellerClient
+from x402_secure_client import (
+    PaymentVerificationError,
+    SellerClient,
+    SettlementDeclined,
+    SettlementUnknown,
+)
 import base64, json
 
 app = FastAPI()
 
-# Initialize seller client
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
+# Initialize seller client with the gateway URL (SellerClient appends /x402)
+seller = SellerClient("https://x402-proxy.t54.ai")
 
 @app.get("/api/generate")
 async def generate_content(request: Request, prompt: str):
@@ -250,30 +254,45 @@ async def generate_content(request: Request, prompt: str):
         "network": "base-sepolia",
         "maxAmountRequired": "100000",  # 0.10 USDC
         "resource": str(request.url),
+        "description": "Content generation",
+        "mimeType": "application/json",
         "payTo": "0xYourWallet",
-        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+        "maxTimeoutSeconds": 30,
+        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC
+        # Required for EIP-3009 signing: the token's EIP-712 domain
+        "extra": {"name": "USDC", "version": "2"},
     }
 
     # Check payment headers
     x_payment = request.headers.get("X-PAYMENT")
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     risk_session = request.headers.get("X-RISK-SESSION")
+    origin = request.headers.get("Origin")
 
-    if not all([x_payment, x_payment_secure, risk_session]):
+    if not all([x_payment, x_payment_secure, risk_session, origin]):
         return JSONResponse(
             {"x402Version": 1, "accepts": [pr], "error": "Payment required"},
             status_code=402
         )
 
     # Verify and settle
-    payment_data = json.loads(base64.b64decode(x_payment))
-    result = await seller.verify_then_settle(
-        payment_data, pr,
-        x_payment_b64=x_payment,
-        origin=request.headers.get("Origin"),
-        x_payment_secure=x_payment_secure,
-        risk_sid=risk_session
-    )
+    try:
+        payment_data = json.loads(base64.b64decode(x_payment))
+    except Exception:
+        return JSONResponse({"error": "Invalid X-PAYMENT"}, status_code=402)
+
+    try:
+        result = await seller.verify_then_settle(
+            payment_data, pr,
+            x_payment_b64=x_payment,
+            origin=origin,
+            x_payment_secure=x_payment_secure,
+            risk_sid=risk_session
+        )
+    except (PaymentVerificationError, SettlementDeclined):
+        return JSONResponse({"error": "Payment declined"}, status_code=402)
+    except SettlementUnknown:
+        return JSONResponse({"error": "Settlement could not be confirmed"}, status_code=502)
 
     # Provide service
     content = f"Generated content for: {prompt}"
@@ -286,62 +305,9 @@ async def generate_content(request: Request, prompt: str):
 # Run with: uvicorn main:app
 ```
 
-#### Flask Example
+#### Flask
 
-```python
-from flask import Flask, request, jsonify, make_response
-from x402_secure_client import SellerClient
-import base64, json
-
-app = Flask(__name__)
-seller = SellerClient("https://x402-proxy.t54.ai/x402")
-
-@app.route("/api/analyze", methods=["GET"])
-async def analyze_data():
-    # Define payment requirements
-    pr = {
-        "scheme": "exact",
-        "network": "base-sepolia",
-        "maxAmountRequired": "1000000",  # 1.00 USDC
-        "resource": request.url,
-        "payTo": "0xYourWallet",
-        "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
-    }
-
-    # Check payment headers
-    x_payment = request.headers.get("X-PAYMENT")
-    x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
-    risk_session = request.headers.get("X-RISK-SESSION")
-
-    if not all([x_payment, x_payment_secure, risk_session]):
-        return jsonify({
-            "x402Version": 1,
-            "accepts": [pr],
-            "error": "Payment required"
-        }), 402
-
-    # Verify and settle payment
-    payment_data = json.loads(base64.b64decode(x_payment))
-    result = await seller.verify_then_settle(
-        payment_data, pr,
-        x_payment_b64=x_payment,
-        origin=request.headers.get("Origin"),
-        x_payment_secure=x_payment_secure,
-        risk_sid=risk_session
-    )
-
-    # Process request
-    data = request.args.get("data", "test data")
-    analysis_result = f"Analysis complete for: {data}"
-
-    response = make_response(jsonify({"result": analysis_result}))
-    response.headers["X-PAYMENT-RESPONSE"] = base64.b64encode(
-        json.dumps(result).encode()
-    ).decode()
-    return response
-
-# Run with: flask run
-```
+`SellerClient` is async-only. For a Flask view, see the [Flask integration](SELLER_INTEGRATION.md#2-flask-integration) in the Seller Integration Guide, or use an async framework such as FastAPI.
 
 ### 3. Test Your Integration
 
@@ -362,7 +328,6 @@ curl "http://localhost:8000/api/generate?prompt=Hello+world" \
 
 - 📖 [Read full Seller Integration Guide](SELLER_INTEGRATION.md)
 - 🛡️ [Configure risk tolerance](SELLER_INTEGRATION.md#risk-management)
-- 💰 [Set up usage-based billing](SELLER_INTEGRATION.md#usage-based-billing)
 
 ---
 

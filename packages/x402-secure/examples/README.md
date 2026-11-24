@@ -22,9 +22,10 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 
 3. **Configure environment:**
    ```bash
-   cp .env.example .env
+   cp ../../../env.example .env   # the repo root env.example
    # Edit .env and add:
    # - BUYER_PRIVATE_KEY (required)
+   # - BUYER_EXPECTED_PAY_TO, BUYER_EXPECTED_ASSET, BUYER_MAX_AMOUNT_ATOMIC (required)
    # - OPENAI_API_KEY (required for agent example)
    #
    # ⚠️ IMPORTANT: Never commit .env to version control - it contains secrets!
@@ -35,6 +36,9 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 ### Required
 - `BUYER_PRIVATE_KEY` - Your wallet private key for signing payments
 - `OPENAI_API_KEY` - OpenAI API key (for agent examples)
+- `BUYER_EXPECTED_PAY_TO` - seller payTo address the buyer will accept (must equal the seller's `MERCHANT_PAYTO`)
+- `BUYER_EXPECTED_ASSET` - token contract the buyer will pay with (must equal the seller's `USDC_ADDRESS`)
+- `BUYER_MAX_AMOUNT_ATOMIC` - per-payment limit in atomic units (the demo seller charges 100000)
 
 ### Optional (with defaults)
 - `AGENT_GATEWAY_URL` - Agent gateway base URL (default: http://localhost:8000)
@@ -42,12 +46,12 @@ Examples demonstrating the x402-secure SDK for AI agent payments with AP2 verifi
 - `SELLER_BASE_URL` - Seller API URL (default: http://localhost:8010)
 - `NETWORK` - Blockchain network (default: base-sepolia)
 - `OPENAI_MODEL` - AI model (default: gpt-5-mini)
-- `MERCHANT_PAYTO` - Merchant wallet address
-- `USDC_ADDRESS` - USDC contract address
+- `MERCHANT_PAYTO` - Merchant wallet address used by `seller_integration.py` (default: placeholder `0x0987654321098765432109876543210987654321`)
+- `USDC_ADDRESS` - Token the seller quotes (default: Base Sepolia USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e`)
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - OpenTelemetry endpoint (optional, for trace export)
 - `OTEL_SERVICE_NAME` - Service name for traces (default: x402-buyer)
-- `AGENT_ORIGIN` - Agent origin for session context (optional)
-- `CLIENT_IP` - Client IP for session context hashing (optional)
+- `AGENT_ORIGIN` - Agent origin for session context (agent example only)
+- `CLIENT_IP` - Client IP for session context hashing (agent example only)
 
 ## Complete Flow Demo
 
@@ -56,9 +60,15 @@ To run a complete end-to-end demo:
 ### 1. Start Facilitator Proxy (Terminal 1)
 ```bash
 cd /path/to/repo/root
+export PROXY_LOCAL_RISK=1
+export PROXY_PAYMENT_AUTHORIZATION_KEY="$(openssl rand -hex 32)"
+export PROXY_UPSTREAM_VERIFY_URL=http://localhost:9000/verify   # upstream_stub, or the x402.org facilitator
+export PROXY_UPSTREAM_SETTLE_URL=http://localhost:9000/settle
 uv run run_facilitator_proxy.py
 # Runs on http://localhost:8000
 ```
+
+To use the stub, start it first (see [Upstream Stub](#1-upstream-stub-mock-facilitator)). Without `PROXY_PAYMENT_AUTHORIZATION_KEY` (at least 32 bytes), `/x402/verify` and `/x402/settle` return 503.
 
 ### 2. Start Seller (Terminal 2)
 ```bash
@@ -150,8 +160,9 @@ pip install "x402-secure[examples]"
 ### Missing environment variables
 Make sure you have `.env` file with required variables:
 ```bash
-cp .env.example .env
-# Add BUYER_PRIVATE_KEY and OPENAI_API_KEY
+cp ../../../env.example .env
+# Add BUYER_PRIVATE_KEY, BUYER_EXPECTED_PAY_TO, BUYER_EXPECTED_ASSET,
+# BUYER_MAX_AMOUNT_ATOMIC and OPENAI_API_KEY
 ```
 
 ## See Also

@@ -1,3 +1,9 @@
+> ⚠️ **Historical document: do not build or operate from it.** A 2025-10 demo walkthrough. Its scripts are gone, and its commands predate the payment authorization key that verify and settle now require.
+>
+> Current source: [`packages/x402-secure/examples/README.md`](../../../packages/x402-secure/examples/README.md).
+>
+> Moved from `docs/guides/RUN_COMPLETE_DEMO.md`. Checked against `main@b4526b8` on 2026-11-24.
+
 # 🚀 Complete Flow Demo - One-Click Launch
 
 ## ✅ Fixed Issues

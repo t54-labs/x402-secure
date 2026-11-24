@@ -6,23 +6,26 @@ Open-source x402 client SDKs for buyers and sellers that integrate with a unifie
 - Seller SDK: call proxy `/x402/verify` and `/x402/settle` with a simple `verify_then_settle(...)` wrapper.
 
 Fail-fast principles:
-- Non-200 responses raise immediately (`HTTPStatusError`).
+- Buyer and risk calls raise `httpx.HTTPStatusError` on non-2xx. `SellerClient` raises `PaymentVerificationError`, `SettlementDeclined` or `SettlementUnknown`.
 - Invalid or missing `traceparent` context raises.
 - Header size limit enforced (`X-PAYMENT-SECURE` ≤ 4096 bytes).
 
 ## Install
 
 ```
-pip install x402-secure
+pip install x402-secure                    # seller (SellerClient)
+pip install "x402-secure[signing,otel]"    # buyer (signing + trace headers)
 ```
 
 ## Quickstart
 
 ```python
 import os, asyncio
-from x402_secure_client import BuyerConfig, BuyerClient
+from x402_secure_client import BuyerConfig, BuyerClient, setup_otel_from_env
 
 async def main():
+    # Required: X-PAYMENT-SECURE is built from an active OpenTelemetry span
+    setup_otel_from_env()
     buyer = BuyerClient(BuyerConfig(
         seller_base_url=os.getenv("SELLER_BASE_URL", "http://localhost:8010"),
         agent_gateway_url=os.getenv("AGENT_GATEWAY_URL", "http://localhost:8000"),

@@ -24,50 +24,45 @@ graph TB
     subgraph "Facilitator Proxy"
         B1[FastAPI Server] --> B2[Risk Evaluator]
         B2 --> B3[Payment Forwarder]
-        B2 --> B4[Evidence Storage]
+        B2 --> B4["VI receipt store (Redis)"]
     end
 
     subgraph "External Services"
         C1[Trustline Risk Engine]
         C2[x402.org Facilitator]
-        C3[Blockchain RPC]
     end
 
     A1 --> B1
     A3 --> B1
     B2 --> C1
     B3 --> C2
-    B3 --> C3
 ```
 
 ### Request Flow
 
 ```mermaid
 sequenceDiagram
-    participant Agent as AI Agent
-    participant SDK as Client SDK
-    participant Proxy as Facilitator Proxy
-    participant Risk as Trustline
-    participant X402 as x402.org
-    participant Chain as Blockchain
+    participant Agent as Buyer agent (SDK)
+    participant Seller
+    participant Proxy as x402-secure proxy
+    participant Risk as Trustline (or local store)
+    participant Fac as Upstream facilitator
 
-    Agent->>SDK: Initialize payment
-    SDK->>SDK: Collect trace
-    SDK->>Risk: Submit trace
-    Risk-->>SDK: Return trace_id
-
-    SDK->>Proxy: Payment request + trace_id
-    Proxy->>Risk: Evaluate risk
-    Risk-->>Proxy: Risk decision
-
-    alt Risk Approved
-        Proxy->>X402: Forward payment
-        X402->>Chain: Execute transaction
-        Chain-->>X402: Confirmation
-        X402-->>Proxy: Receipt
-        Proxy-->>SDK: Success + protection_id
-    else Risk Denied
-        Proxy-->>SDK: Rejection + reason
+    Agent->>Proxy: POST /risk/session
+    Proxy->>Risk: forward (or store locally)
+    Agent->>Proxy: POST /risk/trace (agent_trace)
+    Proxy-->>Agent: tid
+    Agent->>Seller: request + X-PAYMENT, X-PAYMENT-SECURE, X-RISK-SESSION
+    Seller->>Proxy: POST /x402/verify
+    Proxy->>Risk: POST /risk/evaluate
+    alt decision allow
+        Proxy->>Fac: verify
+        Proxy-->>Seller: isValid + X-PAYMENT-AUTHORIZATION
+        Seller->>Proxy: POST /x402/settle + X-PAYMENT-AUTHORIZATION
+        Proxy->>Fac: settle
+        Proxy-->>Seller: success, transaction
+    else deny / review
+        Proxy-->>Seller: 403 {error: {code: RISK_DENIED | RISK_REVIEW}}
     end
 ```
 
@@ -75,7 +70,7 @@ sequenceDiagram
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.11 or 3.12
 - `uv` package manager
 - Git
 - Docker (optional)
@@ -114,16 +109,20 @@ cp env.example .env
 
 # Edit .env with your configuration
 # Required for development:
-PROXY_LOCAL_RISK=1  # Use local risk storage for development
+PROXY_LOCAL_RISK=1  # in-memory risk sessions/traces; single process only
 PROXY_PORT=8000
 PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
 PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
+PROXY_PAYMENT_AUTHORIZATION_KEY=<generate with openssl rand -hex 32>  # at least 32 bytes
 
-# Optional: Use external Trustline (production mode)
+# Optional: forward /risk/* to Trustline instead of the local store
 # PROXY_LOCAL_RISK=0
 # RISK_ENGINE_URL=<TRUSTLINE_API_URL>
-# RISK_INTERNAL_TOKEN=your_token
+# RISK_ENGINE_COMPAT=trustline
+# RISK_INTERNAL_TOKEN=<token>
 ```
+
+Without `PROXY_PAYMENT_AUTHORIZATION_KEY`, `/x402/verify` and `/x402/settle` return 503. See `env.example.full` and `proxy/README.md` for every setting the proxy reads, including the VI receipt store (`X402_SECURE_VI_RECEIPT_*`).
 
 ### 4. Run Development Server
 
@@ -134,9 +133,12 @@ uv run python run_facilitator_proxy.py
 # In another terminal, start example seller
 uv run uvicorn --app-dir packages/x402-secure/examples seller_integration:app --port 8010
 
-# Run example buyer agent
+# Run example buyer agent (needs BUYER_PRIVATE_KEY and OPENAI_API_KEY in .env)
 AGENT_GATEWAY_URL=http://localhost:8000 \
 SELLER_BASE_URL=http://localhost:8010 \
+BUYER_EXPECTED_PAY_TO=<seller payTo address> \
+BUYER_EXPECTED_ASSET=<asset address the seller quotes> \
+BUYER_MAX_AMOUNT_ATOMIC=100000 \
 uv run python packages/x402-secure/examples/buyer_agent_openai.py
 ```
 
@@ -149,8 +151,8 @@ uv run pytest
 # Run specific test file (without coverage check)
 uv run pytest tests/test_core_flows.py --no-cov
 
-# Run with coverage
-uv run pytest --cov=x402_secure --cov-report=html
+# Coverage is configured in pytest.ini; the HTML report goes to htmlcov/
+uv run pytest
 ```
 
 ## Self-Hosting Guide
@@ -169,11 +171,16 @@ services:
     environment:
       - PROXY_LOCAL_RISK=0
       - RISK_ENGINE_URL=<TRUSTLINE_API_URL>
-      - UPSTREAM_FACILITATOR_BASE_URL=https://x402.org/facilitator
-      - AGENT_GATEWAY_URL=http://your-domain.com:8000
+      - RISK_ENGINE_COMPAT=trustline
       - RISK_INTERNAL_TOKEN=${RISK_INTERNAL_TOKEN}
+      - PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
+      - PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
+      - PROXY_PAYMENT_AUTHORIZATION_KEY=${PROXY_PAYMENT_AUTHORIZATION_KEY}
+      - X402_SECURE_VI_RECEIPT_REDIS_URL=${X402_SECURE_VI_RECEIPT_REDIS_URL}
     restart: unless-stopped
 ```
+
+`Dockerfile.production` runs 4 uvicorn workers. Do not combine it with `PROXY_LOCAL_RISK=1`: the local risk store is per process.
 
 ```bash
 # Build and start services
@@ -190,22 +197,21 @@ docker-compose logs -f facilitator-proxy
 git clone https://github.com/t54-labs/x402-secure
 cd x402-secure
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (installs the local x402-proxy and x402-secure packages)
+uv sync --no-dev
 
 # Configure environment
 export PROXY_LOCAL_RISK=0
 export RISK_ENGINE_URL=<TRUSTLINE_API_URL>
-export RISK_INTERNAL_TOKEN=your_token
+export RISK_ENGINE_COMPAT=trustline
+export RISK_INTERNAL_TOKEN=<token>
 export PROXY_UPSTREAM_VERIFY_URL=https://x402.org/facilitator/verify
 export PROXY_UPSTREAM_SETTLE_URL=https://x402.org/facilitator/settle
+export PROXY_PAYMENT_AUTHORIZATION_KEY=<same secret on every replica, at least 32 bytes>
+export X402_SECURE_VI_RECEIPT_REDIS_URL=redis://<host>:6379/0
 
-# Run with gunicorn (production)
-gunicorn -w 4 -k uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000 \
-  --access-logfile - \
-  --error-logfile - \
-  run_facilitator_proxy:app
+# Run with multiple workers
+uv run uvicorn run_facilitator_proxy:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
 
@@ -235,9 +241,9 @@ gunicorn -w 4 -k uvicorn.workers.UvicornWorker \
    # Run tests
    uv run pytest
 
-   # Run linting
-   uv run ruff check .
-   uv run mypy .
+   # Run linting and format checks (the same checks CI runs)
+   uvx ruff@0.8.4 check .
+   uvx ruff@0.8.4 format --check .
    ```
 
 5. **Submit a pull request**
@@ -247,38 +253,14 @@ gunicorn -w 4 -k uvicorn.workers.UvicornWorker \
 
 ### Code Style
 
-- Use Black for formatting
+- Use Ruff for linting and formatting (`[tool.ruff]` in pyproject.toml); CI runs the same checks
 - Type hints for all functions
 - Docstrings for public APIs
 - Meaningful variable names
 
 ### Testing Guidelines
 
-```python
-# Example test structure
-import pytest
-from x402_secure_client import BuyerClient
-
-class TestBuyerClient:
-    @pytest.fixture
-    def client(self):
-        return BuyerClient(
-            proxy_url="http://test.proxy",
-            private_key="0x" + "00" * 32
-        )
-
-    @pytest.mark.asyncio
-    async def test_protected_payment(self, client, mock_trace):
-        result = await client.protected_payment(
-            merchant="test.com",
-            amount="10.00",
-            reason="Test payment",
-            trace=mock_trace
-        )
-
-        assert result.approved
-        assert result.protection_id is not None
-```
+See `tests/test_client_sdk.py` and `tests/test_core_flows.py` for the current test structure.
 
 ## Technical Details
 
@@ -316,9 +298,7 @@ tracer = OpenAITraceCollector()
 tracer.set_model_config(provider="openai", model="gpt-5-mini")
 
 with client.responses.stream(model="gpt-5-mini", input=messages, tools=tool_defs) as stream:
-    result = asyncio.get_event_loop().run_until_complete(
-        tracer.process_stream(stream, tools=wrapped_tools)
-    )
+    result = await tracer.process_stream(stream, tools=wrapped_tools)
 
 # Recorded events are stored for risk upload
 events = tracer.events
@@ -333,7 +313,8 @@ class RiskClient:
         self.base_url = base_url.rstrip("/")
         self.http = httpx.AsyncClient(timeout=15.0)
 
-    async def create_session(self, *, agent_did: str, wallet_address: str,
+    async def create_session(self, *, agent_did: str,
+                             wallet_address: Optional[str] = None,
                              agent_endpoint: Optional[str] = None,
                              app_id: Optional[str] = None,
                              device: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -341,7 +322,8 @@ class RiskClient:
 
         Args:
             agent_did: Agent DID (current phase: often same as wallet; future: did:eip8004:...)
-            wallet_address: EVM wallet address (0x...)
+            wallet_address: EVM wallet address (0x...). Defaults to agent_did when
+                agent_did is an EVM address; required otherwise.
             agent_endpoint: Optional agent callback/base URL
             app_id: Optional application identifier
             device: Device information dict
@@ -380,18 +362,20 @@ class RiskClient:
 
 ```python
 # How the proxy processes payment security headers
-from proxy.src.x402_proxy.headers import parse_x_payment_secure, parse_risk_ids
+from x402_proxy.headers import HeaderError, parse_risk_ids, parse_x_payment_secure
 
 async def process_payment_headers(request: Request) -> dict:
     # Extract and validate required headers
     x_payment_secure = request.headers.get("X-PAYMENT-SECURE")
     x_risk_session = request.headers.get("X-RISK-SESSION")
+    x_risk_trace = request.headers.get("X-RISK-TRACE")
 
+    # A missing or invalid X-PAYMENT-SECURE is a 400 (TRACE_HEADER_INVALID)
     if not x_payment_secure:
         raise HeaderError("X-PAYMENT-SECURE required")
 
     # Parse session ID (required) and optional trace ID
-    sid, tid = parse_risk_ids(x_risk_session, None)
+    sid, tid = parse_risk_ids(x_risk_session, x_risk_trace)
 
     # Parse W3C trace context from X-PAYMENT-SECURE
     # Format: 'w3c.v1;tp=<traceparent>;ts=<url-encoded-tracestate>'
@@ -433,11 +417,14 @@ async def evaluate_risk(context: dict, payment_context: dict) -> dict:
     if context.get("tid"):
         evaluate_json["tid"] = context["tid"]
 
-    # Call Risk Engine
+    # Call Risk Engine (Bearer token when RISK_INTERNAL_TOKEN is set)
+    token = os.getenv("RISK_INTERNAL_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
             f"{risk_engine_url}/risk/evaluate",
-            json=evaluate_json
+            json=evaluate_json,
+            headers=headers,
         )
 
     if response.status_code != 200:
@@ -447,182 +434,26 @@ async def evaluate_risk(context: dict, payment_context: dict) -> dict:
 
     # Response format:
     # {
-    #   "decision": "allow" | "deny" | "challenge",
-    #   "decision_id": "uuid",
+    #   "decision": "allow" | "deny" | "review",
+    #   "decision_id": "...",
     #   "ttl_seconds": 300,
-    #   "reasons": ["..."]
+    #   "reasons": ["..."],
+    #   "risk_level": "low" | "medium" | "high",
+    #   "used_mandate": false,
+    #   "warnings": [],
+    #   "extra": {}
     # }
+    # Any decision other than "allow" makes /x402/verify answer 403 (RISK_DENIED / RISK_REVIEW).
 
     return risk_data
 ```
 
 ### Security Considerations
 
-#### Signature Verification
-
-```python
-# Payment signature verification
-from eth_account.messages import encode_defunct
-from eth_account import Account
-
-def verify_payment_signature(
-    receipt: str,
-    signature: str,
-    expected_signer: str
-) -> bool:
-    # Decode receipt
-    receipt_data = base64.b64decode(receipt)
-    receipt_json = json.loads(receipt_data)
-
-    # Create message hash
-    message = encode_defunct(receipt_data)
-
-    # Recover signer
-    signer = Account.recover_message(message, signature=signature)
-
-    return signer.lower() == expected_signer.lower()
-```
-
-#### Rate Limiting
-
-```python
-# Implement rate limiting
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-
-limiter = Limiter(key_func=get_remote_address)
-
-@app.post("/x402/verify")
-@limiter.limit("100/minute")
-async def verify_payment(request: Request):
-    # ... payment logic
-    pass
-```
-
-### Performance Optimization
-
-#### Caching
-
-```python
-# Cache validation results
-from cachetools import TTLCache
-import asyncio
-
-class ValidationCache:
-    def __init__(self, ttl=300):  # 5 minute TTL
-        self.cache = TTLCache(maxsize=10000, ttl=ttl)
-        self.locks = {}
-
-    async def get_or_compute(self, key: str, compute_fn):
-        if key in self.cache:
-            return self.cache[key]
-
-        # Prevent duplicate computation
-        if key not in self.locks:
-            self.locks[key] = asyncio.Lock()
-
-        async with self.locks[key]:
-            # Double-check after acquiring lock
-            if key in self.cache:
-                return self.cache[key]
-
-            # Compute and cache
-            result = await compute_fn()
-            self.cache[key] = result
-            return result
-```
-
-#### Connection Pooling
-
-```python
-# HTTP client with connection pooling
-import httpx
-
-class PooledHTTPClient:
-    def __init__(self):
-        self.client = httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=20,
-                max_connections=100,
-                keepalive_expiry=30
-            ),
-            timeout=httpx.Timeout(10.0)
-        )
-
-    async def __aenter__(self):
-        return self.client
-
-    async def __aexit__(self, *args):
-        await self.client.aclose()
-```
-
-### Troubleshooting
-
-#### Common Issues
-
-1. **Connection Errors**
-   ```python
-   # Add retry logic
-   from tenacity import retry, stop_after_attempt, wait_exponential
-
-   @retry(
-       stop=stop_after_attempt(3),
-       wait=wait_exponential(multiplier=1, min=4, max=10)
-   )
-   async def call_risk_engine(data):
-       async with httpx.AsyncClient() as client:
-           return await client.post(RISK_ENGINE_URL, json=data)
-   ```
-
-2. **Signature Validation Failures**
-   ```python
-   # Debug signature issues
-   import logging
-
-   logger = logging.getLogger(__name__)
-
-   def debug_signature_failure(receipt, signature, expected_signer):
-       logger.error(f"Signature validation failed")
-       logger.error(f"Receipt: {receipt[:50]}...")
-       logger.error(f"Signature: {signature}")
-       logger.error(f"Expected signer: {expected_signer}")
-
-       # Try to recover actual signer
-       try:
-           actual_signer = recover_signer(receipt, signature)
-           logger.error(f"Actual signer: {actual_signer}")
-       except Exception as e:
-           logger.error(f"Failed to recover signer: {e}")
-   ```
-
-3. **Performance Issues**
-   ```python
-   # Profile slow endpoints
-   import time
-   from contextvars import ContextVar
-
-   request_id = ContextVar('request_id', default=None)
-
-   @app.middleware("http")
-   async def timing_middleware(request: Request, call_next):
-       start = time.time()
-       request_id.set(str(uuid.uuid4()))
-
-       response = await call_next(request)
-
-       duration = time.time() - start
-       if duration > 1.0:  # Log slow requests
-           logger.warning(
-               f"Slow request: {request.url.path} "
-               f"took {duration:.2f}s "
-               f"(request_id: {request_id.get()})"
-           )
-
-       return response
-   ```
+The proxy does not include rate limiting or a CORS policy. Add them at the gateway or load balancer in front of it.
 
 ## Support
 
-- 💬 Developer Discord: [Join #dev channel](https://discord.gg/x402secure)
 - 🐛 Issues: [GitHub Issues](https://github.com/t54-labs/x402-secure/issues)
-- 📧 Technical Support: dev@x402-secure.com
+- 📧 Email: dev@t54.ai
+- 🔒 Security reports: see [SECURITY.md](../SECURITY.md)

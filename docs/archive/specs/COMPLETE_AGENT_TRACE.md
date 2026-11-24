@@ -1,3 +1,9 @@
+> ⚠️ **Historical document: do not build or operate from it.** A 2025-10 implementation report for the conversation fields of the agent trace. The fields are implemented in the SDK; the risk-checking code it shows is illustrative and not part of this repository.
+>
+> Current source: [`packages/x402-secure/src/x402_secure_client/tracing.py`](../../../packages/x402-secure/src/x402_secure_client/tracing.py).
+>
+> Moved from `docs/specs/COMPLETE_AGENT_TRACE.md`. Checked against `main@b4526b8` on 2026-11-24.
+
 # Complete Agent Trace Context - Final Implementation
 
 ## ✅ Implemented Complete Fields

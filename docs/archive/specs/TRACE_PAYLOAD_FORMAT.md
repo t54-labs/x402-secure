@@ -1,3 +1,9 @@
+> ⚠️ **Historical document: do not build or operate from it.** Explains a 2025-10 change to the proxy's local-mode console logging that has since been removed. Its example payloads predate the current SDK event format.
+>
+> Current source: [`protocol-spec/openapi.yaml`](../../../protocol-spec/openapi.yaml).
+>
+> Moved from `docs/specs/TRACE_PAYLOAD_FORMAT.md`. Checked against `main@b4526b8` on 2026-11-24.
+
 # 📋 Trace Payload Format Description
 
 ## Overview

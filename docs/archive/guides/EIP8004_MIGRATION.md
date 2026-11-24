@@ -1,3 +1,9 @@
+> ⚠️ **Historical document: do not build or operate from it.** Records the 2025-10 rename of `agent_id` to `agent_did` and a plan to resolve EIP-8004 identities in the risk engine. That resolution was never built in this repository, and ERC-8004 is still a draft.
+>
+> Current source: [`packages/x402-secure/src/x402_secure_client/risk.py`](../../../packages/x402-secure/src/x402_secure_client/risk.py).
+>
+> Moved from `docs/guides/EIP8004_MIGRATION.md`. Checked against `main@b4526b8` on 2026-11-24.
+
 # EIP-8004 Migration Guide
 
 ## What Changed

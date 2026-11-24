@@ -11,17 +11,17 @@ Welcome to the x402 + AP2 documentation! This directory contains all technical d
 ### 📘 User Guides
 Comprehensive guides for using the system:
 
-- [**Run Complete Demo**](guides/RUN_COMPLETE_DEMO.md) - Step-by-step demo walkthrough
+- [**Run Complete Demo**](archive/guides/RUN_COMPLETE_DEMO.md) - Step-by-step demo walkthrough
 - [**Agent Trace Guide**](guides/AGENT_TRACE_GUIDE.md) - Complete guide to agent trace context
-- [**View Trace Guide**](guides/VIEW_TRACE_GUIDE.md) - How to query and view trace data
-- [**EIP-8004 Migration**](guides/EIP8004_MIGRATION.md) - Migration guide for DID integration
+- [**View Trace Guide**](archive/guides/VIEW_TRACE_GUIDE.md) - How to query and view trace data
+- [**EIP-8004 Migration**](archive/guides/EIP8004_MIGRATION.md) - Migration guide for DID integration
 
 ### 📋 Technical Specifications
 Formal specifications and data formats:
 
 - [**Payment Trace & Evidence Spec**](specs/payment-trace-and-evidence-spec.md) - Header format and protocol spec
-- [**Trace Payload Format**](specs/TRACE_PAYLOAD_FORMAT.md) - Agent trace context structure
-- [**Complete Agent Trace**](specs/COMPLETE_AGENT_TRACE.md) - Full trace context specification
+- [**Trace Payload Format**](archive/specs/TRACE_PAYLOAD_FORMAT.md) - Agent trace context structure
+- [**Complete Agent Trace**](archive/specs/COMPLETE_AGENT_TRACE.md) - Full trace context specification
 
 ### 🎨 Design Documents
 Architecture and enhancement proposals:
@@ -65,12 +65,12 @@ docs/
 
 ### I want to...
 
-- **Run the complete demo** → [guides/RUN_COMPLETE_DEMO.md](guides/RUN_COMPLETE_DEMO.md)
+- **Run the complete demo** → [guides/RUN_COMPLETE_DEMO.md](archive/guides/RUN_COMPLETE_DEMO.md)
 - **Understand agent tracing** → [guides/AGENT_TRACE_GUIDE.md](guides/AGENT_TRACE_GUIDE.md)
-- **View trace data** → [guides/VIEW_TRACE_GUIDE.md](guides/VIEW_TRACE_GUIDE.md)
-- **Integrate EIP-8004 DIDs** → [guides/EIP8004_MIGRATION.md](guides/EIP8004_MIGRATION.md)
+- **View trace data** → [guides/VIEW_TRACE_GUIDE.md](archive/guides/VIEW_TRACE_GUIDE.md)
+- **Integrate EIP-8004 DIDs** → [guides/EIP8004_MIGRATION.md](archive/guides/EIP8004_MIGRATION.md)
 - **Understand the protocol** → [specs/payment-trace-and-evidence-spec.md](specs/payment-trace-and-evidence-spec.md)
-- **Learn about trace format** → [specs/TRACE_PAYLOAD_FORMAT.md](specs/TRACE_PAYLOAD_FORMAT.md)
+- **Learn about trace format** → [specs/TRACE_PAYLOAD_FORMAT.md](archive/specs/TRACE_PAYLOAD_FORMAT.md)
 - **See the architecture** → [design/OPEN_SOURCE_AND_CO_DEPLOY_PLAN.md](design/OPEN_SOURCE_AND_CO_DEPLOY_PLAN.md)
 - **Setup observability** → [observability/otel-collector-minimal.md](observability/otel-collector-minimal.md)
 

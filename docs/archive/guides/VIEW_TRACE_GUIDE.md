@@ -1,3 +1,9 @@
+> ⚠️ **Historical document: do not build or operate from it.** Describes 2025-10 proxy debug logging (raw payload dumps, a proxy log file) that has been removed.
+>
+> Current source: [`docs/guides/AGENT_TRACE_GUIDE.md`](../../guides/AGENT_TRACE_GUIDE.md).
+>
+> Moved from `docs/guides/VIEW_TRACE_GUIDE.md`. Checked against `main@b4526b8` on 2026-11-24.
+
 # 📊 Complete Guide to Viewing Trace Context
 
 ## 🎯 Overview
